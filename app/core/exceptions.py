@@ -1,7 +1,16 @@
-"""Domain exception hierarchy and their FastAPI handlers."""
+"""Domain exception hierarchy and their FastAPI handlers.
+
+Every error response uses the envelope
+``{"error": {"code": str, "message": str, "details": object | null}}``.
+"""
+
+from typing import Any
 
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.logging import get_logger
 
@@ -14,9 +23,14 @@ class PolymomError(Exception):
     status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR
     code: str = "internal_error"
 
-    def __init__(self, message: str = "An unexpected error occurred.") -> None:
+    def __init__(
+        self,
+        message: str = "An unexpected error occurred.",
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
+        self.details = details
 
 
 class NotFoundError(PolymomError):
@@ -24,19 +38,41 @@ class NotFoundError(PolymomError):
     code = "not_found"
 
 
+class MeetingNotFoundError(NotFoundError):
+    code = "meeting_not_found"
+
+
 class ValidationError(PolymomError):
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
     code = "validation_error"
 
 
-class UnsupportedMediaError(PolymomError):
+class UnsupportedFileTypeError(PolymomError):
+    """Extension not allowed, or content does not match the claimed extension."""
+
     status_code = status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
-    code = "unsupported_media"
+    code = "unsupported_file_type"
 
 
-class PayloadTooLargeError(PolymomError):
+class FileTooLargeError(PolymomError):
     status_code = status.HTTP_413_CONTENT_TOO_LARGE
-    code = "payload_too_large"
+    code = "file_too_large"
+
+
+class EmptyFileError(ValidationError):
+    code = "empty_file"
+
+
+class CorruptedMediaError(ValidationError):
+    """File is unreadable or has no audio stream."""
+
+    code = "corrupted_media"
+
+
+class MediaProbeUnavailableError(PolymomError):
+    """ffprobe is missing or failed to start. A server problem, not a client one."""
+
+    code = "media_probe_unavailable"
 
 
 class PipelineError(PolymomError):
@@ -45,16 +81,40 @@ class PipelineError(PolymomError):
     code = "pipeline_error"
 
 
+def error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:
+    return {"error": {"code": code, "message": message, "details": jsonable_encoder(details)}}
+
+
 async def _polymom_error_handler(request: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, PolymomError):  # pragma: no cover - registered only for PolymomError
         raise exc
-    logger.warning("request_failed", path=request.url.path, code=exc.code, error=exc.message)
+    log = logger.error if exc.status_code >= 500 else logger.warning
+    log("request_failed", path=request.url.path, code=exc.code, error=exc.message)
+    return JSONResponse(error_body(exc.code, exc.message, exc.details), status_code=exc.status_code)
+
+
+async def _request_validation_handler(request: Request, exc: Exception) -> JSONResponse:
+    if not isinstance(exc, RequestValidationError):  # pragma: no cover
+        raise exc
+    errors = [{k: e[k] for k in ("loc", "msg", "type") if k in e} for e in exc.errors()]
     return JSONResponse(
+        error_body("validation_error", "Request validation failed.", {"errors": errors}),
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+    )
+
+
+async def _http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    if not isinstance(exc, StarletteHTTPException):  # pragma: no cover
+        raise exc
+    return JSONResponse(
+        error_body(f"http_{exc.status_code}", str(exc.detail)),
         status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": exc.message}},
+        headers=exc.headers,
     )
 
 
 def register_exception_handlers(app: FastAPI) -> None:
-    """Attach handlers that map domain errors to a consistent JSON envelope."""
+    """Attach handlers that map all errors to a consistent JSON envelope."""
     app.add_exception_handler(PolymomError, _polymom_error_handler)
+    app.add_exception_handler(RequestValidationError, _request_validation_handler)
+    app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
