@@ -1,34 +1,55 @@
-"""Meeting repository interface and an in-memory stub implementation."""
+"""Meeting repository interface and its SQLAlchemy implementation."""
 
-from typing import Protocol
+import uuid
+from abc import ABC, abstractmethod
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.meeting import Meeting
 
 
-class MeetingRepository(Protocol):
+class MeetingRepository(ABC):
     """Persistence port for meetings. Services depend on this, not on a backend."""
 
-    async def add(self, meeting: Meeting) -> None: ...
+    @abstractmethod
+    async def add(self, meeting: Meeting) -> Meeting: ...
 
-    async def get(self, meeting_id: str) -> Meeting | None: ...
+    @abstractmethod
+    async def get(self, meeting_id: uuid.UUID) -> Meeting | None: ...
 
-    async def list_all(self) -> list[Meeting]: ...
+    @abstractmethod
+    async def list(self, *, limit: int, offset: int) -> tuple[list[Meeting], int]:
+        """Return one page of meetings, newest first, and the total count."""
+
+    @abstractmethod
+    async def delete(self, meeting: Meeting) -> None: ...
 
 
-class InMemoryMeetingRepository:
-    """Process-local repository for development and tests.
+class SqlAlchemyMeetingRepository(MeetingRepository):
+    """Works with any SQLAlchemy async backend (SQLite, Postgres, ...)."""
 
-    TODO(prompt-2+): add a durable implementation (DB + file storage).
-    """
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
 
-    def __init__(self) -> None:
-        self._items: dict[str, Meeting] = {}
+    async def add(self, meeting: Meeting) -> Meeting:
+        self._session.add(meeting)
+        await self._session.commit()
+        return meeting
 
-    async def add(self, meeting: Meeting) -> None:
-        self._items[meeting.id] = meeting
+    async def get(self, meeting_id: uuid.UUID) -> Meeting | None:
+        return await self._session.get(Meeting, meeting_id)
 
-    async def get(self, meeting_id: str) -> Meeting | None:
-        return self._items.get(meeting_id)
+    async def list(self, *, limit: int, offset: int) -> tuple[list[Meeting], int]:
+        total = await self._session.scalar(select(func.count()).select_from(Meeting))
+        rows = await self._session.scalars(
+            select(Meeting)
+            .order_by(Meeting.created_at.desc(), Meeting.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return list(rows), total or 0
 
-    async def list_all(self) -> list[Meeting]:
-        return list(self._items.values())
+    async def delete(self, meeting: Meeting) -> None:
+        await self._session.delete(meeting)
+        await self._session.commit()
