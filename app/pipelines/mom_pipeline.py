@@ -1,7 +1,7 @@
 """Minutes-of-Meeting pipeline: an ordered list of stages sharing a context.
 
 Stages (planned): preprocess -> diarize -> transcribe -> align -> analytics -> summarize.
-Only ``preprocess`` is registered so far.
+Registered so far: preprocess -> diarize.
 """
 
 import time
@@ -21,8 +21,11 @@ from app.core.logging import get_logger
 from app.models.meeting import Meeting
 from app.repositories.meeting_repository import MeetingRepository
 from app.schemas.audio import PreprocessResult
+from app.schemas.diarization import DiarizationResult
 from app.schemas.meeting import MeetingStatus
 from app.services.audio.preprocessor import AudioPreprocessor
+from app.services.diarization.base import DiarizationBackend
+from app.services.diarization.service import DiarizationService
 
 logger = get_logger(__name__)
 
@@ -35,6 +38,7 @@ class PipelineContext:
 
     meeting_id: uuid.UUID
     input_path: Path
+    expected_speakers: int | None = None
     processed_path: Path | None = None
     outputs: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, int] = field(default_factory=dict)
@@ -73,6 +77,26 @@ class PreprocessStage(PipelineStage):
         meeting.audio_quality = result.model_dump(mode="json", exclude={"processed_path"})
 
 
+class DiarizationStage(PipelineStage):
+    """Who spoke when, on the preprocessed audio. Requires :class:`PreprocessStage`."""
+
+    name = "diarize"
+
+    def __init__(self, service: DiarizationService) -> None:
+        self._service = service
+
+    async def run(self, context: PipelineContext) -> None:
+        if context.processed_path is None:
+            raise RuntimeError("DiarizationStage requires PreprocessStage to run first")
+        context.outputs[self.name] = await self._service.diarize(
+            context.meeting_id, context.processed_path, num_speakers=context.expected_speakers
+        )
+
+    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+        result: DiarizationResult = context.outputs[self.name]
+        meeting.diarization = result.model_dump(mode="json")
+
+
 class MoMPipeline:
     """Runs stages in order and owns the meeting status lifecycle.
 
@@ -98,7 +122,11 @@ class MoMPipeline:
                 meeting.error = None
                 meeting = await repo.save(meeting)
 
-            context = PipelineContext(meeting_id=meeting_id, input_path=Path(meeting.stored_path))
+            context = PipelineContext(
+                meeting_id=meeting_id,
+                input_path=Path(meeting.stored_path),
+                expected_speakers=meeting.expected_speakers,
+            )
             logger.info("pipeline_started", stages=[s.name for s in self.stages])
             started = time.perf_counter()
             current = self.stages[0].name
@@ -132,6 +160,14 @@ class MoMPipeline:
             return meeting.status
 
 
-def build_pipeline(settings: Settings, repositories: RepositoryFactory) -> MoMPipeline:
-    """Default stage registry. Later prompts append diarization, ASR, ..."""
-    return MoMPipeline([PreprocessStage(AudioPreprocessor(settings))], repositories)
+def build_pipeline(
+    settings: Settings, repositories: RepositoryFactory, diarization_backend: DiarizationBackend
+) -> MoMPipeline:
+    """Default stage registry. Later prompts append ASR, alignment, ..."""
+    return MoMPipeline(
+        [
+            PreprocessStage(AudioPreprocessor(settings)),
+            DiarizationStage(DiarizationService(diarization_backend, settings)),
+        ],
+        repositories,
+    )

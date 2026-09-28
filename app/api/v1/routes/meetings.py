@@ -9,6 +9,7 @@ from app.api.deps import MeetingServiceDep, PipelineDep
 from app.core.exceptions import ValidationError
 from app.models.meeting import Meeting
 from app.schemas.audio import AudioQuality
+from app.schemas.diarization import SpeakersResponse
 from app.schemas.error import error_example
 from app.schemas.meeting import (
     SUPPORTED_LANGUAGES,
@@ -171,3 +172,30 @@ async def process_meeting(
     meeting = await service.request_processing(meeting_id, force=force)
     background_tasks.add_task(pipeline.run, meeting.id)
     return ProcessResponse(meeting_id=meeting.id, status=meeting.status)
+
+
+@router.get(
+    "/{meeting_id}/speakers",
+    response_model=SpeakersResponse,
+    summary="Speaker turns from diarization",
+    responses={
+        **_NOT_FOUND,
+        **error_example(
+            409,
+            "diarization_not_available",
+            "Speaker diarization is not available yet.",
+            "The meeting has not been diarized yet",
+        ),
+    },
+)
+async def get_speakers(meeting_id: UUID, service: MeetingServiceDep) -> SpeakersResponse:
+    """Turns sorted by start, labelled Person 1..N by order of first appearance."""
+    result = await service.get_diarization(meeting_id)
+    return SpeakersResponse(
+        meeting_id=meeting_id,
+        num_speakers=result.num_speakers,
+        speakers=[f"Person {i}" for i in range(1, result.num_speakers + 1)],
+        turns=result.turns,
+        overlap_regions=result.overlap_regions,
+        model_name=result.model_name,
+    )
