@@ -1,103 +1,103 @@
 ## Summary
 
-Prompt 2 of 12 adds the meeting upload API. Clients can upload a recording, fetch a meeting, list meetings (paginated, newest first) and delete a meeting. Each upload is validated before it is stored: the file is streamed to disk under a size cap, its real type is checked against its magic bytes, and ffprobe confirms it contains readable audio. Meetings are saved in SQLite through SQLAlchemy 2.0 async with Alembic migrations; setting `DATABASE_URL` switches to Postgres. No audio processing or ML yet.
+Prompt 3 of 12 adds the audio preprocessing stage. Any validated upload (audio, or video that has an audio track) now becomes a model-ready **mono, 16 kHz, 16-bit PCM WAV** at `STORAGE_DIR/processed/{meeting_id}.wav`. The stage normalizes loudness to EBU R128, can apply an optional highpass and denoise, and reports silence and quality. The pipeline is now built from stages, and `POST /api/v1/meetings/{id}/process` runs it in the background. Diarization and ASR are not part of this PR.
+
+## Design decisions
+
+- **Stage pattern:** each `PipelineStage` has a `name`, an async `run(context)` and an `apply(context, meeting)`.
+  - `run` does the work and writes its results to the shared `PipelineContext`; `apply` copies what should be saved onto the meeting.
+  - Keeping the two apart means stages never touch the database themselves.
+  - The orchestrator owns the status changes (`processing` → `completed`/`failed`) and logs each stage's timing.
+- **Status is set to `processing` in the request itself, before the background task starts,** so a second click gets a 409 instead of running the pipeline twice.
+  - Failed meetings can be retried without `force`.
+  - Background work opens its own short-lived database sessions, because the request's session is closed by the time the task runs.
+- **Quality is measured on the original audio.** Every normalized file ends up at about −23 LUFS, so RMS, peak and LUFS measured after normalization would say nothing about how the meeting was recorded, and clipping could no longer be detected.
+  - One ffmpeg pass (`silencedetect` + `astats` + `ebur128`) gathers all of these; it runs before conversion, and conversion uses its silence spans for optional trimming.
+- **Single-pass `loudnorm`, not two-pass:** for speech it's close enough, and it halves the ffmpeg work on long recordings. `loudnorm` upsamples internally, so `aresample` runs after it.
+- **Atomic output:** ffmpeg writes to `{id}.wav.part`, which is renamed only after the WAV header checks out.
+  - A timeout, ffmpeg error or bad output deletes the partial file.
+  - The ffmpeg runner kills the child process on timeout or cancellation.
+- **Warnings don't fail processing:** `low_volume`, `clipping`, `too_short` and `mostly_silent` are returned in `audio_quality.warnings`.
+- **The chunker uses the stdlib `wave` module rather than ffmpeg:** slices are sample-accurate with no re-encoding, and each chunk records its absolute offset. As the spec asks, it's exposed and tested but not wired in yet.
+- **Error mapping:**
+  - `AudioProcessingError` → 422 `audio_processing_failed`
+  - `FFmpegTimeoutError` → 504 `ffmpeg_timeout`
+  - `MeetingStateConflictError` → 409
+
+  In the background path these are stored on the meeting as `"<code>: <message>"`.
 
 ## Changes
 
-- **Endpoints** (`app/api/v1/routes/meetings.py`):
-  - `POST /api/v1/meetings` returns 202. Form fields: `file`, plus optional `title`, `expected_speakers` (1-20) and `languages` (`en`/`hi`/`or`, repeated or comma-separated).
-  - `GET /api/v1/meetings/{id}`
-  - `GET /api/v1/meetings` with `limit`/`offset`
-  - `DELETE /api/v1/meetings/{id}` returns 204 and deletes the stored file too.
-- **Validator** (`app/services/audio/validator.py`), checks in order:
-  1. Sanitize the filename, keeping Unicode and Indic vowel signs.
-  2. Check the extension against the allow-list.
-  3. Stream to a `.part` file in chunks, with the size limit enforced as it streams.
-  4. Reject empty files.
-  5. Check magic bytes with `filetype`; m4a/mp4/mov and mkv/webm are each treated as one family because they share a container format.
-  6. Run ffprobe with a timeout, rejecting unreadable files, files with no audio stream and zero-duration audio.
-  7. Atomically rename the file to `uploads/{meeting_id}.{ext}`.
-
-  Partial files are deleted on any failure, including cancellation.
-- **Early 413:** a middleware rejects requests whose `Content-Length` is already over the limit before the body is read.
-- **Model and schemas:** a `Meeting` ORM entity with every field from the spec, a `MeetingStatus` enum (`queued`/`processing`/`completed`/`failed`), and `AudioMetadata`. Timestamps are stored as timezone-aware UTC on every backend.
-- **Storage:**
-  - an abstract `MeetingRepository` with a `SqlAlchemyMeetingRepository` implementation
-  - `app/db/` holds the engine and session factory plus Alembic (`alembic.ini`, migration `0001`)
-  - migrations run automatically at startup (`AUTO_MIGRATE`)
-  - the session, repository, validator and service are wired up in `deps.py`
-- **Errors:**
-  - typed exceptions: `UnsupportedFileTypeError` (415), `FileTooLargeError` (413), `CorruptedMediaError` and `EmptyFileError` (422), `MeetingNotFoundError` (404), `MediaProbeUnavailableError` (500)
-  - every error, including FastAPI's own validation errors and HTTP errors, uses the envelope `{"error": {"code", "message", "details"}}`
-- **Logging:** `upload_started`, `upload_validated`, `upload_rejected`, `upload_persist_failed`, `meeting_queued` and `meeting_deleted` are logged with `meeting_id` bound through contextvars. File contents are never logged.
-- **OpenAPI:** response models include examples, and a documented `ErrorResponse` covers 404/413/415/422.
-- **Docker and CI:** the image now installs `libmagic1` alongside `ffmpeg`, and CI installs `ffmpeg`.
-- **Docs:** the README covers API usage with curl examples, the validation pipeline, the error codes, the new config variables and migrations.
-
-## API examples
-
-```bash
-curl -F "file=@standup.m4a" -F "title=Weekly sync" -F "expected_speakers=4" \
-     -F "languages=en,hi" http://localhost:8000/api/v1/meetings
-# 202 {"meeting_id":"3715...","status":"queued","created_at":"2026-09-28T15:52:16.503966Z"}
-
-curl http://localhost:8000/api/v1/meetings/3715...
-# 200 {..., "mime_type":"audio/x-wav", "audio_metadata":{"codec":"pcm_s16le","sample_rate":16000,"channels":1,...}}
-
-curl "http://localhost:8000/api/v1/meetings?limit=10&offset=0"
-curl -X DELETE http://localhost:8000/api/v1/meetings/3715...   # 204
-
-printf 'hello' > fake.wav && curl -F "file=@fake.wav" http://localhost:8000/api/v1/meetings
-# 415 {"error":{"code":"unsupported_file_type","message":"File content does not match its extension.","details":{"extension":"wav","detected_mime_type":null}}}
-```
+- `app/services/audio/`:
+  - `ffmpeg.py`: async subprocess runner with a timeout.
+  - `analysis.py`: silence and level analysis, and the warnings.
+  - `preprocessor.py`: the conversion itself.
+  - `chunker.py`: `plan_chunks` and `split_wav`.
+- `app/schemas/audio.py`: `AudioWarning`, `AudioQuality`, and `PreprocessResult` (which extends `AudioQuality` with `processed_path`). `MeetingRead` gains `audio_quality`; `processed_path` stays internal.
+- `app/pipelines/mom_pipeline.py`: `PipelineContext`, `PipelineStage`, `PreprocessStage`, the `MoMPipeline` orchestrator and `build_pipeline`.
+- **Endpoint:** `POST /api/v1/meetings/{id}/process?force=`, documented in OpenAPI with 404 and 409 examples. `DELETE` now also removes the processed file.
+- **Storage:** migration `0002` adds `processed_path` and `audio_quality` (a JSON column). `MeetingRepository.save` is new. `alembic check` reports no drift.
+- **Config** (in `.env.example` too):
+  - `TARGET_SAMPLE_RATE`, `TARGET_LOUDNESS_LUFS`
+  - `ENABLE_HIGHPASS`, `HIGHPASS_CUTOFF_HZ`, `ENABLE_DENOISE`
+  - `TRIM_SILENCE`, `SILENCE_THRESHOLD_DB`, `SILENCE_MIN_DURATION_SECONDS`
+  - `FFMPEG_PATH`, `FFMPEG_TIMEOUT_SECONDS`
+  - `CHUNK_LENGTH_SECONDS`, `CHUNK_OVERLAP_SECONDS`
+- **Docs:** the README covers the pipeline stage pattern (Mermaid diagram), the preprocessing steps, the warnings, `audio_quality` and the config flags. It also fixes a broken curl line continuation.
 
 ## Test coverage
 
-45 tests pass. Overall coverage is 90%; for the new code it is:
+90 tests pass, with 95% coverage overall. For the new code:
 
 | Module | Coverage |
 | --- | --- |
-| `validator.py` | 94% |
+| `mom_pipeline.py` | 100% |
+| `chunker.py` | 100% |
 | `meeting_service.py` | 100% |
-| `meeting_repository.py` | 100% |
-| `routes/meetings.py` | 100% |
-| `main.py` | 100% |
+| `analysis.py` | 99% |
+| `preprocessor.py` | 97% |
+| `ffmpeg.py` | 86% (the untested lines are the cancellation branch) |
 
-- **Unit tests** cover:
-  - valid wav and mp3
-  - a disallowed extension and a missing extension
-  - a text file renamed `.wav`, and mp3 content named `.wav`
-  - an oversized file, checking that it is read in bounded chunks
-  - empty, corrupted and zero-duration files, and a video with no audio
-  - ffprobe missing and ffprobe timing out
-  - filename sanitization, including path traversal and Hindi/Odia names
-  - cleanup of the stored file when the database write fails
-- **Integration tests** run against an isolated temp database and storage directory for each test, and cover:
-  - all four endpoints
-  - pagination order
-  - that delete removes the file
-  - 404/413/415/422 envelopes, including malformed UUIDs and invalid form fields
-  - that the OpenAPI spec documents the error responses
-- Media fixtures are generated at test time with Python's `wave` module and ffmpeg's `lavfi` sources; no binaries are committed. Tests that need ffmpeg are skipped when it isn't installed.
-- Coverage now uses `concurrency = ["greenlet", "thread"]`. Without it, code that runs after SQLAlchemy async calls was wrongly reported as uncovered.
+**Fixtures,** generated with ffmpeg `lavfi` at test time (no binaries committed):
+- a stereo 44.1 kHz tone
+- an mp4 video with an AAC audio track
+- a near-silent file (about −70 dBFS)
+- a clipped file
+- a 1 s file
+- a file padded with 1 s of silence at each end
+- a 3-minute file
+
+**Unit tests** check that:
+- output is mono, 16 kHz and PCM s16, and the original is byte-for-byte unchanged
+- audio is extracted from video
+- a custom sample rate works and denoise runs
+- each warning fires exactly when it should
+- leading and trailing silence are reported but only trimmed when the flag is on
+- the chunk plan is correct, and 3-minute chunks have sample-exact offsets and overlaps
+- the filter chain respects the config flags
+- a timeout kills the process and raises `FFmpegTimeoutError`, and non-zero exits and a missing binary are handled
+- partial output is cleaned up after a timeout or an invalid WAV
+- the orchestrator runs stages in order, records typed and unexpected failures, and leaves later stages unrun after a failure
+
+**Integration tests** check that:
+- upload, then process, then GET shows `completed` with `audio_quality` filled in
+- a second `process` call gets a 409, and `force=true` reprocesses
+- `process` on an unknown meeting gets a 404
+- a missing ffmpeg records `failed` with an `audio_processing_failed: ...` error, and the meeting can then be retried
+- delete removes the processed file
 
 ## Checklist
 
 - [x] `make lint` (ruff check + format) passes
 - [x] `make typecheck` (mypy strict) passes
 - [x] `make test` passes, with coverage of new code at least 85%
-- [x] Docker image builds with ffmpeg and libmagic
-- [x] `alembic check` reports that the models match the migrations
-- [x] Manual smoke test with uvicorn: upload, list and a 415 rejection
-- [x] No secrets, database files or media committed
-
-## Notes
-
-- Starlette buffers the multipart body into a `SpooledTemporaryFile`, which moves to disk once it passes 1 MB, before the handler runs. Memory use stays bounded, and the `Content-Length` middleware rejects oversized uploads that declare their size up front. A streaming multipart parser that never spools could come later if it's needed.
-- Magic-byte detection uses the pure-Python `filetype` library, so it needs no system libmagic on Windows or macOS. The Docker image still installs `libmagic1` as the spec asks.
+- [x] Docker image builds
+- [x] Migration 0002 applies on top of 0001, and `alembic check` is clean
+- [x] The original upload is never modified; partial output is removed on failure
+- [x] No large binaries or secrets committed
 
 ## Next steps
 
-**Prompt 3: audio preprocessing.** Use ffmpeg to decode, resample to 16 kHz mono and normalize loudness, with optional voice activity detection (VAD). Status moves from `queued` to `processing`, and the processing job is enqueued from `MeetingService.create`.
+**Prompt 4: speaker diarization.** Add a `DiarizationStage` that runs pyannote (as an optional `diarization` dependency group) on `context.processed_path`, using the chunker for long recordings and `expected_speakers` as a hint. It will persist speaker segments.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
