@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Runtime data
+storage/
+data/
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.opus
+*.webm
+*.mp4
+*.mkv
+*.mov
+*.avi
+
+# Model caches / weights
+.cache/
+models_cache/
+hf_cache/
+*.pt
+*.bin
+*.onnx
+*.safetensors
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
