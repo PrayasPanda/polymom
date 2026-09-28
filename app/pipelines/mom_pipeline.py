@@ -1,7 +1,8 @@
 """Minutes-of-Meeting pipeline: an ordered list of stages sharing a context.
 
 Stages (planned): preprocess -> diarize -> transcribe -> align -> analytics -> summarize.
-Registered so far: preprocess -> diarize -> transcribe.
+Registered so far: preprocess -> diarize -> identify languages -> transcribe
+(language ID only when LANGUAGE_ROUTING_ENABLED).
 """
 
 import time
@@ -23,12 +24,15 @@ from app.repositories.meeting_repository import MeetingRepository
 from app.schemas.asr import ASRResult
 from app.schemas.audio import PreprocessResult
 from app.schemas.diarization import DiarizationResult
+from app.schemas.language import LanguageSummary
 from app.schemas.meeting import MeetingStatus
 from app.services.asr.router import ASRRouter
 from app.services.asr.service import TranscriptionService
 from app.services.audio.preprocessor import AudioPreprocessor
 from app.services.diarization.base import DiarizationBackend
 from app.services.diarization.service import DiarizationService
+from app.services.language.base import LanguageIdentifier
+from app.services.language.service import LanguageIdResult, LanguageIdService
 
 logger = get_logger(__name__)
 
@@ -101,10 +105,40 @@ class DiarizationStage(PipelineStage):
         meeting.diarization = result.model_dump(mode="json")
 
 
+class LanguageIdentificationStage(PipelineStage):
+    """Spoken language per diarization turn, smoothed into language regions.
+
+    Uses the diarization turns when :class:`DiarizationStage` ran; otherwise
+    fixed windows over the whole recording.
+    """
+
+    name = "identify_languages"
+
+    def __init__(self, service: LanguageIdService) -> None:
+        self._service = service
+
+    async def run(self, context: PipelineContext) -> None:
+        if context.processed_path is None:
+            raise RuntimeError("LanguageIdentificationStage requires PreprocessStage to run first")
+        diarization: DiarizationResult | None = context.outputs.get("diarize")
+        context.outputs[self.name] = await self._service.identify(
+            context.meeting_id,
+            context.processed_path,
+            diarization.turns if diarization else [],
+            context.languages_hint,
+        )
+
+    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+        result: LanguageIdResult = context.outputs[self.name]
+        meeting.language_summary = result.summary.model_dump(mode="json")
+
+
 class TranscriptionStage(PipelineStage):
     """Timestamped transcript of the preprocessed audio.
 
-    Independent of diarization for now; word-to-speaker alignment comes later.
+    With language regions from :class:`LanguageIdentificationStage` each region
+    is routed to its language's backend; otherwise the single-pass Prompt 5
+    strategy (hint or auto-detect) is used. Word-to-speaker alignment comes later.
     """
 
     name = "transcribe"
@@ -115,13 +149,27 @@ class TranscriptionStage(PipelineStage):
     async def run(self, context: PipelineContext) -> None:
         if context.processed_path is None:
             raise RuntimeError("TranscriptionStage requires PreprocessStage to run first")
-        context.outputs[self.name] = await self._service.transcribe(
-            context.meeting_id, context.processed_path, context.languages_hint
-        )
+        language_id: LanguageIdResult | None = context.outputs.get(LanguageIdentificationStage.name)
+        if language_id is not None and language_id.regions:
+            result = await self._service.transcribe_routed(
+                context.meeting_id,
+                context.processed_path,
+                language_id.regions,
+                context.languages_hint,
+            )
+        else:
+            result = await self._service.transcribe(
+                context.meeting_id, context.processed_path, context.languages_hint
+            )
+        context.outputs[self.name] = result
 
     def apply(self, context: PipelineContext, meeting: Meeting) -> None:
         result: ASRResult = context.outputs[self.name]
         meeting.transcript = result.model_dump(mode="json")
+        if meeting.language_summary is not None:
+            summary = LanguageSummary.model_validate(meeting.language_summary)
+            summary.code_mixed_segments = sum(s.is_code_mixed for s in result.segments)
+            meeting.language_summary = summary.model_dump(mode="json")
 
 
 class MoMPipeline:
@@ -193,13 +241,14 @@ def build_pipeline(
     repositories: RepositoryFactory,
     diarization_backend: DiarizationBackend,
     asr_router: ASRRouter,
+    language_identifier: LanguageIdentifier | None = None,
 ) -> MoMPipeline:
     """Default stage registry. Later prompts append alignment, analytics, ..."""
-    return MoMPipeline(
-        [
-            PreprocessStage(AudioPreprocessor(settings)),
-            DiarizationStage(DiarizationService(diarization_backend, settings)),
-            TranscriptionStage(TranscriptionService(asr_router, settings)),
-        ],
-        repositories,
-    )
+    stages: list[PipelineStage] = [
+        PreprocessStage(AudioPreprocessor(settings)),
+        DiarizationStage(DiarizationService(diarization_backend, settings)),
+    ]
+    if settings.language_routing_enabled and language_identifier is not None:
+        stages.append(LanguageIdentificationStage(LanguageIdService(language_identifier, settings)))
+    stages.append(TranscriptionStage(TranscriptionService(asr_router, settings)))
+    return MoMPipeline(stages, repositories)

@@ -89,6 +89,7 @@ def settings(tmp_path: Path) -> Settings:
         storage_dir=tmp_path / "storage",
         diarization_backend="mock",
         asr_backend="mock",
+        lid_backend="mock",
     )
 
 

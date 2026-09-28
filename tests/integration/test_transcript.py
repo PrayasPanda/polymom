@@ -27,23 +27,24 @@ async def _process(client: AsyncClient, seconds: float = 9, **form: str | list[s
 
 
 async def test_transcript_json_is_nfc_native_script(client: AsyncClient) -> None:
-    meeting_id = await _process(client)  # no hint: mock rotates en -> hi -> or
+    # 12 s, no hint: mock LID says en for 0-6 s and hi for 6-12 s; each region is routed.
+    meeting_id = await _process(client, seconds=12)
 
     response = await client.get(f"{URL}/{meeting_id}/transcript")
 
     assert response.status_code == 200
     body = response.json()
     assert body["meeting_id"] == meeting_id
-    assert [s["language"] for s in body["segments"]] == ["en", "hi", "or"]
-    assert [s["id"] for s in body["segments"]] == [0, 1, 2]
+    assert [s["language"] for s in body["segments"]] == ["en", "en", "hi", "hi"]
+    assert [s["id"] for s in body["segments"]] == [0, 1, 2, 3]
     for s in body["segments"]:
         assert unicodedata.is_normalized("NFC", s["text"])
         assert s["words"]
-        assert s["backend"] == "mock"
+        assert s["backend"] == "mock-whisper"
         assert s["low_confidence"] is False
-    assert body["segments"][1]["text"].startswith("पहला मुद्दा")
-    assert body["segments"][2]["text"].startswith("ଶୁକ୍ରବାର")
-    assert {d["language"] for d in body["detected_languages"]} == {"en", "hi", "or"}
+        assert s["lid_confidence"] is not None
+    assert body["segments"][2]["text"].startswith("नमस्ते")
+    assert {d["language"] for d in body["detected_languages"]} == {"en", "hi"}
     assert body["requested_language"] is None
 
 
@@ -98,6 +99,7 @@ async def test_asr_failure_keeps_earlier_stage_outputs(
         storage_dir=tmp_path,
         diarization_backend="mock",
         asr_backend="real",
+        lid_backend="mock",
         asr_language_backends={"en": "whisper", "hi": "whisper", "or": "indic"},
     )
     async for client in client_factory(settings):
