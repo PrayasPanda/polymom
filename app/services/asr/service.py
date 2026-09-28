@@ -13,6 +13,7 @@ from starlette.concurrency import run_in_threadpool
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.schemas.asr import ASRResult, TranscriptSegment
+from app.schemas.language import LanguageRegion
 from app.services.asr.base import ASRBackend
 from app.services.asr.indic_backend import IndicConformerBackend
 from app.services.asr.mock_backend import MockASRBackend
@@ -29,6 +30,7 @@ from app.services.asr.postprocess import (
 from app.services.asr.router import ASRRouter
 from app.services.asr.whisper_backend import WhisperBackend
 from app.services.audio.chunker import split_wav
+from app.services.language.text_tagger import tag_segment
 
 logger = get_logger(__name__)
 
@@ -37,8 +39,11 @@ def build_router(settings: Settings) -> ASRRouter:
     """Router for ``ASR_BACKEND``: real models, or the mock behind every route."""
     backends: dict[str, ASRBackend]
     if settings.asr_backend == "mock":
-        mock = MockASRBackend(settings)
-        backends = {"whisper": mock, "indic": mock, "mock": mock}
+        backends = {
+            "whisper": MockASRBackend(settings, route="whisper"),
+            "indic": MockASRBackend(settings, route="indic"),
+        }
+        backends["mock"] = backends["whisper"]
     else:
         backends = {"whisper": WhisperBackend(settings), "indic": IndicConformerBackend(settings)}
     return ASRRouter(backends, settings.asr_language_backends, auto_backend="whisper")
@@ -76,6 +81,41 @@ class TranscriptionService:
         else:
             segments = (await backend.transcribe(audio_path, language)).segments
 
+        return self._finalize(
+            meeting_id, segments, [backend.model_name], language, started, backend.name
+        )
+
+    async def transcribe_routed(
+        self,
+        meeting_id: uuid.UUID,
+        audio_path: Path,
+        regions: Sequence[LanguageRegion],
+        language_hints: Sequence[str] = (),
+    ) -> ASRResult:
+        """Per-region routing from language ID (see :meth:`ASRRouter.transcribe_regions`)."""
+        started = time.perf_counter()
+        routed = await self.router.transcribe_regions(
+            audio_path, regions, max_batch_seconds=self._settings.chunk_length_seconds
+        )
+        return self._finalize(
+            meeting_id,
+            routed.segments,
+            routed.model_names,
+            choose_language(language_hints),
+            started,
+            "routed",
+        )
+
+    def _finalize(
+        self,
+        meeting_id: uuid.UUID,
+        segments: Sequence[TranscriptSegment],
+        model_names: Sequence[str],
+        language: str | None,
+        started: float,
+        backend_name: str,
+    ) -> ASRResult:
+        """Normalize, drop hallucinations, flag low confidence, tag code-mixing, renumber."""
         settings = self._settings
         kept, dropped = filter_hallucinations(
             [normalize_segment(s) for s in segments],
@@ -85,22 +125,25 @@ class TranscriptionService:
                 no_speech_threshold=settings.asr_no_speech_threshold,
             ),
         )
-        final = renumber(flag_low_confidence(kept, settings.asr_low_confidence_threshold))
+        flagged = flag_low_confidence(kept, settings.asr_low_confidence_threshold)
+        final = renumber([tag_segment(s) for s in flagged])
         result = ASRResult(
             segments=final,
             detected_languages=language_durations(final),
-            model_names=sorted({backend.model_name}),
+            model_names=sorted(set(model_names)),
             processing_time_ms=int((time.perf_counter() - started) * 1000),
             requested_language=language,
         )
         logger.info(
             "transcription_completed",
             meeting_id=str(meeting_id),
-            backend=backend.name,
+            backend=backend_name,
             language=language,
             segments=len(final),
             dropped=dict(Counter(reason for _, reason in dropped)),
             low_confidence=sum(s.low_confidence for s in final),
+            code_mixed=sum(s.is_code_mixed for s in final),
+            fallbacks=sum(s.fallback_used for s in final),
             languages=[d.language for d in result.detected_languages],
             processing_time_ms=result.processing_time_ms,
         )
