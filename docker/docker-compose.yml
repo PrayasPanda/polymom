@@ -1,0 +1,19 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: polymom:latest
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      STORAGE_DIR: /app/storage
+    ports:
+      - "8000:8000"
+    volumes:
+      - storage:/app/storage
+    restart: unless-stopped
+
+volumes:
+  storage:
