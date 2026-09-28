@@ -1,5 +1,5 @@
-"""Persistence models.
+"""ORM entities. Importing this package registers every model on ``Base.metadata``."""
 
-TODO(prompt-2+): choose persistence (SQLite/Postgres via SQLModel or SQLAlchemy)
-and define ORM entities here.
-"""
+from app.models.meeting import Meeting
+
+__all__ = ["Meeting"]
