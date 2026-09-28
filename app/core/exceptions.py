@@ -104,6 +104,25 @@ class FFmpegTimeoutError(AudioProcessingError):
     code = "ffmpeg_timeout"
 
 
+class DiarizationError(PipelineError):
+    """Diarization inference failed."""
+
+    code = "diarization_failed"
+
+
+class DiarizationModelLoadError(DiarizationError):
+    """The diarization model could not be loaded (token, terms, download, extras)."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    code = "diarization_model_unavailable"
+
+
+class DiarizationNotAvailableError(ConflictError):
+    """Speaker turns were requested before diarization finished."""
+
+    code = "diarization_not_available"
+
+
 def error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": jsonable_encoder(details)}}
 

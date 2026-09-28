@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     chunk_length_seconds: float = Field(default=1800.0, gt=0)
     chunk_overlap_seconds: float = Field(default=5.0, ge=0)
 
+    # Diarization
+    diarization_backend: Literal["pyannote", "mock"] = "pyannote"
+    diarization_model: str = "pyannote/speaker-diarization-3.1"
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    merge_gap_seconds: float = Field(default=0.5, ge=0)
+    min_turn_seconds: float = Field(default=0.3, ge=0)
+    diarization_chunk_threshold_seconds: float = Field(default=3600.0, gt=0)
+    speaker_similarity_threshold: float = Field(default=0.6, ge=-1, le=1)
+
     @field_validator("allowed_extensions", mode="before")
     @classmethod
     def _split_extensions(cls, value: object) -> object:

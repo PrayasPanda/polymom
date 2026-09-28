@@ -26,6 +26,7 @@ class Meeting(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float)
     audio_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     audio_quality: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    diarization: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     languages_hint: Mapped[list[str]] = mapped_column(JSON, default=list)
     expected_speakers: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[MeetingStatus] = mapped_column(

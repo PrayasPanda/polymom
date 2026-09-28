@@ -7,10 +7,16 @@ import structlog
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import Settings
-from app.core.exceptions import MeetingNotFoundError, MeetingStateConflictError, PolymomError
+from app.core.exceptions import (
+    DiarizationNotAvailableError,
+    MeetingNotFoundError,
+    MeetingStateConflictError,
+    PolymomError,
+)
 from app.core.logging import get_logger
 from app.models.meeting import Meeting
 from app.repositories.meeting_repository import MeetingRepository
+from app.schemas.diarization import DiarizationResult
 from app.schemas.meeting import MeetingStatus
 from app.services.audio.validator import AsyncReadable, MediaValidator
 
@@ -86,6 +92,16 @@ class MeetingService:
 
     async def list(self, *, limit: int, offset: int) -> tuple[list[Meeting], int]:
         return await self._repo.list(limit=limit, offset=offset)
+
+    async def get_diarization(self, meeting_id: uuid.UUID) -> DiarizationResult:
+        meeting = await self.get(meeting_id)
+        if meeting.diarization is None:
+            raise DiarizationNotAvailableError(
+                "Speaker diarization is not available yet. Run POST /meetings/{id}/process "
+                "and wait for status 'completed'.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+        return DiarizationResult.model_validate(meeting.diarization)
 
     async def request_processing(self, meeting_id: uuid.UUID, *, force: bool = False) -> Meeting:
         """Mark a meeting as ``processing`` so the pipeline can be scheduled.

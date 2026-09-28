@@ -11,6 +11,8 @@ from app.core.config import Settings, get_settings
 from app.pipelines.mom_pipeline import MoMPipeline, RepositoryFactory, build_pipeline
 from app.repositories.meeting_repository import MeetingRepository, SqlAlchemyMeetingRepository
 from app.services.audio.validator import MediaValidator
+from app.services.diarization.base import DiarizationBackend
+from app.services.diarization.service import build_backend
 from app.services.meeting_service import MeetingService
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
@@ -61,8 +63,19 @@ def repository_factory(
     return _make
 
 
-def get_pipeline(request: Request, settings: SettingsDep) -> MoMPipeline:
-    return build_pipeline(settings, repository_factory(request.app.state.sessionmaker))
+def get_diarization_backend(settings: SettingsDep) -> DiarizationBackend:
+    """Backend chosen by ``DIARIZATION_BACKEND`` (pyannote models are cached process-wide)."""
+    return build_backend(settings)
+
+
+def get_pipeline(
+    request: Request,
+    settings: SettingsDep,
+    diarization_backend: Annotated[DiarizationBackend, Depends(get_diarization_backend)],
+) -> MoMPipeline:
+    return build_pipeline(
+        settings, repository_factory(request.app.state.sessionmaker), diarization_backend
+    )
 
 
 PipelineDep = Annotated[MoMPipeline, Depends(get_pipeline)]
