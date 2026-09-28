@@ -1,103 +1,120 @@
 ## Summary
 
-Prompt 3 of 12 adds the audio preprocessing stage. Any validated upload (audio, or video that has an audio track) now becomes a model-ready **mono, 16 kHz, 16-bit PCM WAV** at `STORAGE_DIR/processed/{meeting_id}.wav`. The stage normalizes loudness to EBU R128, can apply an optional highpass and denoise, and reports silence and quality. The pipeline is now built from stages, and `POST /api/v1/meetings/{id}/process` runs it in the background. Diarization and ASR are not part of this PR.
+Prompt 4 of 12 adds speaker diarization as the second pipeline stage, after preprocessing. The stage labels every speaker **Person 1, Person 2, ...** consistently across the whole meeting, marks overlapping speech rather than dropping it, and splits long recordings into chunks whose speakers are re-linked by voice embeddings. Results are served by `GET /api/v1/meetings/{id}/speakers`.
 
-## Design decisions
+The backend is behind an interface: `pyannote` (real model, optional `ml` extra) or `mock` (deterministic fake, used by tests and on machines without a GPU or HF token). No ASR yet.
 
-- **Stage pattern:** each `PipelineStage` has a `name`, an async `run(context)` and an `apply(context, meeting)`.
-  - `run` does the work and writes its results to the shared `PipelineContext`; `apply` copies what should be saved onto the meeting.
-  - Keeping the two apart means stages never touch the database themselves.
-  - The orchestrator owns the status changes (`processing` → `completed`/`failed`) and logs each stage's timing.
-- **Status is set to `processing` in the request itself, before the background task starts,** so a second click gets a 409 instead of running the pipeline twice.
-  - Failed meetings can be retried without `force`.
-  - Background work opens its own short-lived database sessions, because the request's session is closed by the time the task runs.
-- **Quality is measured on the original audio.** Every normalized file ends up at about −23 LUFS, so RMS, peak and LUFS measured after normalization would say nothing about how the meeting was recorded, and clipping could no longer be detected.
-  - One ffmpeg pass (`silencedetect` + `astats` + `ebur128`) gathers all of these; it runs before conversion, and conversion uses its silence spans for optional trimming.
-- **Single-pass `loudnorm`, not two-pass:** for speech it's close enough, and it halves the ffmpeg work on long recordings. `loudnorm` upsamples internally, so `aresample` runs after it.
-- **Atomic output:** ffmpeg writes to `{id}.wav.part`, which is renamed only after the WAV header checks out.
-  - A timeout, ffmpeg error or bad output deletes the partial file.
-  - The ffmpeg runner kills the child process on timeout or cancellation.
-- **Warnings don't fail processing:** `low_volume`, `clipping`, `too_short` and `mostly_silent` are returned in `audio_quality.warnings`.
-- **The chunker uses the stdlib `wave` module rather than ffmpeg:** slices are sample-accurate with no re-encoding, and each chunk records its absolute offset. As the spec asks, it's exposed and tested but not wired in yet.
-- **Error mapping:**
-  - `AudioProcessingError` → 422 `audio_processing_failed`
-  - `FFmpegTimeoutError` → 504 `ffmpeg_timeout`
-  - `MeetingStateConflictError` → 409
+## Model choice and rationale
 
-  In the background path these are stored on the meeting as `"<code>: <message>"`.
+**`pyannote/speaker-diarization-3.1`:**
+- **Accurate and widely used:** it's the most widely adopted open diarization pipeline, with strong published results.
+- **Pure PyTorch:** 3.0 depended on `onnxruntime`.
+- **Language-agnostic:** it separates voices, not words, which suits Hindi, Odia and code-mixed meetings.
+- **Handles overlap natively.**
+- **Accepts speaker-count hints:** `num_speakers`, `min_speakers` and `max_speakers`, which lets us pass the upload's `expected_speakers`.
+- **Returns per-speaker embeddings,** which is what makes cross-chunk re-linking possible without a second embedding model.
+- **Hardware:** it runs on CPU and is fast on GPU.
+- **MIT licensed:** the model is gated behind accepting its terms, which the README walks through.
+
+**Dependencies:**
+- The `ml` extra pins `torch`/`torchaudio` below 2.9, because torchaudio 2.9 removed I/O APIs that pyannote.audio 3.x uses. The lock resolved to pyannote.audio 3.4.0 and torch 2.8.0.
+- As a second safeguard, audio is passed to pyannote as an in-memory waveform read with the stdlib `wave` module, so torchaudio's file I/O is never used.
+- torch comes from the PyTorch CPU index by default.
 
 ## Changes
 
-- `app/services/audio/`:
-  - `ffmpeg.py`: async subprocess runner with a timeout.
-  - `analysis.py`: silence and level analysis, and the warnings.
-  - `preprocessor.py`: the conversion itself.
-  - `chunker.py`: `plan_chunks` and `split_wav`.
-- `app/schemas/audio.py`: `AudioWarning`, `AudioQuality`, and `PreprocessResult` (which extends `AudioQuality` with `processed_path`). `MeetingRead` gains `audio_quality`; `processed_path` stays internal.
-- `app/pipelines/mom_pipeline.py`: `PipelineContext`, `PipelineStage`, `PreprocessStage`, the `MoMPipeline` orchestrator and `build_pipeline`.
-- **Endpoint:** `POST /api/v1/meetings/{id}/process?force=`, documented in OpenAPI with 404 and 409 examples. `DELETE` now also removes the processed file.
-- **Storage:** migration `0002` adds `processed_path` and `audio_quality` (a JSON column). `MeetingRepository.save` is new. `alembic check` reports no drift.
-- **Config** (in `.env.example` too):
-  - `TARGET_SAMPLE_RATE`, `TARGET_LOUDNESS_LUFS`
-  - `ENABLE_HIGHPASS`, `HIGHPASS_CUTOFF_HZ`, `ENABLE_DENOISE`
-  - `TRIM_SILENCE`, `SILENCE_THRESHOLD_DB`, `SILENCE_MIN_DURATION_SECONDS`
-  - `FFMPEG_PATH`, `FFMPEG_TIMEOUT_SECONDS`
-  - `CHUNK_LENGTH_SECONDS`, `CHUNK_OVERLAP_SECONDS`
-- **Docs:** the README covers the pipeline stage pattern (Mermaid diagram), the preprocessing steps, the warnings, `audio_quality` and the config flags. It also fixes a broken curl line continuation.
+- **Dependencies:**
+  - the optional `ml` extra (`uv sync --extra ml` or `make install-ml`); the base install and CI stay light
+  - torch and pyannote are imported lazily, and mypy treats them as untyped, so type checks pass without them installed
+- **`app/services/diarization/`:**
+  - `base.py`: the `DiarizationBackend` ABC. Backends implement `diarize_raw` (segments plus embeddings); the shared `diarize` applies post-processing.
+  - `pyannote_backend.py`:
+    - the pipeline is a lazy singleton per (model, device), with thread-safe loading and inference serialized by a lock
+    - `DEVICE` can be `auto`, `cpu` or `cuda`, and inference runs in a thread pool
+    - errors are typed and say what to fix: missing token, terms not accepted (pyannote returns `None`), download failure, missing extras, CUDA unavailable
+  - `mock_backend.py`: deterministic alternating speakers, with embeddings that identify the true speaker (so re-linking can be tested) and a "no speech" path.
+  - `postprocess.py`: pure functions `merge_gaps`, `drop_short_turns`, `find_overlaps` (sweep-line), `first_appearance_labels`, `build_result` and `relink_chunks`.
+  - `service.py`: picks whole-file or chunked mode by duration, uses the existing chunker, cleans up chunk files, and includes `build_backend` (the factory).
+- **Pipeline:** `DiarizationStage` is registered after `PreprocessStage`. `PipelineContext.expected_speakers` comes from the upload.
+- **API:** `GET /api/v1/meetings/{id}/speakers` returns the turns, speaker count, speaker list and overlap regions. It returns 409 `diarization_not_available` before diarization and 404 for an unknown meeting.
+- **Dependency injection:** `get_diarization_backend` in `deps.py` picks the backend from `DIARIZATION_BACKEND`.
+- **Errors:** `DiarizationError` (500 `diarization_failed`), `DiarizationModelLoadError` (503 `diarization_model_unavailable`) and `DiarizationNotAvailableError` (409).
+- **Config:**
+  - `DIARIZATION_BACKEND`, `DEVICE`, `DIARIZATION_MODEL`
+  - `MERGE_GAP_SECONDS`, `MIN_TURN_SECONDS`
+  - `DIARIZATION_CHUNK_THRESHOLD_SECONDS`, `SPEAKER_SIMILARITY_THRESHOLD`
+- **Docker:**
+  - `INSTALL_ML=true` installs the `ml` extra; `TORCH_VARIANT=cu124` (for example) swaps in CUDA wheels of the locked torch version
+  - `HF_HOME` and `TORCH_HOME` point into `/app/.cache`, which the compose file mounts as the `model-cache` volume
+- **Makefile:** new targets `install-ml`, `test-slow` and `docker-build-ml`.
+- **Docs:** a README diarization section covering the model choice, Hugging Face setup, label consistency, overlaps, long recordings, known limitations and config.
+
+### Persistence: a `diarization` JSON column, not a `speaker_turns` table
+
+Migration `0003` adds a JSON column. Diarization is written in one go at the end of the stage, always read whole (by `/speakers` and by the ASR alignment coming in Prompt 6), and replaced whole when a meeting is reprocessed with `force`. A JSON document fits that pattern: saving is one atomic update rather than a delete plus N inserts, there are no joins, and it matches the existing `audio_quality` column. It also works on SQLite and on Postgres, where it could later become JSONB. The trade-off is that you can't query individual turns across meetings in SQL. If analytics later needs that, a `speaker_turns` table can be generated from this column without changing the API.
 
 ## Test coverage
 
-90 tests pass, with 95% coverage overall. For the new code:
+137 tests pass, plus 1 slow real-model test that is deselected by default. Overall coverage is 96%; for the new code:
 
 | Module | Coverage |
 | --- | --- |
-| `mom_pipeline.py` | 100% |
-| `chunker.py` | 100% |
+| `postprocess.py` | 99% |
+| `service.py` | 100% |
+| `mock_backend.py` | 100% |
+| `base.py` | 100% |
+| `pyannote_backend.py` | 89% (the uncovered lines are the real waveform loader, which needs the `ml` extras) |
+| `mom_pipeline.py` | 99% |
 | `meeting_service.py` | 100% |
-| `analysis.py` | 99% |
-| `preprocessor.py` | 97% |
-| `ffmpeg.py` | 86% (the untested lines are the cancellation branch) |
+| `routes/meetings.py` | 100% |
 
-**Fixtures,** generated with ffmpeg `lavfi` at test time (no binaries committed):
-- a stereo 44.1 kHz tone
-- an mp4 video with an AAC audio track
-- a near-silent file (about −70 dBFS)
-- a clipped file
-- a 1 s file
-- a file padded with 1 s of silence at each end
-- a 3-minute file
+- **Post-processing unit tests:**
+  - labels follow first appearance, not raw label order
+  - gap merging, including that merging is per speaker across interjections
+  - short turns are dropped, but a speaker's only turn and "longest when all are short" are kept
+  - overlap detection, including touching turns and three-way overlaps
+  - timestamps are rounded to 3 decimals
+  - single-speaker audio and audio with no speech
+- **Re-linking with synthetic embeddings:**
+  - speakers swap local labels between chunks but keep their global identity
+  - a new speaker below the threshold gets a new label, and person numbers stay stable in later chunks
+  - matching is one-to-one within a chunk
+  - missing or NaN embeddings are handled
+  - overlap-window de-duplication
+  - cosine similarity edge cases
+- **Backend tests:**
+  - the mock backend and the backend factory
+  - the chunked service with the mock (consistent labels over 60 s in 20 s chunks, chunk files cleaned up)
+  - no chunking below the threshold
+  - the pyannote backend with **faked `torch` and `pyannote.audio` modules**: kwargs passed through, loaded once then cached, device selection, missing token, gated model, download failure, missing extras, CUDA unavailable, inference failure, embedding order
+- **Integration tests** (mock backend):
+  - upload, process, then `/speakers`
+  - `expected_speakers=3` produces 3 speakers
+  - silent audio completes with 0 speakers
+  - 409 before diarization and 404 for an unknown meeting
+  - the pyannote backend without `HF_TOKEN` marks the meeting `failed` with an actionable `diarization_model_unavailable: HF_TOKEN is not set...` while keeping `audio_quality`
+- **Real model test:** `@pytest.mark.slow` and skipped without `HF_TOKEN` or the `ml` extras. `addopts` excludes `slow`, so CI runs only the fast tests; run it with `make test-slow`.
 
-**Unit tests** check that:
-- output is mono, 16 kHz and PCM s16, and the original is byte-for-byte unchanged
-- audio is extracted from video
-- a custom sample rate works and denoise runs
-- each warning fires exactly when it should
-- leading and trailing silence are reported but only trimmed when the flag is on
-- the chunk plan is correct, and 3-minute chunks have sample-exact offsets and overlaps
-- the filter chain respects the config flags
-- a timeout kills the process and raises `FFmpegTimeoutError`, and non-zero exits and a missing binary are handled
-- partial output is cleaned up after a timeout or an invalid WAV
-- the orchestrator runs stages in order, records typed and unexpected failures, and leaves later stages unrun after a failure
+## Known limitations
 
-**Integration tests** check that:
-- upload, then process, then GET shows `completed` with `audio_quality` filled in
-- a second `process` call gets a 409, and `force=true` reprocesses
-- `process` on an unknown meeting gets a 404
-- a missing ffmpeg records `failed` with an `audio_processing_failed: ...` error, and the meeting can then be retried
-- delete removes the processed file
+- **Real model not run by me:** it hasn't run against pyannote 3.1 in this environment, because I have no `HF_TOKEN` here. The integration code is tested against fakes that follow pyannote's API, and the ML Docker image builds and imports it. Please run `make install-ml && HF_TOKEN=... make test-slow` once.
+- **Speed:** CPU inference is slow for long meetings (tens of minutes per hour of audio, depending on the CPU); a GPU is strongly recommended. Inference runs in the API process until the worker queue arrives in Prompt 11.
+- **Speaker accuracy:** very brief or quiet speakers may be missed, and similar voices may be merged or split, particularly across chunks (tune `SPEAKER_SIMILARITY_THRESHOLD`). Laughter and music can be attributed to a speaker.
+- **Chunk boundaries:** chunks receive `expected_speakers` as a maximum, not an exact count, so the result may contain fewer speakers than expected.
+- **Mock vs. default:** the mock backend is only for development and tests. The default is `pyannote`, so a misconfigured deployment fails loudly instead of producing fake speakers.
 
 ## Checklist
 
-- [x] `make lint` (ruff check + format) passes
-- [x] `make typecheck` (mypy strict) passes
+- [x] `make lint` passes
+- [x] `make typecheck` (mypy strict) passes, without the ML extras installed
 - [x] `make test` passes, with coverage of new code at least 85%
-- [x] Docker image builds
-- [x] Migration 0002 applies on top of 0001, and `alembic check` is clean
-- [x] The original upload is never modified; partial output is removed on failure
-- [x] No large binaries or secrets committed
+- [x] Docker build passes without the `ml` extras
+- [x] Docker build passes with `INSTALL_ML=true` (CPU torch), and pyannote imports in the image
+- [x] Migration 0003 applies on top of 0002, and `alembic check` is clean
+- [x] No secrets or model weights committed
 
 ## Next steps
 
-**Prompt 4: speaker diarization.** Add a `DiarizationStage` that runs pyannote (as an optional `diarization` dependency group) on `context.processed_path`, using the chunker for long recordings and `expected_speakers` as a hint. It will persist speaker segments.
+**Prompt 5: multilingual ASR.** Add an ASR stage (Whisper / faster-whisper) for English, Hindi, Odia and code-mixed speech on `processed_path`, chunked the same way for long meetings. It produces word-level timestamps that Prompt 6 will align with these speaker turns.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

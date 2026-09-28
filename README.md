@@ -9,7 +9,7 @@ Voice-based **Minutes of Meeting** pipeline. Upload a meeting recording and get 
 
 Everything is exposed through a FastAPI service.
 
-> Status: **upload** and **audio preprocessing** work, and the pipeline runs through the preprocess stage. Diarization, ASR and summarization are still stubs. See the [roadmap](#roadmap).
+> Status: **upload**, **audio preprocessing** and **speaker diarization** work (preprocess, then diarize). ASR and summarization are still stubs. See the [roadmap](#roadmap).
 
 ## Architecture
 
@@ -97,7 +97,8 @@ Interactive docs: <http://localhost:8000/docs>.
 ```bash
 make lint       # ruff check + format check
 make typecheck  # mypy --strict on app/
-make test       # pytest with coverage
+make test       # fast tests with coverage (slow/real-model tests excluded)
+make test-slow  # real pyannote test; needs `make install-ml` and HF_TOKEN
 make format     # auto-fix
 ```
 
@@ -112,6 +113,7 @@ Interactive docs with schemas and example responses: <http://localhost:8000/docs
 | `GET` | `/api/v1/meetings` | Paginated list, newest first (`limit` 1-100, default 20; `offset`) |
 | `GET` | `/api/v1/meetings/{meeting_id}` | Metadata and status |
 | `DELETE` | `/api/v1/meetings/{meeting_id}` | Delete the record, the upload and the processed audio (`204`) |
+| `GET` | `/api/v1/meetings/{meeting_id}/speakers` | Speaker turns (`Person 1..N`), speaker count and overlap regions; `409` until diarized |
 | `POST` | `/api/v1/meetings/{meeting_id}/process` | Run the pipeline in the background (`202`); `409` if already processing/completed unless `?force=true` |
 
 ```bash
@@ -128,6 +130,7 @@ curl -X DELETE http://localhost:8000/api/v1/meetings/3f8b6f0e-...
 curl -X POST http://localhost:8000/api/v1/meetings/3f8b6f0e-.../process
 # {"meeting_id":"3f8b6f0e-...","status":"processing"}
 curl http://localhost:8000/api/v1/meetings/3f8b6f0e-...   # includes audio_quality
+curl http://localhost:8000/api/v1/meetings/3f8b6f0e-.../speakers
 ```
 
 ### Upload validation
@@ -156,6 +159,7 @@ Every error uses the same envelope:
 | 415 | `unsupported_file_type` | Extension not allowed, or content does not match it |
 | 422 | `empty_file` / `corrupted_media` | Zero bytes; unreadable file; no audio stream |
 | 422 | `validation_error` | Invalid form/query fields |
+| 409 | `diarization_not_available` | `/speakers` before the meeting has been diarized |
 | 409 | `meeting_state_conflict` | `/process` on a meeting that is processing or completed, without `force` |
 | 500 | `media_probe_unavailable` | `ffprobe` missing on the server |
 
@@ -177,10 +181,11 @@ flowchart TD
     API["POST /meetings/{id}/process"] -->|"status = processing<br/>(409 if busy, unless force)"| BG[BackgroundTasks]
     BG --> ORCH[MoMPipeline.run]
     ORCH --> S1[PreprocessStage]
-    S1 -.-> S2["DiarizationStage (Prompt 4)"]
+    S1 --> S2[DiarizationStage]
     S2 -.-> S3["ASR stage (Prompt 5)"]
     S3 -.-> SN[...]
     S1 -->|"apply(): processed_path, audio_quality"| DB[(meetings)]
+    S2 -->|"apply(): diarization"| DB
     ORCH -->|"all stages ok"| DONE[status = completed]
     ORCH -->|"PolymomError"| FAIL["status = failed<br/>error = 'code: message'"]
 ```
@@ -229,12 +234,80 @@ The level metrics (`loudness_lufs`, `rms_db`, `peak_db`) describe the **original
 | `FFMPEG_PATH` / `FFMPEG_TIMEOUT_SECONDS` | `ffmpeg` / `1800` | ffmpeg binary and per-run timeout |
 | `CHUNK_LENGTH_SECONDS` / `CHUNK_OVERLAP_SECONDS` | `1800` / `5` | Chunker defaults (30 min, 5 s overlap) |
 
+## Speaker diarization
+
+`DiarizationStage` runs after preprocessing on the 16 kHz mono WAV and answers *who spoke when*. Each speaker is labelled **Person 1, Person 2, ...**, consistently across the whole meeting. The results are stored on the meeting and served by `GET /meetings/{id}/speakers`.
+
+### Model choice: pyannote 3.1
+
+`pyannote/speaker-diarization-3.1` is the most widely used open diarization pipeline. It is pure PyTorch (3.0 needed `onnxruntime`), it runs acceptably on CPU and well on a GPU, and it is language-agnostic. That matters for Hindi, Odia and code-mixed meetings: it separates voices, not words. It handles overlapping speech natively, accepts `num_speakers`/`min_speakers`/`max_speakers` hints, and can return per-speaker embeddings, which we use to re-link speakers across chunks of long recordings. Its MIT license allows commercial use, though the model itself is gated behind accepting its terms.
+
+### Hugging Face setup
+
+1. Create a Hugging Face account and a **read** access token at <https://huggingface.co/settings/tokens>.
+2. Accept the user conditions for **both** <https://huggingface.co/pyannote/speaker-diarization-3.1> and <https://huggingface.co/pyannote/segmentation-3.0> while logged in as that account.
+3. Install the ML extras and configure:
+
+   ```bash
+   make install-ml            # uv sync --all-groups --extra ml (CPU torch)
+   # .env
+   HF_TOKEN=hf_...
+   DIARIZATION_BACKEND=pyannote
+   DEVICE=auto                # cuda if available, else cpu
+   ```
+
+The model downloads on first use (about 30 MB) into the Hugging Face cache (`HF_HOME`). Mistakes produce actionable errors, recorded on the meeting as `diarization_model_unavailable: ...`: a missing token, terms not accepted, missing ML extras, or `DEVICE=cuda` with no GPU.
+
+Without a GPU or token, set `DIARIZATION_BACKEND=mock` for a deterministic fake (speakers alternate every 2 s; silent audio yields no speakers). The test suite uses the mock.
+
+### How labels stay consistent
+
+Post-processing (`app/services/diarization/postprocess.py`) is a set of pure functions, applied in this order:
+
+1. **Merge gaps.** A speaker's consecutive turns are joined when the pause between them is under `MERGE_GAP_SECONDS` (0.5 s). Merging is per speaker, so a short interjection from someone else doesn't split the turn.
+2. **Drop short turns.** Turns under `MIN_TURN_SECONDS` (0.3 s) are removed, except a speaker's only turn. If all of a speaker's turns are short, their longest is kept so the speaker doesn't vanish.
+3. **Mark overlaps.** A sweep-line finds every span where two or more people speak. Those turns get `is_overlap: true` and the spans are listed in `overlap_regions`; overlapping speech is marked, never discarded.
+4. **Relabel.** Raw model labels (`SPEAKER_00`, ...) are arbitrary, so speakers are renumbered by first appearance: whoever speaks first is Person 1. The model's label stays available as `raw_label`.
+
+### Long recordings
+
+Recordings longer than `DIARIZATION_CHUNK_THRESHOLD_SECONDS` (1 h) are split into `CHUNK_LENGTH_SECONDS` chunks (30 min) that overlap by `CHUNK_OVERLAP_SECONDS` (5 s), and each chunk is diarized separately. Local labels differ per chunk, so speakers are **re-linked** by the cosine similarity of their pyannote embeddings against running per-person centroids. Matching is greedy and one-to-one within a chunk; a similarity below `SPEAKER_SIMILARITY_THRESHOLD` (0.6) means a new person. This way Person 2 in chunk 1 is still Person 2 in chunk 3. Timestamps are shifted by each chunk's offset, and each chunk keeps only its half of an overlap window, so no speech is counted twice. `expected_speakers` is passed to each chunk as `max_speakers`, because a chunk may not contain everyone.
+
+### Known limitations
+
+- **Speed:** on a GPU, pyannote 3.1 processes an hour of audio in roughly 1.5 minutes. On CPU it is much slower, often tens of minutes per hour depending on the machine, so use a GPU for long meetings. It currently runs inside the API process; the worker queue in Prompt 11 moves it out.
+- **Short or quiet speakers:** someone who only says "yes" once may be missed or merged into another speaker. `expected_speakers` helps.
+- **Similar voices:** speakers with similar voices, or the same person on different microphones, can be merged or split, especially across chunks. Tune `SPEAKER_SIMILARITY_THRESHOLD`.
+- **Non-speech sounds:** music and laughter can occasionally be assigned to a speaker.
+- **Names:** "Person N" labels are anonymous; mapping them to real names is out of scope.
+
+### Diarization configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DIARIZATION_BACKEND` | `pyannote` | `pyannote` (real model) or `mock` |
+| `DEVICE` | `auto` | `auto`, `cpu` or `cuda` |
+| `HF_TOKEN` | – | Hugging Face token with the model terms accepted |
+| `MERGE_GAP_SECONDS` | `0.5` | Join same-speaker turns separated by shorter pauses |
+| `MIN_TURN_SECONDS` | `0.3` | Drop shorter turns (never a speaker's last trace) |
+| `DIARIZATION_CHUNK_THRESHOLD_SECONDS` | `3600` | Chunk recordings longer than this |
+| `SPEAKER_SIMILARITY_THRESHOLD` | `0.6` | Cosine similarity for cross-chunk re-linking |
+
 ## Running with Docker
 
 ```bash
 make docker-build   # build polymom:latest
 make docker-up      # docker compose up on port 8000 (reads .env if present)
 ```
+
+```bash
+make docker-build-ml                                   # with torch (CPU) + pyannote
+docker build -f docker/Dockerfile --build-arg INSTALL_ML=true \
+    --build-arg TORCH_VARIANT=cu124 -t polymom:cuda .   # CUDA torch; run with --gpus all
+INSTALL_ML=true docker compose -f docker/docker-compose.yml up --build
+```
+
+By default the image stays light, without ML. `INSTALL_ML=true` adds torch and pyannote; `TORCH_VARIANT` swaps in CUDA wheels of the same torch version. Downloaded models are cached in the `model-cache` volume (`HF_HOME=/app/.cache/huggingface`), so they survive restarts.
 
 The image uses a multi-stage build, runs as a non-root `app` user, installs `ffmpeg` and `libmagic`, and defines a `HEALTHCHECK` against `/api/v1/health`. The SQLite database and uploads live in the `storage` volume.
 
@@ -244,8 +317,8 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | --- | --- | --- |
 | 1 | Project scaffold ✅ | Layout, tooling, CI, Docker, health endpoint |
 | 2 | Upload API ✅ | Multipart upload, size/extension validation, storage, meeting records |
-| 3 | **Audio preprocessing** ✅ | ffmpeg extract, resample, loudness-normalize, silence/quality analysis, chunking, stage-based pipeline |
-| 4 | Speaker diarization | pyannote integration (optional `diarization` extra) |
+| 3 | Audio preprocessing ✅ | ffmpeg extract, resample, loudness-normalize, silence/quality analysis, chunking, stage-based pipeline |
+| 4 | **Speaker diarization** ✅ | pyannote 3.1 stage, consistent Person N labels, overlaps, chunk re-linking |
 | 5 | Multilingual ASR | Whisper-based ASR with language ID for en/hi/or and code-mixed speech |
 | 6 | Alignment | Word-to-speaker attribution, speaker turns |
 | 7 | Speaker analytics | Talk time, turns, interruptions, WPM |
