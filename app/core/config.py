@@ -25,10 +25,17 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr | None = None
 
     storage_dir: Path = Path("./storage")
+    database_url: str | None = None
+    auto_migrate: bool = True
+
     max_upload_mb: int = Field(default=200, gt=0)
+    upload_chunk_bytes: int = Field(default=1024 * 1024, gt=0)
     allowed_extensions: Annotated[frozenset[str], NoDecode] = frozenset(
-        {"wav", "mp3", "m4a", "flac", "ogg", "webm", "mp4"}
+        {"wav", "mp3", "m4a", "flac", "ogg", "aac", "mp4", "mkv", "mov", "webm"}
     )
+
+    ffprobe_path: str = "ffprobe"
+    ffprobe_timeout_seconds: float = Field(default=30.0, gt=0)
 
     @field_validator("allowed_extensions", mode="before")
     @classmethod
@@ -41,6 +48,17 @@ class Settings(BaseSettings):
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def uploads_dir(self) -> Path:
+        return self.storage_dir / "uploads"
+
+    @property
+    def resolved_database_url(self) -> str:
+        """``DATABASE_URL`` if set, else a SQLite file inside ``STORAGE_DIR``."""
+        if self.database_url:
+            return self.database_url
+        return f"sqlite+aiosqlite:///{(self.storage_dir / 'polymom.db').resolve().as_posix()}"
 
 
 @lru_cache

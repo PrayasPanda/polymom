@@ -12,6 +12,10 @@ dependencies = [
     "pydantic-settings>=2.4",
     "structlog>=24.4",
     "python-multipart>=0.0.9",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.22.1",
+    "alembic>=1.20.0",
+    "filetype>=1.2.0",
 ]
 
 [project.optional-dependencies]
@@ -59,3 +63,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra --cov=app --cov-report=term-missing"
+
+[[tool.mypy.overrides]]
+module = ["filetype", "filetype.*"]
+ignore_missing_imports = true
