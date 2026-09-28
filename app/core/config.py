@@ -37,6 +37,22 @@ class Settings(BaseSettings):
     ffprobe_path: str = "ffprobe"
     ffprobe_timeout_seconds: float = Field(default=30.0, gt=0)
 
+    # Preprocessing
+    ffmpeg_path: str = "ffmpeg"
+    ffmpeg_timeout_seconds: float = Field(default=1800.0, gt=0)
+    target_sample_rate: int = Field(default=16000, ge=8000, le=48000)
+    target_loudness_lufs: float = Field(default=-23.0, le=0)
+    enable_highpass: bool = True
+    highpass_cutoff_hz: int = Field(default=80, gt=0)
+    enable_denoise: bool = False
+    trim_silence: bool = False
+    silence_threshold_db: float = Field(default=-50.0, lt=0)
+    silence_min_duration_seconds: float = Field(default=0.5, gt=0)
+
+    # Chunking for long recordings
+    chunk_length_seconds: float = Field(default=1800.0, gt=0)
+    chunk_overlap_seconds: float = Field(default=5.0, ge=0)
+
     @field_validator("allowed_extensions", mode="before")
     @classmethod
     def _split_extensions(cls, value: object) -> object:
@@ -52,6 +68,10 @@ class Settings(BaseSettings):
     @property
     def uploads_dir(self) -> Path:
         return self.storage_dir / "uploads"
+
+    @property
+    def processed_dir(self) -> Path:
+        return self.storage_dir / "processed"
 
     @property
     def resolved_database_url(self) -> str:
