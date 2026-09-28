@@ -9,7 +9,7 @@ Voice-based **Minutes of Meeting** pipeline. Upload a meeting recording and get 
 
 Everything is exposed through a FastAPI service.
 
-> Status: **upload**, **audio preprocessing** and **speaker diarization** work (preprocess, then diarize). ASR and summarization are still stubs. See the [roadmap](#roadmap).
+> Status: **upload**, **audio preprocessing**, **speaker diarization** and **multilingual ASR** (English, Hindi, Odia) work. Aligning words to speakers and summarization come next. See the [roadmap](#roadmap).
 
 ## Architecture
 
@@ -98,7 +98,7 @@ Interactive docs: <http://localhost:8000/docs>.
 make lint       # ruff check + format check
 make typecheck  # mypy --strict on app/
 make test       # fast tests with coverage (slow/real-model tests excluded)
-make test-slow  # real pyannote test; needs `make install-ml` and HF_TOKEN
+make test-slow  # real-model tests (pyannote, Whisper, Odia); need `make install-ml`, HF_TOKEN
 make format     # auto-fix
 ```
 
@@ -113,6 +113,7 @@ Interactive docs with schemas and example responses: <http://localhost:8000/docs
 | `GET` | `/api/v1/meetings` | Paginated list, newest first (`limit` 1-100, default 20; `offset`) |
 | `GET` | `/api/v1/meetings/{meeting_id}` | Metadata and status |
 | `DELETE` | `/api/v1/meetings/{meeting_id}` | Delete the record, the upload and the processed audio (`204`) |
+| `GET` | `/api/v1/meetings/{meeting_id}/transcript` | Timestamped transcript; `?format=json` (default), `txt` or `srt`; `409` until transcribed |
 | `GET` | `/api/v1/meetings/{meeting_id}/speakers` | Speaker turns (`Person 1..N`), speaker count and overlap regions; `409` until diarized |
 | `POST` | `/api/v1/meetings/{meeting_id}/process` | Run the pipeline in the background (`202`); `409` if already processing/completed unless `?force=true` |
 
@@ -131,6 +132,7 @@ curl -X POST http://localhost:8000/api/v1/meetings/3f8b6f0e-.../process
 # {"meeting_id":"3f8b6f0e-...","status":"processing"}
 curl http://localhost:8000/api/v1/meetings/3f8b6f0e-...   # includes audio_quality
 curl http://localhost:8000/api/v1/meetings/3f8b6f0e-.../speakers
+curl "http://localhost:8000/api/v1/meetings/3f8b6f0e-.../transcript?format=srt" -o meeting.srt
 ```
 
 ### Upload validation
@@ -159,6 +161,7 @@ Every error uses the same envelope:
 | 415 | `unsupported_file_type` | Extension not allowed, or content does not match it |
 | 422 | `empty_file` / `corrupted_media` | Zero bytes; unreadable file; no audio stream |
 | 422 | `validation_error` | Invalid form/query fields |
+| 409 | `transcript_not_available` | `/transcript` before the meeting has been transcribed |
 | 409 | `diarization_not_available` | `/speakers` before the meeting has been diarized |
 | 409 | `meeting_state_conflict` | `/process` on a meeting that is processing or completed, without `force` |
 | 500 | `media_probe_unavailable` | `ffprobe` missing on the server |
@@ -182,10 +185,11 @@ flowchart TD
     BG --> ORCH[MoMPipeline.run]
     ORCH --> S1[PreprocessStage]
     S1 --> S2[DiarizationStage]
-    S2 -.-> S3["ASR stage (Prompt 5)"]
-    S3 -.-> SN[...]
+    S2 --> S3[TranscriptionStage]
+    S3 -.-> SN["alignment, analytics, summary"]
     S1 -->|"apply(): processed_path, audio_quality"| DB[(meetings)]
     S2 -->|"apply(): diarization"| DB
+    S3 -->|"apply(): transcript"| DB
     ORCH -->|"all stages ok"| DONE[status = completed]
     ORCH -->|"PolymomError"| FAIL["status = failed<br/>error = 'code: message'"]
 ```
@@ -293,6 +297,109 @@ Recordings longer than `DIARIZATION_CHUNK_THRESHOLD_SECONDS` (1 h) are split int
 | `DIARIZATION_CHUNK_THRESHOLD_SECONDS` | `3600` | Chunk recordings longer than this |
 | `SPEAKER_SIMILARITY_THRESHOLD` | `0.6` | Cosine similarity for cross-chunk re-linking |
 
+## Speech recognition (English, Hindi, Odia)
+
+`TranscriptionStage` runs after diarization on the 16 kHz WAV and produces a **timestamped transcript in each language's native script**: segments with word timings, confidence, language and the backend that produced them. It is independent of diarization for now; attributing words to speakers comes in a later prompt. The transcript is served by `GET /meetings/{id}/transcript` as JSON, plain text or SRT subtitles.
+
+### Routing design
+
+No single open model covers all three languages well, so ASR is **routed per language** to interchangeable backends (`app/services/asr/`):
+
+```mermaid
+flowchart LR
+    H["upload languages hint"] --> C{choose_language}
+    C -->|"exactly one: en / hi / or"| R[ASRRouter]
+    C -->|"none or several"| AUTO["auto-detect (Whisper)"]
+    R -->|"en, hi"| W["WhisperBackend<br/>faster-whisper large-v3"]
+    R -->|"or"| I["IndicConformerBackend<br/>AI4Bharat 600M"]
+    AUTO --> W
+    W --> P["post-process: NFC, hallucination guards,<br/>low-confidence flags, chunk merge"]
+    I --> P
+```
+
+- `ASRBackend` (`base.py`) defines the interface: `transcribe(audio_path, language, offset) -> ASRResult` and `supported_languages`.
+- `ASRRouter` maps language codes to backends using `ASR_LANGUAGE_BACKENDS=en:whisper,hi:whisper,or:indic`. A misconfigured mapping fails at startup; an unsupported language raises `unsupported_language` with the fix in the message. Routing is a separate object so that Prompt 6 can route **per segment** after language identification.
+- **Current strategy:** if exactly one language hint was given on upload, that language is forced. With no hint, or several (a code-mixed meeting), Whisper decodes without a forced language, because forcing one language on mixed speech mangles the others.
+- **Long recordings** reuse the chunker (30 min chunks, 5 s overlap), and timestamps are shifted to meeting time. In each overlap, a segment belongs to the chunk that owns its midpoint. Near-duplicates that overlap in time with the previous segment (same text, contained text, or ≥ 80 % fuzzy match) are dropped, keeping the more complete version.
+- `ASR_BACKEND=mock` swaps every route for a deterministic fake that emits scripted English, Hindi and Odia lines. The tests use it.
+
+### Model choices
+
+| Language | Model | Why |
+| --- | --- | --- |
+| English, Hindi | [`Systran/faster-whisper-large-v3`](https://huggingface.co/Systran/faster-whisper-large-v3) (MIT, not gated) | Whisper large-v3 is the strongest open multilingual model for English and Hindi, with language ID, native word timestamps and Silero VAD. The CTranslate2 build is up to 4× faster than the reference implementation and uses less memory, with int8 on CPU and float16 on GPU. |
+| Odia | [`ai4bharat/indic-conformer-600m-multilingual`](https://huggingface.co/ai4bharat/indic-conformer-600m-multilingual) (MIT, gated, auto-approved) | **Whisper does not support Odia.** AI4Bharat's IndicConformer is purpose-built for Indian languages, and one multilingual checkpoint covers the 22 scheduled languages, including Odia. It is actively maintained and ships as ONNX with a transformers loader, so it **does not need NeMo**. |
+
+The Odia model returns text only, with no timestamps. Segments are therefore cut at **energy-based speech regions**, accurate to one 30 ms frame, and each region is transcribed separately. **Word timings are approximated** by spreading the segment's duration over its words in proportion to their length. Segment boundaries are reliable; individual Odia word times can be off by roughly a word's length, which is fine for subtitles and speaker attribution at segment level. No confidence scores are available for Odia.
+
+### Native scripts and normalization
+
+Text is kept exactly in the script the model produced: Latin for English, Devanagari for Hindi, Odia script for Odia. **Nothing is ever transliterated.** All text is normalized to Unicode **NFC** so that equal-looking strings compare equal. Two notes:
+
+- Devanagari nukta letters (क़ ज़ ड़ ...) and Odia ଡ଼/ଢ଼ are Unicode *composition exclusions*, so their NFC form is **base letter + nukta**. A model emitting precomposed `U+095B` (ज़) is normalized to `ज` + `़`.
+- Odia two-part vowel signs (ୋ ୈ ୌ) are composed.
+
+### Quality guards
+
+- **Low confidence:** segments whose average word probability is below `ASR_LOW_CONFIDENCE_THRESHOLD` (0.5) get `low_confidence: true` and are kept.
+- **Hallucinations** that Whisper produces during silence or when it loops are dropped (the counts per reason are logged):
+  - empty or punctuation-only output
+  - filler-only output (uh, um, hmm, हम्म ...) or known subtitle phrases ("thanks for watching") when the model reports silence (`no_speech_prob` ≥ `ASR_NO_SPEECH_THRESHOLD`) or low confidence
+  - text with a compression ratio above `ASR_COMPRESSION_RATIO_THRESHOLD` (2.4), which signals repetition loops
+  - a segment identical to the previous one
+- Whisper also runs with `condition_on_previous_text=False` and the VAD filter enabled, which prevents most loops in the first place.
+
+### Setup
+
+```bash
+make install-ml        # uv sync --all-groups --extra ml --extra indic
+# .env
+ASR_BACKEND=real
+WHISPER_MODEL_SIZE=large-v3     # "small" or "medium" for CPU-only machines
+HF_TOKEN=hf_...                 # accept the terms at huggingface.co/ai4bharat/indic-conformer-600m-multilingual
+```
+
+The models download on first use into `HF_HOME`: large-v3 is about 3 GB and IndicConformer is a few GB. In Docker, build with `INSTALL_ML=true INSTALL_INDIC=true`; the `model-cache` volume is shared with diarization.
+
+### Evaluating accuracy
+
+`scripts/eval_asr.py` transcribes a folder of recordings and reports **WER and CER per language** using jiwer. Put audio next to a same-named `.txt` reference, grouped by language folder:
+
+```text
+data/en/call1.wav  data/en/call1.txt
+data/hi/clip.mp3   data/hi/clip.txt
+data/or/demo.wav   data/or/demo.txt
+```
+
+```bash
+make eval-asr DATA=data/                                  # real models
+uv run python scripts/eval_asr.py data/ --json report.json
+uv run python scripts/eval_asr.py data/ --backend mock    # plumbing check only
+```
+
+Before scoring, both texts are NFC-normalized, case-folded and stripped of punctuation, including the danda (।). **CER is the metric to watch for Hindi and Odia**, where word segmentation and spelling variants inflate WER.
+
+### Known limitations
+
+- **Odia timestamps** are approximate at word level (see above), and Odia segments carry no confidence.
+- **Code-mixed speech:** without a single-language hint, Whisper picks one language per 30 s window. Hindi-English mixing is usually transcribed reasonably, but Odia inside a mixed meeting is sent to Whisper, which cannot transcribe it well. Per-segment language ID and routing is Prompt 6. Whisper also sometimes labels Hindi as Urdu and writes it in Perso-Arabic script; pass `languages=hi` when you know the language.
+- **Compute:** faster-whisper large-v3 needs roughly 5 GB of GPU memory in float16. On CPU (int8) it runs at roughly real time or slower, so use `small` or `medium` on CPU-only hosts. Both models load inside the API process until the worker queue arrives.
+- **Model downloads:** the first transcription of each language downloads the model, so it is slow.
+
+### ASR configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ASR_BACKEND` | `real` | `real` or `mock` |
+| `WHISPER_MODEL_SIZE` | `large-v3` | Any faster-whisper size/model id |
+| `WHISPER_COMPUTE_TYPE` | `auto` | `auto` = float16 on GPU, int8 on CPU |
+| `ODIA_MODEL_ID` / `ODIA_DECODING` | IndicConformer 600M / `rnnt` | Odia model and decoder (`rnnt` more accurate, `ctc` faster) |
+| `ASR_LANGUAGE_BACKENDS` | `en:whisper,hi:whisper,or:indic` | Language → backend routing |
+| `ASR_BEAM_SIZE` | `5` | Whisper beam size |
+| `ASR_VAD_FILTER` | `true` | Whisper Silero VAD |
+| `ASR_LOW_CONFIDENCE_THRESHOLD` | `0.5` | Flag segments below this average confidence |
+| `ASR_COMPRESSION_RATIO_THRESHOLD` / `ASR_NO_SPEECH_THRESHOLD` | `2.4` / `0.6` | Hallucination guards |
+
 ## Running with Docker
 
 ```bash
@@ -301,13 +408,13 @@ make docker-up      # docker compose up on port 8000 (reads .env if present)
 ```
 
 ```bash
-make docker-build-ml                                   # with torch (CPU) + pyannote
+make docker-build-ml                                   # torch (CPU), pyannote, faster-whisper, Odia ASR
 docker build -f docker/Dockerfile --build-arg INSTALL_ML=true \
     --build-arg TORCH_VARIANT=cu124 -t polymom:cuda .   # CUDA torch; run with --gpus all
 INSTALL_ML=true docker compose -f docker/docker-compose.yml up --build
 ```
 
-By default the image stays light, without ML. `INSTALL_ML=true` adds torch and pyannote; `TORCH_VARIANT` swaps in CUDA wheels of the same torch version. Downloaded models are cached in the `model-cache` volume (`HF_HOME=/app/.cache/huggingface`), so they survive restarts.
+By default the image stays light, without ML. `INSTALL_ML=true` adds torch, pyannote and faster-whisper, and `INSTALL_INDIC=true` adds the Odia ASR runtime; `TORCH_VARIANT` swaps in CUDA wheels of the same torch version. Downloaded models are cached in the `model-cache` volume (`HF_HOME=/app/.cache/huggingface`), so they survive restarts.
 
 The image uses a multi-stage build, runs as a non-root `app` user, installs `ffmpeg` and `libmagic`, and defines a `HEALTHCHECK` against `/api/v1/health`. The SQLite database and uploads live in the `storage` volume.
 
@@ -318,8 +425,8 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | 1 | Project scaffold ✅ | Layout, tooling, CI, Docker, health endpoint |
 | 2 | Upload API ✅ | Multipart upload, size/extension validation, storage, meeting records |
 | 3 | Audio preprocessing ✅ | ffmpeg extract, resample, loudness-normalize, silence/quality analysis, chunking, stage-based pipeline |
-| 4 | **Speaker diarization** ✅ | pyannote 3.1 stage, consistent Person N labels, overlaps, chunk re-linking |
-| 5 | Multilingual ASR | Whisper-based ASR with language ID for en/hi/or and code-mixed speech |
+| 4 | Speaker diarization ✅ | pyannote 3.1 stage, consistent Person N labels, overlaps, chunk re-linking |
+| 5 | **Multilingual ASR** ✅ | Routed ASR: faster-whisper (en/hi) + AI4Bharat IndicConformer (or), NFC native script, hallucination guards, SRT, WER/CER eval |
 | 6 | Alignment | Word-to-speaker attribution, speaker turns |
 | 7 | Speaker analytics | Talk time, turns, interruptions, WPM |
 | 8 | LLM summarization | Provider-agnostic summary, decisions and action items with structured output |
