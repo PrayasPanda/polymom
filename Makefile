@@ -1,10 +1,10 @@
-.PHONY: install dev install-ml lint format typecheck test test-slow run docker-build docker-build-ml docker-up
+.PHONY: install dev install-ml eval-asr lint format typecheck test test-slow run docker-build docker-build-ml docker-up
 
 install:
 	uv sync
 
 install-ml:
-	uv sync --all-groups --extra ml
+	uv sync --all-groups --extra ml --extra indic
 
 dev:
 	uv sync --all-groups
@@ -34,7 +34,10 @@ docker-build:
 	docker build -f docker/Dockerfile -t polymom:latest .
 
 docker-build-ml:
-	docker build -f docker/Dockerfile --build-arg INSTALL_ML=true -t polymom:ml .
+	docker build -f docker/Dockerfile --build-arg INSTALL_ML=true --build-arg INSTALL_INDIC=true -t polymom:ml .
 
 docker-up:
 	docker compose -f docker/docker-compose.yml up --build
+
+eval-asr:
+	uv run python scripts/eval_asr.py $(DATA)
