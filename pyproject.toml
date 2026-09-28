@@ -50,7 +50,7 @@ select = ["E", "W", "F", "I", "B", "UP", "N", "S", "SIM", "RUF", "ASYNC", "PT"]
 ignore = []
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]
+"tests/**" = ["S101", "ASYNC240"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -67,3 +67,11 @@ addopts = "-ra --cov=app --cov-report=term-missing"
 [[tool.mypy.overrides]]
 module = ["filetype", "filetype.*"]
 ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["app"]
+# SQLAlchemy's asyncio layer resumes code inside greenlets.
+concurrency = ["greenlet", "thread"]
+
+[tool.coverage.report]
+exclude_also = ['if TYPE_CHECKING:', 'raise NotImplementedError', '^\s*\.\.\.$']
