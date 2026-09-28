@@ -67,15 +67,21 @@ class ValidatedMedia:
     metadata: AudioMetadata
 
 
+def _is_name_char(char: str) -> bool:
+    """Letters (L*), combining marks (M*) and numbers (N*)."""
+    return unicodedata.category(char)[0] in "LMN"
+
+
 def sanitize_filename(name: str | None) -> str:
     """Reduce a client-supplied filename to a safe basename.
 
     Strips directories, control and shell-special characters and leading dots,
-    keeps Unicode letters (Hindi/Odia names survive), and caps the length.
+    keeps Unicode letters, combining marks and digits (so Devanagari/Odia names
+    with vowel signs survive), and caps the length.
     """
     name = unicodedata.normalize("NFKC", name or "")
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
-    name = re.sub(r"[^\w.\- ]", "_", name)
+    name = "".join(c if c in "._- " or _is_name_char(c) else "_" for c in name)
     name = re.sub(r"_{2,}", "_", name).strip(" .")
     if len(name) > MAX_FILENAME_LEN:
         stem, dot, ext = name.rpartition(".")
