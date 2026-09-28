@@ -12,10 +12,12 @@ from app.core.exceptions import (
     MeetingNotFoundError,
     MeetingStateConflictError,
     PolymomError,
+    TranscriptNotAvailableError,
 )
 from app.core.logging import get_logger
 from app.models.meeting import Meeting
 from app.repositories.meeting_repository import MeetingRepository
+from app.schemas.asr import ASRResult
 from app.schemas.diarization import DiarizationResult
 from app.schemas.meeting import MeetingStatus
 from app.services.audio.validator import AsyncReadable, MediaValidator
@@ -102,6 +104,16 @@ class MeetingService:
                 details={"meeting_id": str(meeting_id), "status": meeting.status.value},
             )
         return DiarizationResult.model_validate(meeting.diarization)
+
+    async def get_transcript(self, meeting_id: uuid.UUID) -> ASRResult:
+        meeting = await self.get(meeting_id)
+        if meeting.transcript is None:
+            raise TranscriptNotAvailableError(
+                "The transcript is not available yet. Run POST /meetings/{id}/process "
+                "and wait for status 'completed'.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+        return ASRResult.model_validate(meeting.transcript)
 
     async def request_processing(self, meeting_id: uuid.UUID, *, force: bool = False) -> Meeting:
         """Mark a meeting as ``processing`` so the pipeline can be scheduled.

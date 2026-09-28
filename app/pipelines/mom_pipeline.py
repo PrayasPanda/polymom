@@ -1,7 +1,7 @@
 """Minutes-of-Meeting pipeline: an ordered list of stages sharing a context.
 
 Stages (planned): preprocess -> diarize -> transcribe -> align -> analytics -> summarize.
-Registered so far: preprocess -> diarize.
+Registered so far: preprocess -> diarize -> transcribe.
 """
 
 import time
@@ -20,9 +20,12 @@ from app.core.exceptions import PolymomError
 from app.core.logging import get_logger
 from app.models.meeting import Meeting
 from app.repositories.meeting_repository import MeetingRepository
+from app.schemas.asr import ASRResult
 from app.schemas.audio import PreprocessResult
 from app.schemas.diarization import DiarizationResult
 from app.schemas.meeting import MeetingStatus
+from app.services.asr.router import ASRRouter
+from app.services.asr.service import TranscriptionService
 from app.services.audio.preprocessor import AudioPreprocessor
 from app.services.diarization.base import DiarizationBackend
 from app.services.diarization.service import DiarizationService
@@ -39,6 +42,7 @@ class PipelineContext:
     meeting_id: uuid.UUID
     input_path: Path
     expected_speakers: int | None = None
+    languages_hint: list[str] = field(default_factory=list)
     processed_path: Path | None = None
     outputs: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, int] = field(default_factory=dict)
@@ -97,6 +101,29 @@ class DiarizationStage(PipelineStage):
         meeting.diarization = result.model_dump(mode="json")
 
 
+class TranscriptionStage(PipelineStage):
+    """Timestamped transcript of the preprocessed audio.
+
+    Independent of diarization for now; word-to-speaker alignment comes later.
+    """
+
+    name = "transcribe"
+
+    def __init__(self, service: TranscriptionService) -> None:
+        self._service = service
+
+    async def run(self, context: PipelineContext) -> None:
+        if context.processed_path is None:
+            raise RuntimeError("TranscriptionStage requires PreprocessStage to run first")
+        context.outputs[self.name] = await self._service.transcribe(
+            context.meeting_id, context.processed_path, context.languages_hint
+        )
+
+    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+        result: ASRResult = context.outputs[self.name]
+        meeting.transcript = result.model_dump(mode="json")
+
+
 class MoMPipeline:
     """Runs stages in order and owns the meeting status lifecycle.
 
@@ -126,6 +153,7 @@ class MoMPipeline:
                 meeting_id=meeting_id,
                 input_path=Path(meeting.stored_path),
                 expected_speakers=meeting.expected_speakers,
+                languages_hint=list(meeting.languages_hint or []),
             )
             logger.info("pipeline_started", stages=[s.name for s in self.stages])
             started = time.perf_counter()
@@ -161,13 +189,17 @@ class MoMPipeline:
 
 
 def build_pipeline(
-    settings: Settings, repositories: RepositoryFactory, diarization_backend: DiarizationBackend
+    settings: Settings,
+    repositories: RepositoryFactory,
+    diarization_backend: DiarizationBackend,
+    asr_router: ASRRouter,
 ) -> MoMPipeline:
-    """Default stage registry. Later prompts append ASR, alignment, ..."""
+    """Default stage registry. Later prompts append alignment, analytics, ..."""
     return MoMPipeline(
         [
             PreprocessStage(AudioPreprocessor(settings)),
             DiarizationStage(DiarizationService(diarization_backend, settings)),
+            TranscriptionStage(TranscriptionService(asr_router, settings)),
         ],
         repositories,
     )

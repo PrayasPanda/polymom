@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core.config import Settings, get_settings
 from app.pipelines.mom_pipeline import MoMPipeline, RepositoryFactory, build_pipeline
 from app.repositories.meeting_repository import MeetingRepository, SqlAlchemyMeetingRepository
+from app.services.asr.router import ASRRouter
+from app.services.asr.service import build_router
 from app.services.audio.validator import MediaValidator
 from app.services.diarization.base import DiarizationBackend
 from app.services.diarization.service import build_backend
@@ -68,13 +70,22 @@ def get_diarization_backend(settings: SettingsDep) -> DiarizationBackend:
     return build_backend(settings)
 
 
+def get_asr_router(settings: SettingsDep) -> ASRRouter:
+    """Backends chosen by ``ASR_BACKEND``, routed per ``ASR_LANGUAGE_BACKENDS``."""
+    return build_router(settings)
+
+
 def get_pipeline(
     request: Request,
     settings: SettingsDep,
     diarization_backend: Annotated[DiarizationBackend, Depends(get_diarization_backend)],
+    asr_router: Annotated[ASRRouter, Depends(get_asr_router)],
 ) -> MoMPipeline:
     return build_pipeline(
-        settings, repository_factory(request.app.state.sessionmaker), diarization_backend
+        settings,
+        repository_factory(request.app.state.sessionmaker),
+        diarization_backend,
+        asr_router,
     )
 
 
