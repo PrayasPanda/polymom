@@ -117,6 +117,32 @@ class DiarizationModelLoadError(DiarizationError):
     code = "diarization_model_unavailable"
 
 
+class ASRModelLoadError(PipelineError):
+    """A speech recognition model could not be loaded."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    code = "asr_model_unavailable"
+
+
+class UnsupportedLanguageError(PipelineError):
+    """No ASR backend is configured for the requested language."""
+
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    code = "unsupported_language"
+
+
+class TranscriptionError(PipelineError):
+    """ASR inference failed."""
+
+    code = "transcription_failed"
+
+
+class TranscriptNotAvailableError(ConflictError):
+    """The transcript was requested before transcription finished."""
+
+    code = "transcript_not_available"
+
+
 class DiarizationNotAvailableError(ConflictError):
     """Speaker turns were requested before diarization finished."""
 

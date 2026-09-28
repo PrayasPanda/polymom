@@ -26,6 +26,13 @@ ml = [
     "torchaudio>=2.2,<2.9",
     "pyannote.audio>=3.3,<4",
     "numpy>=1.26",
+    "faster-whisper>=1.1",
+]
+# Odia ASR (AI4Bharat IndicConformer via ONNX + transformers remote code; no NeMo).
+# Install together with `ml`: `uv sync --extra ml --extra indic`.
+indic = [
+    "transformers>=4.44,<5",
+    "onnxruntime>=1.18",
 ]
 
 [dependency-groups]
@@ -37,6 +44,7 @@ dev = [
     "pytest-cov>=5.0",
     "httpx>=0.27",
     "pre-commit>=3.8",
+    "jiwer>=3.0",
 ]
 
 [build-system]
@@ -81,7 +89,7 @@ addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow'"
 markers = ["slow: needs real models / HF_TOKEN; run with `make test-slow`"]
 
 [[tool.mypy.overrides]]
-module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*"]
+module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "transformers", "transformers.*", "jiwer", "jiwer.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

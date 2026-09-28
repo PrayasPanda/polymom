@@ -1,13 +1,15 @@
-"""Meeting endpoints: upload, fetch, list, delete, process."""
+"""Meeting endpoints: upload, fetch, list, delete, process, speakers, transcript."""
 
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Response, UploadFile, status
+from fastapi.responses import PlainTextResponse
 
 from app.api.deps import MeetingServiceDep, PipelineDep
 from app.core.exceptions import ValidationError
 from app.models.meeting import Meeting
+from app.schemas.asr import TranscriptResponse
 from app.schemas.audio import AudioQuality
 from app.schemas.diarization import SpeakersResponse
 from app.schemas.error import error_example
@@ -19,6 +21,7 @@ from app.schemas.meeting import (
     MeetingRead,
     ProcessResponse,
 )
+from app.utils.subtitles import to_srt, to_text
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
@@ -199,3 +202,45 @@ async def get_speakers(meeting_id: UUID, service: MeetingServiceDep) -> Speakers
         overlap_regions=result.overlap_regions,
         model_name=result.model_name,
     )
+
+
+@router.get(
+    "/{meeting_id}/transcript",
+    response_model=TranscriptResponse,
+    summary="Timestamped transcript (json, txt or srt)",
+    responses={
+        200: {
+            "content": {
+                "text/plain": {"example": "[00:00:00.520] (hi) आज की मीटिंग का एजेंडा बजट है।\n"},
+                "application/x-subrip": {
+                    "example": "1\n00:00:00,520 --> 00:00:03,900\nआज की मीटिंग का एजेंडा बजट है।\n"
+                },
+            }
+        },
+        **_NOT_FOUND,
+        **error_example(
+            409,
+            "transcript_not_available",
+            "The transcript is not available yet.",
+            "The meeting has not been transcribed yet",
+        ),
+    },
+)
+async def get_transcript(
+    meeting_id: UUID,
+    service: MeetingServiceDep,
+    format: Annotated[
+        Literal["json", "txt", "srt"], Query(description="Response format.")
+    ] = "json",
+) -> TranscriptResponse | Response:
+    """Raw ASR segments in native script (NFC). Not yet attributed to speakers."""
+    result = await service.get_transcript(meeting_id)
+    if format == "txt":
+        return PlainTextResponse(to_text(result.segments), media_type="text/plain; charset=utf-8")
+    if format == "srt":
+        return Response(
+            to_srt(result.segments),
+            media_type="application/x-subrip; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{meeting_id}.srt"'},
+        )
+    return TranscriptResponse(meeting_id=meeting_id, **result.model_dump())

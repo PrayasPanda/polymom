@@ -74,6 +74,7 @@ async def test_failed_processing_records_typed_error(
         storage_dir=tmp_path,
         ffmpeg_path="no-such-ffmpeg-xyz",
         diarization_backend="mock",
+        asr_backend="mock",
     )
     async for client in client_factory(settings):
         meeting_id = await _upload(client, stereo_44k_path)

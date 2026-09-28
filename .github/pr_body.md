@@ -1,120 +1,140 @@
 ## Summary
 
-Prompt 4 of 12 adds speaker diarization as the second pipeline stage, after preprocessing. The stage labels every speaker **Person 1, Person 2, ...** consistently across the whole meeting, marks overlapping speech rather than dropping it, and splits long recordings into chunks whose speakers are re-linked by voice embeddings. Results are served by `GET /api/v1/meetings/{id}/speakers`.
+Prompt 5 of 12 adds multilingual speech-to-text for **English, Hindi and Odia** as a third pipeline stage (preprocess → diarize → **transcribe**). It produces a standalone timestamped transcript: segments with word timings, confidence, language and backend, in each language's native script, NFC-normalized. The transcript is served by `GET /api/v1/meetings/{id}/transcript` as JSON, plain text or SRT. Aligning words to speakers is out of scope and comes later.
 
-The backend is behind an interface: `pyannote` (real model, optional `ml` extra) or `mock` (deterministic fake, used by tests and on machines without a GPU or HF token). No ASR yet.
+ASR is **routed per language** to interchangeable backends:
+- faster-whisper for English and Hindi
+- AI4Bharat IndicConformer for Odia
+- a deterministic mock for tests
 
-## Model choice and rationale
+## Model choices and rationale
 
-**`pyannote/speaker-diarization-3.1`:**
-- **Accurate and widely used:** it's the most widely adopted open diarization pipeline, with strong published results.
-- **Pure PyTorch:** 3.0 depended on `onnxruntime`.
-- **Language-agnostic:** it separates voices, not words, which suits Hindi, Odia and code-mixed meetings.
-- **Handles overlap natively.**
-- **Accepts speaker-count hints:** `num_speakers`, `min_speakers` and `max_speakers`, which lets us pass the upload's `expected_speakers`.
-- **Returns per-speaker embeddings,** which is what makes cross-chunk re-linking possible without a second embedding model.
-- **Hardware:** it runs on CPU and is fast on GPU.
-- **MIT licensed:** the model is gated behind accepting its terms, which the README walks through.
+I checked model availability and licenses on the Hugging Face API before wiring anything in.
 
-**Dependencies:**
-- The `ml` extra pins `torch`/`torchaudio` below 2.9, because torchaudio 2.9 removed I/O APIs that pyannote.audio 3.x uses. The lock resolved to pyannote.audio 3.4.0 and torch 2.8.0.
-- As a second safeguard, audio is passed to pyannote as an in-memory waveform read with the stdlib `wave` module, so torchaudio's file I/O is never used.
-- torch comes from the PyTorch CPU index by default.
+| Language | Model | License / access | Why |
+| --- | --- | --- | --- |
+| en, hi | `Systran/faster-whisper-large-v3` (size configurable) | MIT, not gated | Strongest open model for English and Hindi, with built-in language ID, native word timestamps and Silero VAD. The CTranslate2 build is up to 4× faster and uses less memory (int8 on CPU, float16 on GPU). |
+| or | `ai4bharat/indic-conformer-600m-multilingual` (configurable via `ODIA_MODEL_ID`) | MIT, gated (terms auto-approved) | Whisper doesn't support Odia. This is AI4Bharat's current maintained multilingual IndicConformer (updated Feb 2026, about 580k downloads) and covers Odia. It ships as **ONNX with a transformers remote-code loader, so NeMo isn't needed**, and the new `indic` extra is just `transformers` + `onnxruntime`. |
+
+**Alternatives considered:**
+- `ai4bharat/indicwav2vec-odia` (wav2vec2 CTC, Apache-2.0): it would give native CTC word offsets, but it's from 2023, has around 40 downloads, and predates IndicConformer's accuracy gains. Since the model id is configurable, a CTC word-offset backend could be added later if word-level Odia timing becomes critical.
+- `ai4bharat/IndicConformer-or` (a per-language checkpoint): not available on the Hub (the API returned an auth error).
+
+**Odia timestamps:** IndicConformer returns text only. Segments are cut at energy-based speech regions (accurate to one 30 ms frame, split at 20 s), and each is transcribed separately. **Word timings are approximated** in proportion to word length within each segment, and there are no confidence scores. This trade-off is documented in the README.
+
+**Not verified:** I couldn't read the gated IndicConformer model card without a token. The call signature `model(wav, "or", "ctc"|"rnnt") -> str` is based on AI4Bharat's documented usage and on the remote-code files visible in the repo (`model_onnx.py`, the CTC and RNNT decoders). The slow test confirms it once `HF_TOKEN` is available.
 
 ## Changes
 
 - **Dependencies:**
-  - the optional `ml` extra (`uv sync --extra ml` or `make install-ml`); the base install and CI stay light
-  - torch and pyannote are imported lazily, and mypy treats them as untyped, so type checks pass without them installed
-- **`app/services/diarization/`:**
-  - `base.py`: the `DiarizationBackend` ABC. Backends implement `diarize_raw` (segments plus embeddings); the shared `diarize` applies post-processing.
-  - `pyannote_backend.py`:
-    - the pipeline is a lazy singleton per (model, device), with thread-safe loading and inference serialized by a lock
-    - `DEVICE` can be `auto`, `cpu` or `cuda`, and inference runs in a thread pool
-    - errors are typed and say what to fix: missing token, terms not accepted (pyannote returns `None`), download failure, missing extras, CUDA unavailable
-  - `mock_backend.py`: deterministic alternating speakers, with embeddings that identify the true speaker (so re-linking can be tested) and a "no speech" path.
-  - `postprocess.py`: pure functions `merge_gaps`, `drop_short_turns`, `find_overlaps` (sweep-line), `first_appearance_labels`, `build_result` and `relink_chunks`.
-  - `service.py`: picks whole-file or chunked mode by duration, uses the existing chunker, cleans up chunk files, and includes `build_backend` (the factory).
-- **Pipeline:** `DiarizationStage` is registered after `PreprocessStage`. `PipelineContext.expected_speakers` comes from the upload.
-- **API:** `GET /api/v1/meetings/{id}/speakers` returns the turns, speaker count, speaker list and overlap regions. It returns 409 `diarization_not_available` before diarization and 404 for an unknown meeting.
-- **Dependency injection:** `get_diarization_backend` in `deps.py` picks the backend from `DIARIZATION_BACKEND`.
-- **Errors:** `DiarizationError` (500 `diarization_failed`), `DiarizationModelLoadError` (503 `diarization_model_unavailable`) and `DiarizationNotAvailableError` (409).
+  - the `ml` extra gains `faster-whisper`
+  - new `indic` extra (`transformers`, `onnxruntime`)
+  - `jiwer` in the dev group
+  - all ML imports are lazy, so the base install and CI stay light
+- **`app/services/asr/`:**
+  - `base.py`: the `ASRBackend` ABC, with `transcribe(audio_path, language, offset)`, `supported_languages` and `supports_auto_detect`.
+  - `whisper_backend.py`:
+    - model loaded lazily as a thread-safe singleton per (size, device, compute type)
+    - `DEVICE=auto|cpu|cuda`, and `compute_type` set to `auto` (float16 on CUDA, int8 on CPU)
+    - runs in a worker thread with word timestamps, VAD and `condition_on_previous_text=False`
+  - `indic_backend.py`: IndicConformer (lazy, thread-safe), energy-based segmentation and approximate word timings.
+  - `mock_backend.py`: scripted en/hi/or lines. Indic lines are emitted in NFD on purpose, so NFC normalization is tested end to end.
+  - `router.py`: `ASRRouter`, driven by `ASR_LANGUAGE_BACKENDS`. It's validated at construction, raises `UnsupportedLanguageError` with the fix in the message, and is ready for per-segment routing in Prompt 6.
+  - `service.py`:
+    - language strategy: one hint → forced; none or several → Whisper auto-detect
+    - chunking with offset shifting
+    - central post-processing
+    - `build_router` (the factory for `ASR_BACKEND=real|mock`)
+  - `postprocess.py`, all pure functions:
+    - NFC normalization, preserving native script
+    - hallucination guards
+    - low-confidence flags
+    - `merge_chunks`: overlap de-duplication by midpoint ownership, time overlap and fuzzy text match
+    - `approximate_words`
+  - `segmentation.py`: pure speech-region detection.
+- **Schemas** (`app/schemas/asr.py`):
+  - `Word`
+  - `TranscriptSegment`, with `low_confidence`, `no_speech_prob` and `compression_ratio` diagnostics
+  - `LanguageDuration`
+  - `ASRResult`, with `detected_languages`, `model_names` and `requested_language`
+  - `TranscriptResponse`
+- **Pipeline:** `TranscriptionStage` is registered after `DiarizationStage` and receives the upload's `languages_hint` through `PipelineContext`.
+- **Storage:** migration `0004` adds a `transcript` JSON column, following the JSON-column choice from Prompt 4. `alembic check` reports no drift.
+- **API:** `GET /api/v1/meetings/{id}/transcript?format=json|txt|srt`.
+  - `txt` returns `text/plain` lines like `[HH:MM:SS.mmm] (lang) text`.
+  - `srt` returns `application/x-subrip` as an attachment.
+  - It returns 409 `transcript_not_available` before transcription and 404 for an unknown meeting.
+- **Utilities:** `app/utils/subtitles.py` provides `to_srt`, `to_text` and `format_timestamp`.
+- **Errors:**
+  - `ASRModelLoadError` (503 `asr_model_unavailable`): missing extras, token or terms, a load failure, or CUDA unavailable
+  - `UnsupportedLanguageError` (422)
+  - `TranscriptionError` (500)
+  - `TranscriptNotAvailableError` (409)
+  - An ASR failure marks the meeting `failed` but keeps `audio_quality` and `diarization`; a test covers this.
 - **Config:**
-  - `DIARIZATION_BACKEND`, `DEVICE`, `DIARIZATION_MODEL`
-  - `MERGE_GAP_SECONDS`, `MIN_TURN_SECONDS`
-  - `DIARIZATION_CHUNK_THRESHOLD_SECONDS`, `SPEAKER_SIMILARITY_THRESHOLD`
-- **Docker:**
-  - `INSTALL_ML=true` installs the `ml` extra; `TORCH_VARIANT=cu124` (for example) swaps in CUDA wheels of the locked torch version
-  - `HF_HOME` and `TORCH_HOME` point into `/app/.cache`, which the compose file mounts as the `model-cache` volume
-- **Makefile:** new targets `install-ml`, `test-slow` and `docker-build-ml`.
-- **Docs:** a README diarization section covering the model choice, Hugging Face setup, label consistency, overlaps, long recordings, known limitations and config.
-
-### Persistence: a `diarization` JSON column, not a `speaker_turns` table
-
-Migration `0003` adds a JSON column. Diarization is written in one go at the end of the stage, always read whole (by `/speakers` and by the ASR alignment coming in Prompt 6), and replaced whole when a meeting is reprocessed with `force`. A JSON document fits that pattern: saving is one atomic update rather than a delete plus N inserts, there are no joins, and it matches the existing `audio_quality` column. It also works on SQLite and on Postgres, where it could later become JSONB. The trade-off is that you can't query individual turns across meetings in SQL. If analytics later needs that, a `speaker_turns` table can be generated from this column without changing the API.
+  - `ASR_BACKEND`, `ASR_LANGUAGE_BACKENDS`
+  - `WHISPER_MODEL_SIZE`, `WHISPER_COMPUTE_TYPE`, `ASR_BEAM_SIZE`, `ASR_VAD_FILTER`
+  - `ODIA_MODEL_ID`, `ODIA_DECODING`
+  - `ASR_LOW_CONFIDENCE_THRESHOLD`, `ASR_COMPRESSION_RATIO_THRESHOLD`, `ASR_NO_SPEECH_THRESHOLD`
+- **Evaluation:** `scripts/eval_asr.py` computes WER and CER per language with jiwer on a folder of audio files plus `.txt` references. Text is NFC-normalized, case-folded and stripped of punctuation (including the danda) before scoring. It can write a JSON report. Also added a `make eval-asr DATA=...` target.
+- **Docker:** new `INSTALL_INDIC` build arg, alongside `INSTALL_ML`/`TORCH_VARIANT`. Whisper and IndicConformer downloads share the Prompt 4 `model-cache` volume.
+- **Docs:** a README section covering the routing design (Mermaid), model choices, native script and NFC handling, quality guards, setup, the eval script and known limitations.
 
 ## Test coverage
 
-137 tests pass, plus 1 slow real-model test that is deselected by default. Overall coverage is 96%; for the new code:
+229 tests pass, plus 3 slow real-model tests that are deselected by default. Overall coverage is 96%; for the new code:
 
 | Module | Coverage |
 | --- | --- |
-| `postprocess.py` | 99% |
 | `service.py` | 100% |
 | `mock_backend.py` | 100% |
-| `base.py` | 100% |
-| `pyannote_backend.py` | 89% (the uncovered lines are the real waveform loader, which needs the `ml` extras) |
-| `mom_pipeline.py` | 99% |
-| `meeting_service.py` | 100% |
-| `routes/meetings.py` | 100% |
+| `segmentation.py` | 100% |
+| `subtitles.py` | 100% |
+| `postprocess.py` | 99% |
+| `whisper_backend.py` | 99% |
+| `router.py` | 97% |
+| `indic_backend.py` | 85% (the uncovered lines are the numpy audio loader, which needs the extras) |
 
-- **Post-processing unit tests:**
-  - labels follow first appearance, not raw label order
-  - gap merging, including that merging is per speaker across interjections
-  - short turns are dropped, but a speaker's only turn and "longest when all are short" are kept
-  - overlap detection, including touching turns and three-way overlaps
-  - timestamps are rounded to 3 decimals
-  - single-speaker audio and audio with no speech
-- **Re-linking with synthetic embeddings:**
-  - speakers swap local labels between chunks but keep their global identity
-  - a new speaker below the threshold gets a new label, and person numbers stay stable in later chunks
-  - matching is one-to-one within a chunk
-  - missing or NaN embeddings are handled
-  - overlap-window de-duplication
-  - cosine similarity edge cases
-- **Backend tests:**
-  - the mock backend and the backend factory
-  - the chunked service with the mock (consistent labels over 60 s in 20 s chunks, chunk files cleaned up)
-  - no chunking below the threshold
-  - the pyannote backend with **faked `torch` and `pyannote.audio` modules**: kwargs passed through, loaded once then cached, device selection, missing token, gated model, download failure, missing extras, CUDA unavailable, inference failure, embedding order
+- **Unit tests:**
+  - **Router:** selection per language (including upper-case codes and auto-detect), unconfigured language, a backend that can't handle the language, auto-detect on an incapable backend, mapping validation, config parsing, and the language strategy.
+  - **Chunks:** timestamp shifting, overlap de-duplication (midpoint ownership, fuzzy duplicates, keeping the more complete version, keeping distinct text), and chunked transcription through the service.
+  - **Hallucination guards:** empty output, fillers during silence, known phrases, a confident real "umm" being kept, "Thank you." being kept, compression ratio (computed and backend-supplied), and repeats.
+  - **NFC normalization:** Devanagari nukta exclusions (precomposed ज़ becomes ज + ़), ऩ composition, Odia two-part vowels (ୋ ୈ ୌ), Odia ଡ଼, an NFD Odia sentence round trip, and a check that nothing is transliterated.
+  - **Exports:** SRT and TXT formatting, and speech-region detection.
+  - **Eval script:** normalization, per-language scoring, sample discovery, and the end-to-end CLI with the mock.
+- **Backends with faked `faster_whisper`, `ctranslate2`, `transformers`, `onnxruntime` and `torch`:**
+  - Whisper: kwargs passed through, loaded once then cached, cuda/float16 vs cpu/int8, word to segment mapping, confidence fallback, load and inference failures, missing extras.
+  - IndicConformer: segments built from speech regions with offsets, approximate words, the `trust_remote_code` token, caching, missing token or extras, load and inference failures.
 - **Integration tests** (mock backend):
-  - upload, process, then `/speakers`
-  - `expected_speakers=3` produces 3 speakers
-  - silent audio completes with 0 speakers
-  - 409 before diarization and 404 for an unknown meeting
-  - the pyannote backend without `HF_TOKEN` marks the meeting `failed` with an actionable `diarization_model_unavailable: HF_TOKEN is not set...` while keeping `audio_quality`
-- **Real model test:** `@pytest.mark.slow` and skipped without `HF_TOKEN` or the `ml` extras. `addopts` excludes `slow`, so CI runs only the fast tests; run it with `make test-slow`.
+  - `/transcript` as JSON (NFC, native script, language durations), `txt` and `srt` (headers and cue layout), an invalid format → 422, before processing → 409, unknown meeting → 404
+  - a single-language hint forces that language
+  - an ASR failure keeps diarization and audio quality
+- **Slow tests,** skipped without the extras:
+  - real Whisper on a short public-domain English clip (JFK), fetched at test time
+  - real IndicConformer on Odia, which runs only if `HF_TOKEN` and `POLYMOM_ODIA_SAMPLE_URL` are set, because no stable public-domain Odia clip URL was found
+
+No audio is committed.
 
 ## Known limitations
 
-- **Real model not run by me:** it hasn't run against pyannote 3.1 in this environment, because I have no `HF_TOKEN` here. The integration code is tested against fakes that follow pyannote's API, and the ML Docker image builds and imports it. Please run `make install-ml && HF_TOKEN=... make test-slow` once.
-- **Speed:** CPU inference is slow for long meetings (tens of minutes per hour of audio, depending on the CPU); a GPU is strongly recommended. Inference runs in the API process until the worker queue arrives in Prompt 11.
-- **Speaker accuracy:** very brief or quiet speakers may be missed, and similar voices may be merged or split, particularly across chunks (tune `SPEAKER_SIMILARITY_THRESHOLD`). Laughter and music can be attributed to a speaker.
-- **Chunk boundaries:** chunks receive `expected_speakers` as a maximum, not an exact count, so the result may contain fewer speakers than expected.
-- **Mock vs. default:** the mock backend is only for development and tests. The default is `pyannote`, so a misconfigured deployment fails loudly instead of producing fake speakers.
+- **Odia timing:** Odia word timestamps are approximate (segment boundaries are accurate to 30 ms), and there are no Odia confidence scores.
+- **Code-mixed speech:** without a single hint, Whisper decodes everything, including Odia, which it can't transcribe well. Per-segment language ID and routing comes in Prompt 6. Whisper sometimes labels Hindi as Urdu (Perso-Arabic script); passing `languages=hi` avoids that.
+- **Compute:** large-v3 needs roughly 5 GB of GPU memory in float16. On CPU, use `small` or `medium`. Inference runs in the API process until the worker queue arrives in Prompt 11.
+- **Real models not run by me:** they haven't run in this environment, because I have no `HF_TOKEN` here and the downloads are several GB. The integration code is tested against fakes that follow each library's API, and the ML Docker image builds with all the extras. Please run `make install-ml && HF_TOKEN=... make test-slow` once.
 
 ## Checklist
 
 - [x] `make lint` passes
 - [x] `make typecheck` (mypy strict) passes, without the ML extras installed
 - [x] `make test` passes, with coverage of new code at least 85%
-- [x] Docker build passes without the `ml` extras
-- [x] Docker build passes with `INSTALL_ML=true` (CPU torch), and pyannote imports in the image
-- [x] Migration 0003 applies on top of 0002, and `alembic check` is clean
-- [x] No secrets or model weights committed
+- [x] Docker build passes without extras
+- [x] Docker build passes with `INSTALL_ML=true INSTALL_INDIC=true`
+- [x] Migration 0004 applies on top of 0003, and `alembic check` is clean
+- [x] Native scripts preserved, NFC throughout, nothing transliterated
+- [x] No audio, model weights or secrets committed
 
 ## Next steps
 
-**Prompt 5: multilingual ASR.** Add an ASR stage (Whisper / faster-whisper) for English, Hindi, Odia and code-mixed speech on `processed_path`, chunked the same way for long meetings. It produces word-level timestamps that Prompt 6 will align with these speaker turns.
+**Prompt 6: language detection and code-switching.** Run segment-level language ID (Whisper LID and script detection), then use `ASRRouter.select` per segment so that Odia stretches inside a Hindi or English meeting are re-transcribed by IndicConformer, and record code-switch points.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
