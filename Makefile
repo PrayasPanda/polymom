@@ -1,7 +1,10 @@
-.PHONY: install dev lint format typecheck test run docker-build docker-up
+.PHONY: install dev install-ml lint format typecheck test test-slow run docker-build docker-build-ml docker-up
 
 install:
 	uv sync
+
+install-ml:
+	uv sync --all-groups --extra ml
 
 dev:
 	uv sync --all-groups
@@ -21,11 +24,17 @@ typecheck:
 test:
 	uv run pytest
 
+test-slow:
+	uv run pytest -m slow --no-cov
+
 run:
 	uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 docker-build:
 	docker build -f docker/Dockerfile -t polymom:latest .
+
+docker-build-ml:
+	docker build -f docker/Dockerfile --build-arg INSTALL_ML=true -t polymom:ml .
 
 docker-up:
 	docker compose -f docker/docker-compose.yml up --build

@@ -69,7 +69,11 @@ async def test_failed_processing_records_typed_error(
     client_factory: Callable[[Settings], AsyncIterator[AsyncClient]],
 ) -> None:
     settings = Settings(
-        _env_file=None, app_env="test", storage_dir=tmp_path, ffmpeg_path="no-such-ffmpeg-xyz"
+        _env_file=None,
+        app_env="test",
+        storage_dir=tmp_path,
+        ffmpeg_path="no-such-ffmpeg-xyz",
+        diarization_backend="mock",
     )
     async for client in client_factory(settings):
         meeting_id = await _upload(client, stereo_44k_path)

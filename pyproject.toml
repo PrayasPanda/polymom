@@ -65,7 +65,7 @@ select = ["E", "W", "F", "I", "B", "UP", "N", "S", "SIM", "RUF", "ASYNC", "PT"]
 ignore = []
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "ASYNC240"]
+"tests/**" = ["S101", "S105", "S106", "ASYNC240"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -77,7 +77,8 @@ files = ["app"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra --cov=app --cov-report=term-missing"
+addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow'"
+markers = ["slow: needs real models / HF_TOKEN; run with `make test-slow`"]
 
 [[tool.mypy.overrides]]
 module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*"]

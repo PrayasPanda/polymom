@@ -83,7 +83,12 @@ def video_without_audio_bytes(media_dir: Path) -> bytes:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(_env_file=None, app_env="test", storage_dir=tmp_path / "storage")
+    return Settings(
+        _env_file=None,
+        app_env="test",
+        storage_dir=tmp_path / "storage",
+        diarization_backend="mock",
+    )
 
 
 @pytest.fixture
