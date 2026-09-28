@@ -22,6 +22,9 @@ class FailingRepository(MeetingRepository):
     async def list(self, *, limit: int, offset: int) -> tuple[list[Meeting], int]:
         return [], 0
 
+    async def save(self, meeting: Meeting) -> Meeting:
+        return meeting
+
     async def delete(self, meeting: Meeting) -> None:
         return None
 
