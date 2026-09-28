@@ -1,13 +1,14 @@
-"""Meeting endpoints: upload, fetch, list, delete."""
+"""Meeting endpoints: upload, fetch, list, delete, process."""
 
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, File, Form, Query, Response, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Response, UploadFile, status
 
-from app.api.deps import MeetingServiceDep
+from app.api.deps import MeetingServiceDep, PipelineDep
 from app.core.exceptions import ValidationError
 from app.models.meeting import Meeting
+from app.schemas.audio import AudioQuality
 from app.schemas.error import error_example
 from app.schemas.meeting import (
     SUPPORTED_LANGUAGES,
@@ -15,6 +16,7 @@ from app.schemas.meeting import (
     MeetingCreateResponse,
     MeetingList,
     MeetingRead,
+    ProcessResponse,
 )
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
@@ -31,6 +33,9 @@ def to_read(meeting: Meeting) -> MeetingRead:
         size_bytes=meeting.size_bytes,
         duration_seconds=meeting.duration_seconds,
         audio_metadata=AudioMetadata.model_validate(meeting.audio_metadata),
+        audio_quality=(
+            AudioQuality.model_validate(meeting.audio_quality) if meeting.audio_quality else None
+        ),
         languages_hint=meeting.languages_hint,
         expected_speakers=meeting.expected_speakers,
         status=meeting.status,
@@ -135,3 +140,34 @@ async def get_meeting(meeting_id: UUID, service: MeetingServiceDep) -> MeetingRe
 async def delete_meeting(meeting_id: UUID, service: MeetingServiceDep) -> Response:
     await service.delete(meeting_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/{meeting_id}/process",
+    response_model=ProcessResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Run the processing pipeline for a meeting",
+    responses={
+        **_NOT_FOUND,
+        **error_example(
+            409,
+            "meeting_state_conflict",
+            "Meeting is already completed. Use ?force=true to reprocess.",
+            "Meeting is already processing or completed",
+        ),
+    },
+)
+async def process_meeting(
+    meeting_id: UUID,
+    service: MeetingServiceDep,
+    pipeline: PipelineDep,
+    background_tasks: BackgroundTasks,
+    force: Annotated[bool, Query(description="Reprocess even if processing or completed.")] = False,
+) -> ProcessResponse:
+    """Queue the pipeline in the background. Poll ``GET /meetings/{id}`` for the status.
+
+    Runs in-process via ``BackgroundTasks`` for now; a real job queue replaces it later.
+    """
+    meeting = await service.request_processing(meeting_id, force=force)
+    background_tasks.add_task(pipeline.run, meeting.id)
+    return ProcessResponse(meeting_id=meeting.id, status=meeting.status)

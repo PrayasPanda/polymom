@@ -1,12 +1,14 @@
 """Dependency-injection providers for FastAPI routes."""
 
 from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings, get_settings
+from app.pipelines.mom_pipeline import MoMPipeline, RepositoryFactory, build_pipeline
 from app.repositories.meeting_repository import MeetingRepository, SqlAlchemyMeetingRepository
 from app.services.audio.validator import MediaValidator
 from app.services.meeting_service import MeetingService
@@ -41,3 +43,26 @@ def get_meeting_service(
 
 
 MeetingServiceDep = Annotated[MeetingService, Depends(get_meeting_service)]
+
+
+def repository_factory(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> RepositoryFactory:
+    """Short-lived repositories for work that outlives the request (background tasks)."""
+
+    @asynccontextmanager
+    async def _factory() -> AsyncIterator[MeetingRepository]:
+        async with sessionmaker() as session:
+            yield SqlAlchemyMeetingRepository(session)
+
+    def _make() -> AbstractAsyncContextManager[MeetingRepository]:
+        return _factory()
+
+    return _make
+
+
+def get_pipeline(request: Request, settings: SettingsDep) -> MoMPipeline:
+    return build_pipeline(settings, repository_factory(request.app.state.sessionmaker))
+
+
+PipelineDep = Annotated[MoMPipeline, Depends(get_pipeline)]
