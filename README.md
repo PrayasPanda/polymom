@@ -9,7 +9,7 @@ Voice-based **Minutes of Meeting** pipeline. Upload a meeting recording and get 
 
 Everything is exposed through a FastAPI service.
 
-> Status: the **upload API** works: validated uploads, stored files and meeting records with status tracking. Audio processing and ML stages are still stubs. See the [roadmap](#roadmap).
+> Status: **upload** and **audio preprocessing** work, and the pipeline runs through the preprocess stage. Diarization, ASR and summarization are still stubs. See the [roadmap](#roadmap).
 
 ## Architecture
 
@@ -111,16 +111,23 @@ Interactive docs with schemas and example responses: <http://localhost:8000/docs
 | `POST` | `/api/v1/meetings` | Upload a recording (multipart). Returns `202` with `meeting_id`, `status: queued`, `created_at` |
 | `GET` | `/api/v1/meetings` | Paginated list, newest first (`limit` 1-100, default 20; `offset`) |
 | `GET` | `/api/v1/meetings/{meeting_id}` | Metadata and status |
-| `DELETE` | `/api/v1/meetings/{meeting_id}` | Delete the record and stored file (`204`) |
+| `DELETE` | `/api/v1/meetings/{meeting_id}` | Delete the record, the upload and the processed audio (`204`) |
+| `POST` | `/api/v1/meetings/{meeting_id}/process` | Run the pipeline in the background (`202`); `409` if already processing/completed unless `?force=true` |
 
 ```bash
 # Upload (title, expected_speakers 1-20 and languages en/hi/or are optional)
-curl -F "file=@standup.m4a" -F "title=Weekly sync" -F "expected_speakers=4"      -F "languages=en,hi" http://localhost:8000/api/v1/meetings
+curl -F "file=@standup.m4a" -F "title=Weekly sync" -F "expected_speakers=4" \
+     -F "languages=en,hi" http://localhost:8000/api/v1/meetings
 # {"meeting_id":"3f8b6f0e-...","status":"queued","created_at":"2026-09-28T10:15:00Z"}
 
 curl http://localhost:8000/api/v1/meetings/3f8b6f0e-...
 curl "http://localhost:8000/api/v1/meetings?limit=10&offset=0"
 curl -X DELETE http://localhost:8000/api/v1/meetings/3f8b6f0e-...
+
+# Process, then poll until status is completed or failed
+curl -X POST http://localhost:8000/api/v1/meetings/3f8b6f0e-.../process
+# {"meeting_id":"3f8b6f0e-...","status":"processing"}
+curl http://localhost:8000/api/v1/meetings/3f8b6f0e-...   # includes audio_quality
 ```
 
 ### Upload validation
@@ -149,6 +156,7 @@ Every error uses the same envelope:
 | 415 | `unsupported_file_type` | Extension not allowed, or content does not match it |
 | 422 | `empty_file` / `corrupted_media` | Zero bytes; unreadable file; no audio stream |
 | 422 | `validation_error` | Invalid form/query fields |
+| 409 | `meeting_state_conflict` | `/process` on a meeting that is processing or completed, without `force` |
 | 500 | `media_probe_unavailable` | `ffprobe` missing on the server |
 
 ### Database migrations
@@ -157,6 +165,69 @@ Every error uses the same envelope:
 uv run alembic upgrade head                           # applied automatically at startup when AUTO_MIGRATE=true
 uv run alembic revision --autogenerate -m "message"   # after changing models
 ```
+
+## Processing pipeline
+
+### Stage pattern
+
+`MoMPipeline` runs an ordered list of `PipelineStage`s over a shared `PipelineContext`. Each stage has a `name`, an async `run(context)` that does the work and records its outputs on the context, and an `apply(context, meeting)` that copies whatever should be persisted onto the meeting. The orchestrator owns the status lifecycle and logs each stage's timing. Adding a stage means subclassing `PipelineStage` and registering it in `build_pipeline`.
+
+```mermaid
+flowchart TD
+    API["POST /meetings/{id}/process"] -->|"status = processing<br/>(409 if busy, unless force)"| BG[BackgroundTasks]
+    BG --> ORCH[MoMPipeline.run]
+    ORCH --> S1[PreprocessStage]
+    S1 -.-> S2["DiarizationStage (Prompt 4)"]
+    S2 -.-> S3["ASR stage (Prompt 5)"]
+    S3 -.-> SN[...]
+    S1 -->|"apply(): processed_path, audio_quality"| DB[(meetings)]
+    ORCH -->|"all stages ok"| DONE[status = completed]
+    ORCH -->|"PolymomError"| FAIL["status = failed<br/>error = 'code: message'"]
+```
+
+Stage failures never escape the background task. A typed error is stored as `"<code>: <message>"` (for example `ffmpeg_timeout: Audio processing timed out after 1800 seconds.`), and anything unexpected is stored as `internal_error`. A failed meeting can be reprocessed without `force`.
+
+### Audio preprocessing
+
+`AudioPreprocessor.process(meeting_id, input_path)` turns any validated upload into a model-ready file at `STORAGE_DIR/processed/{meeting_id}.wav`: **mono, 16 kHz, 16-bit PCM WAV**, the format Whisper and pyannote expect. The original upload is never modified.
+
+1. **Analysis** (`analysis.py`) makes a single ffmpeg pass over the original audio. It runs `silencedetect` for silent spans, `astats` for RMS and peak level, and `ebur128` for integrated loudness in LUFS.
+2. **Conversion** (`preprocessor.py`) runs this chain: first audio track (from video too), then optional `atrim` (when `TRIM_SILENCE` is on), optional `highpass` at 80 Hz, optional `afftdn` denoise, then `loudnorm` (EBU R128, −23 LUFS) and resampling. It writes to a `.part` file and atomically renames it; a failed or timed-out run deletes the partial output.
+3. **Warnings** are reported but never fail processing:
+
+| Warning | Condition |
+| --- | --- |
+| `low_volume` | RMS below −40 dBFS (or unmeasurable) |
+| `clipping` | Peak at or above −0.1 dBFS |
+| `too_short` | Shorter than 2 s |
+| `mostly_silent` | More than 80 % silence |
+
+The results are stored on the meeting as `audio_quality` and returned by `GET /meetings/{id}`:
+
+```json
+{"sample_rate": 16000, "channels": 1, "duration_seconds": 312.4, "loudness_lufs": -21.8,
+ "rms_db": -24.1, "peak_db": -3.2, "silence_ratio": 0.12, "leading_silence_seconds": 1.4,
+ "trailing_silence_seconds": 0.0, "trimmed_seconds": 0.0, "warnings": [], "processing_time_ms": 4180}
+```
+
+The level metrics (`loudness_lufs`, `rms_db`, `peak_db`) describe the **original** recording, so they reflect how well it was captured; after normalization every file sits at about −23 LUFS anyway.
+
+### Chunking long recordings
+
+`app/services/audio/chunker.py` provides `split_wav(path, out_dir, chunk_length_seconds=..., overlap_seconds=...)`. It cuts sample-accurate, overlapping WAV slices without re-encoding, and each `AudioChunk` records its absolute `start_seconds` and `end_seconds` so later stages can map timestamps back to meeting time. It isn't wired into the pipeline yet; the ASR and diarization stages will use it.
+
+### Preprocessing configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TARGET_SAMPLE_RATE` | `16000` | Output sample rate |
+| `TARGET_LOUDNESS_LUFS` | `-23` | `loudnorm` integrated loudness target |
+| `ENABLE_HIGHPASS` / `HIGHPASS_CUTOFF_HZ` | `true` / `80` | Remove low-frequency rumble |
+| `ENABLE_DENOISE` | `false` | Light FFT denoise (`afftdn`) |
+| `TRIM_SILENCE` | `false` | Cut leading/trailing silence (it is always reported) |
+| `SILENCE_THRESHOLD_DB` / `SILENCE_MIN_DURATION_SECONDS` | `-50` / `0.5` | `silencedetect` sensitivity |
+| `FFMPEG_PATH` / `FFMPEG_TIMEOUT_SECONDS` | `ffmpeg` / `1800` | ffmpeg binary and per-run timeout |
+| `CHUNK_LENGTH_SECONDS` / `CHUNK_OVERLAP_SECONDS` | `1800` / `5` | Chunker defaults (30 min, 5 s overlap) |
 
 ## Running with Docker
 
@@ -172,8 +243,8 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | # | Prompt | Scope |
 | --- | --- | --- |
 | 1 | Project scaffold ✅ | Layout, tooling, CI, Docker, health endpoint |
-| 2 | **Upload API** ✅ | Multipart upload, size/extension validation, storage, meeting records |
-| 3 | Audio preprocessing | ffmpeg decode, resample, normalise, VAD |
+| 2 | Upload API ✅ | Multipart upload, size/extension validation, storage, meeting records |
+| 3 | **Audio preprocessing** ✅ | ffmpeg extract, resample, loudness-normalize, silence/quality analysis, chunking, stage-based pipeline |
 | 4 | Speaker diarization | pyannote integration (optional `diarization` extra) |
 | 5 | Multilingual ASR | Whisper-based ASR with language ID for en/hi/or and code-mixed speech |
 | 6 | Alignment | Word-to-speaker attribution, speaker turns |

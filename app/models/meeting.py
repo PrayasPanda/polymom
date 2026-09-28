@@ -20,10 +20,12 @@ class Meeting(Base):
     title: Mapped[str | None] = mapped_column(String(200))
     original_filename: Mapped[str] = mapped_column(String(255))
     stored_path: Mapped[str] = mapped_column(String(1024))
+    processed_path: Mapped[str | None] = mapped_column(String(1024))
     mime_type: Mapped[str] = mapped_column(String(100))
     size_bytes: Mapped[int] = mapped_column(BigInteger)
     duration_seconds: Mapped[float | None] = mapped_column(Float)
     audio_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    audio_quality: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     languages_hint: Mapped[list[str]] = mapped_column(JSON, default=list)
     expected_speakers: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[MeetingStatus] = mapped_column(

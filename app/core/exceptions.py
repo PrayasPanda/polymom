@@ -75,10 +75,33 @@ class MediaProbeUnavailableError(PolymomError):
     code = "media_probe_unavailable"
 
 
+class ConflictError(PolymomError):
+    status_code = status.HTTP_409_CONFLICT
+    code = "conflict"
+
+
+class MeetingStateConflictError(ConflictError):
+    """The meeting is in a state that does not allow the requested action."""
+
+    code = "meeting_state_conflict"
+
+
 class PipelineError(PolymomError):
     """Raised when a processing stage (ASR, diarization, ...) fails."""
 
     code = "pipeline_error"
+
+
+class AudioProcessingError(PipelineError):
+    """ffmpeg failed to decode, filter or write the audio."""
+
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    code = "audio_processing_failed"
+
+
+class FFmpegTimeoutError(AudioProcessingError):
+    status_code = status.HTTP_504_GATEWAY_TIMEOUT
+    code = "ffmpeg_timeout"
 
 
 def error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:

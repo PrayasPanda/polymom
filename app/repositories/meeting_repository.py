@@ -23,6 +23,10 @@ class MeetingRepository(ABC):
         """Return one page of meetings, newest first, and the total count."""
 
     @abstractmethod
+    async def save(self, meeting: Meeting) -> Meeting:
+        """Persist changes to an existing meeting."""
+
+    @abstractmethod
     async def delete(self, meeting: Meeting) -> None: ...
 
 
@@ -49,6 +53,11 @@ class SqlAlchemyMeetingRepository(MeetingRepository):
             .offset(offset)
         )
         return list(rows), total or 0
+
+    async def save(self, meeting: Meeting) -> Meeting:
+        merged = await self._session.merge(meeting)
+        await self._session.commit()
+        return merged
 
     async def delete(self, meeting: Meeting) -> None:
         await self._session.delete(meeting)

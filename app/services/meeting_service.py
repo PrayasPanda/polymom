@@ -1,4 +1,4 @@
-"""Meeting use cases: upload, fetch, list, delete."""
+"""Meeting use cases: upload, fetch, list, delete, request processing."""
 
 import uuid
 from pathlib import Path
@@ -7,7 +7,7 @@ import structlog
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import Settings
-from app.core.exceptions import MeetingNotFoundError, PolymomError
+from app.core.exceptions import MeetingNotFoundError, MeetingStateConflictError, PolymomError
 from app.core.logging import get_logger
 from app.models.meeting import Meeting
 from app.repositories.meeting_repository import MeetingRepository
@@ -87,9 +87,30 @@ class MeetingService:
     async def list(self, *, limit: int, offset: int) -> tuple[list[Meeting], int]:
         return await self._repo.list(limit=limit, offset=offset)
 
+    async def request_processing(self, meeting_id: uuid.UUID, *, force: bool = False) -> Meeting:
+        """Mark a meeting as ``processing`` so the pipeline can be scheduled.
+
+        Setting the status here, before the background task starts, makes a
+        second request see ``processing`` and get a 409 instead of double-running.
+        """
+        meeting = await self.get(meeting_id)
+        busy = (MeetingStatus.PROCESSING, MeetingStatus.COMPLETED)
+        if meeting.status in busy and not force:
+            raise MeetingStateConflictError(
+                f"Meeting is already {meeting.status.value}. Use ?force=true to reprocess.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+        meeting.status = MeetingStatus.PROCESSING
+        meeting.error = None
+        meeting = await self._repo.save(meeting)
+        logger.info("processing_requested", meeting_id=str(meeting_id), force=force)
+        return meeting
+
     async def delete(self, meeting_id: uuid.UUID) -> None:
-        """Remove the record, then its stored file."""
+        """Remove the record, then its stored and processed files."""
         meeting = await self.get(meeting_id)
         await self._repo.delete(meeting)
-        await run_in_threadpool(Path(meeting.stored_path).unlink, missing_ok=True)
+        for path in (meeting.stored_path, meeting.processed_path):
+            if path:
+                await run_in_threadpool(Path(path).unlink, missing_ok=True)
         logger.info("meeting_deleted", meeting_id=str(meeting_id))

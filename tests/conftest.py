@@ -105,3 +105,71 @@ async def client(
 ) -> AsyncIterator[AsyncClient]:
     async for ac in client_factory(settings):
         yield ac
+
+
+# --- Preprocessing fixtures (generated with ffmpeg lavfi sources) ---
+
+
+def _lavfi(media_dir: Path, name: str, *args: str) -> Path:
+    if not HAS_FFMPEG:
+        pytest.skip("ffmpeg not installed")
+    out = media_dir / name
+    if not out.exists():
+        _ffmpeg(out, *args)
+    return out
+
+
+@pytest.fixture(scope="session")
+def stereo_44k_path(media_dir: Path) -> Path:
+    """3 s stereo 44.1 kHz tone."""
+    return _lavfi(
+        media_dir,
+        "stereo44k.wav",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=f=440:d=3:sample_rate=44100",
+        "-ac",
+        "2",
+    )
+
+
+@pytest.fixture(scope="session")
+def video_with_audio_path(media_dir: Path) -> Path:
+    return _lavfi(
+        media_dir,
+        "talk.mp4",
+        *("-f", "lavfi", "-i", "color=c=black:s=32x32:d=3"),
+        *("-f", "lavfi", "-i", "sine=f=300:d=3"),
+        *("-c:v", "mpeg4", "-c:a", "aac", "-shortest"),
+    )
+
+
+@pytest.fixture(scope="session")
+def near_silent_path(media_dir: Path) -> Path:
+    """Tone at about -70 dBFS: below the silence threshold and very quiet."""
+    return _lavfi(media_dir, "quiet.wav", "-f", "lavfi", "-i", "sine=f=440:d=4,volume=0.0005")
+
+
+@pytest.fixture(scope="session")
+def clipped_path(media_dir: Path) -> Path:
+    """Tone amplified far past full scale, so samples clip."""
+    return _lavfi(media_dir, "clipped.wav", "-f", "lavfi", "-i", "sine=f=440:d=3,volume=20")
+
+
+@pytest.fixture(scope="session")
+def short_path(media_dir: Path) -> Path:
+    return _lavfi(media_dir, "short.wav", "-f", "lavfi", "-i", "sine=f=440:d=1")
+
+
+@pytest.fixture(scope="session")
+def padded_path(media_dir: Path) -> Path:
+    """1 s silence, 2 s tone, 1 s silence."""
+    expr = "if(between(t,1,3),0.5*sin(2*PI*440*t),0)"
+    return _lavfi(media_dir, "padded.wav", "-f", "lavfi", "-i", f"aevalsrc='{expr}':d=4:s=16000")
+
+
+@pytest.fixture(scope="session")
+def long_3min_path(media_dir: Path) -> Path:
+    """3-minute 16 kHz mono tone for chunking tests."""
+    return _lavfi(media_dir, "long.wav", "-f", "lavfi", "-i", "sine=f=440:d=180:sample_rate=16000")

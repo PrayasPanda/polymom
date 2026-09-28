@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.audio import AudioQuality
+
 Language = Literal["en", "hi", "or"]
 SUPPORTED_LANGUAGES: frozenset[str] = frozenset({"en", "hi", "or"})
 
@@ -63,6 +65,7 @@ class MeetingRead(BaseModel):
                         "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
                         "bit_rate": 128000,
                     },
+                    "audio_quality": None,
                     "languages_hint": ["en", "hi"],
                     "expected_speakers": 4,
                     "status": "queued",
@@ -81,6 +84,9 @@ class MeetingRead(BaseModel):
     size_bytes: int
     duration_seconds: float | None
     audio_metadata: AudioMetadata
+    audio_quality: AudioQuality | None = Field(
+        default=None, description="Preprocessing results; set once the preprocess stage ran."
+    )
     languages_hint: list[Language]
     expected_speakers: int | None
     status: MeetingStatus
@@ -94,3 +100,12 @@ class MeetingList(BaseModel):
     total: int = Field(description="Total number of meetings, ignoring pagination.")
     limit: int
     offset: int
+
+
+class ProcessResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{"meeting_id": _EXAMPLE_ID, "status": "processing"}]}
+    )
+
+    meeting_id: UUID
+    status: MeetingStatus
