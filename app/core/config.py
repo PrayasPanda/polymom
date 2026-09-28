@@ -62,12 +62,41 @@ class Settings(BaseSettings):
     diarization_chunk_threshold_seconds: float = Field(default=3600.0, gt=0)
     speaker_similarity_threshold: float = Field(default=0.6, ge=-1, le=1)
 
+    # ASR
+    asr_backend: Literal["real", "mock"] = "real"
+    whisper_model_size: str = "large-v3"
+    whisper_compute_type: Literal["auto", "int8", "int8_float16", "float16", "float32"] = "auto"
+    odia_model_id: str = "ai4bharat/indic-conformer-600m-multilingual"
+    odia_decoding: Literal["ctc", "rnnt"] = "rnnt"
+    asr_language_backends: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=lambda: {"en": "whisper", "hi": "whisper", "or": "indic"}
+    )
+    asr_beam_size: int = Field(default=5, ge=1, le=20)
+    asr_vad_filter: bool = True
+    asr_low_confidence_threshold: float = Field(default=0.5, ge=0, le=1)
+    asr_compression_ratio_threshold: float = Field(default=2.4, gt=0)
+    asr_no_speech_threshold: float = Field(default=0.6, ge=0, le=1)
+
     @field_validator("allowed_extensions", mode="before")
     @classmethod
     def _split_extensions(cls, value: object) -> object:
         """Accept a comma-separated string such as ``"wav,.MP3"``."""
         if isinstance(value, str):
             return frozenset(e.strip().lstrip(".").lower() for e in value.split(",") if e.strip())
+        return value
+
+    @field_validator("asr_language_backends", mode="before")
+    @classmethod
+    def _parse_language_backends(cls, value: object) -> object:
+        """Accept ``"en:whisper,hi:whisper,or:indic"``."""
+        if isinstance(value, str):
+            mapping: dict[str, str] = {}
+            for pair in filter(None, (p.strip() for p in value.split(","))):
+                lang, sep, backend = pair.partition(":")
+                if not sep or not lang.strip() or not backend.strip():
+                    raise ValueError(f"expected 'lang:backend', got {pair!r}")
+                mapping[lang.strip().lower()] = backend.strip().lower()
+            return mapping
         return value
 
     @property
