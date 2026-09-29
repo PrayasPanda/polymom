@@ -8,7 +8,13 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings, get_settings
-from app.pipelines.mom_pipeline import MoMPipeline, RepositoryFactory, build_pipeline
+from app.pipelines.mom_pipeline import (
+    MoMPipeline,
+    RepositoryFactory,
+    SummarizationStage,
+    SummaryRegenerator,
+    build_pipeline,
+)
 from app.repositories.meeting_repository import MeetingRepository, SqlAlchemyMeetingRepository
 from app.services.asr.router import ASRRouter
 from app.services.asr.service import build_router
@@ -17,6 +23,8 @@ from app.services.diarization.base import DiarizationBackend
 from app.services.diarization.service import build_backend
 from app.services.language.base import LanguageIdentifier
 from app.services.language.service import build_identifier
+from app.services.llm import build_llm_client
+from app.services.llm.base import LLMClient
 from app.services.meeting_service import MeetingService
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
@@ -82,12 +90,21 @@ def get_language_identifier(settings: SettingsDep) -> LanguageIdentifier:
     return build_identifier(settings)
 
 
+def get_llm_client(settings: SettingsDep) -> LLMClient:
+    """LLM chosen by ``LLM_PROVIDER`` / ``LLM_MODEL``."""
+    return build_llm_client(settings)
+
+
+LLMClientDep = Annotated[LLMClient, Depends(get_llm_client)]
+
+
 def get_pipeline(
     request: Request,
     settings: SettingsDep,
     diarization_backend: Annotated[DiarizationBackend, Depends(get_diarization_backend)],
     asr_router: Annotated[ASRRouter, Depends(get_asr_router)],
     language_identifier: Annotated[LanguageIdentifier, Depends(get_language_identifier)],
+    llm: LLMClientDep,
 ) -> MoMPipeline:
     return build_pipeline(
         settings,
@@ -95,7 +112,19 @@ def get_pipeline(
         diarization_backend,
         asr_router,
         language_identifier,
+        llm,
     )
 
 
 PipelineDep = Annotated[MoMPipeline, Depends(get_pipeline)]
+
+
+def get_summary_regenerator(
+    request: Request, settings: SettingsDep, llm: LLMClientDep
+) -> SummaryRegenerator:
+    return SummaryRegenerator(
+        SummarizationStage(settings, llm), repository_factory(request.app.state.sessionmaker)
+    )
+
+
+SummaryRegeneratorDep = Annotated[SummaryRegenerator, Depends(get_summary_regenerator)]

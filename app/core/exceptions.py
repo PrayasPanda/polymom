@@ -181,6 +181,25 @@ class ChartsUnavailableError(PolymomError):
     code = "charts_unavailable"
 
 
+class LLMError(PipelineError):
+    """The LLM provider failed: missing credentials, HTTP error, timeout."""
+
+    status_code = status.HTTP_502_BAD_GATEWAY
+    code = "llm_error"
+
+
+class LLMOutputError(LLMError):
+    """The model kept returning output that does not match the schema."""
+
+    code = "llm_invalid_output"
+
+
+class SummaryNotAvailableError(ConflictError):
+    """The summary was requested before (or after a failed) summarization."""
+
+    code = "summary_not_available"
+
+
 def error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": jsonable_encoder(details)}}
 

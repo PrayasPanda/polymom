@@ -72,7 +72,7 @@ make dev                   # uv sync --all-groups + pre-commit install
 | `APP_ENV` | `development` | `development` / `staging` / `production` / `test`; non-development environments log JSON |
 | `LOG_LEVEL` | `INFO` | Root log level |
 | `HF_TOKEN` | – | Hugging Face token (for diarization models) |
-| `LLM_PROVIDER` | `openai` | LLM backend for summaries |
+| `LLM_PROVIDER` | `openai` | LLM backend for summaries: `openai`, `azure`, `anthropic`, `ollama`, `mock` |
 | `LLM_API_KEY` | – | API key for the LLM provider |
 | `STORAGE_DIR` | `./storage` | Uploads go to `STORAGE_DIR/uploads/{meeting_id}.{ext}` |
 | `DATABASE_URL` | SQLite at `STORAGE_DIR/polymom.db` | Any SQLAlchemy async URL, e.g. `postgresql+asyncpg://...` (install `asyncpg`) |
@@ -685,6 +685,157 @@ Charts need the optional extra: `uv sync --extra viz` (matplotlib). Without it, 
 | `GINI_BALANCED_MAX` | `0.2` | At or below this: `balanced` |
 | `GINI_DOMINATED_MIN` | `0.4` | At or above this: `dominated` |
 
+## Minutes of meeting (LLM summary)
+
+`SummarizationStage` (after analytics) turns the speaker-attributed transcript into minutes: a title, an executive summary (5 to 8 sentences), agenda topics, key discussion points, decisions, action items and open questions. **Every item cites evidence**: utterance ids, speaker label, timestamps and a short verbatim quote in the original script. A verifier checks each piece of evidence against the transcript before anything is shown.
+
+```bash
+curl .../meetings/{id}/summary               # JSON (speaker labels + speaker_names)
+curl .../meetings/{id}/summary?format=md     # Markdown minutes with display names
+curl -X POST .../meetings/{id}/summary/regenerate -H 'Content-Type: application/json' \
+     -d '{"output_language": "hi", "model": "gpt-4o"}'   # both optional; 202, then poll GET
+```
+
+### How it works
+
+```mermaid
+flowchart TD
+    T[Aligned utterances] --> F["Lines: [u42][00:12:05][Person 2][hi] text"]
+    T --> I[Injection detector]
+    F --> Q{Tokens <= SUMMARY_SINGLE_PASS_TOKENS?}
+    Q -- yes --> S[Single pass: full minutes]
+    Q -- no --> C[Chunk on utterance boundaries, small overlap]
+    C --> M1[Map: items for chunk 1]
+    C --> M2[Map: items for chunk N]
+    M1 --> R[Reduce: merge, de-duplicate, later decisions supersede earlier]
+    M2 --> R
+    R --> H[LLM: title, executive summary, agenda]
+    S --> V[Verifier: ids, speakers, timestamps, fuzzy quote match]
+    H --> V
+    A[Analytics: compact context only] -.-> S
+    A -.-> H
+    I --> RP[verification_report]
+    V --> RP
+    V --> OUT[MeetingSummary]
+```
+
+- **Transcript format:** the transcript goes to the model in its original scripts; nothing is translated first. Each line carries the utterance id, time, speaker label and language, so the model can cite them.
+- **Structured output:** each provider's native mode is used. OpenAI and Azure use `response_format: json_schema`, Anthropic a forced tool call with the schema as `input_schema`, and Ollama `format: <schema>`. The result is always validated with Pydantic. If validation fails, the error is sent back to the model for up to `LLM_MAX_RETRIES` repair attempts.
+- **Map-reduce:** long meetings are split into chunks of about `SUMMARY_CHUNK_TOKENS`, measured with a provider-neutral token estimate. The reduce step is deterministic:
+  - Items with similar text (rapidfuzz), or that cite the same utterances, are merged and keep all their evidence.
+  - A later decision on the same `topic` marks the earlier one `superseded`, and both get a `note`.
+  - One final LLM call then writes the narrative from the merged items.
+- **Analytics as context:** speaking time and the dominant speaker are passed as context and labelled "never evidence". They cannot create or override items.
+- **Multilingual output:** `SUMMARY_OUTPUT_LANGUAGE` is `en` (default), `hi` or `or`, and quotes stay in the original language. The prompt covers code-mixing, romanized Hindi and Odia, and Indian date expressions. `due_date.raw` keeps the words as spoken ("kal", "parso", "agle hafte", "by EOD"). `due_date.iso` is filled only when the date is unambiguous from the meeting date.
+
+### Providers
+
+| `LLM_PROVIDER` | Default `LLM_MODEL` | Notes |
+| --- | --- | --- |
+| `openai` | `gpt-4o-mini` | Cheap, good at Hindi. `LLM_API_KEY` |
+| `azure` | (deployment) | `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, `LLM_API_KEY` |
+| `anthropic` | `claude-sonnet-5` | Strong long-context reasoning. `LLM_API_KEY` |
+| `ollama` | `qwen2.5:7b-instruct` | Fully local and offline, no key needed |
+| `mock` | `mock-llm` | Deterministic keyword rules; used by the tests |
+
+Running fully offline with Ollama:
+
+```bash
+ollama pull qwen2.5:7b-instruct        # or llama3.1:8b / any model that follows JSON schemas
+echo 'LLM_PROVIDER=ollama' >> .env      # OLLAMA_BASE_URL defaults to http://localhost:11434
+# In Docker, point OLLAMA_BASE_URL at the host, e.g. http://host.docker.internal:11434
+```
+
+Small local models return invalid JSON more often. The repair loop catches most of it; if not, raise `LLM_MAX_RETRIES` or use a larger model. Each call records token usage, latency, repair attempts and cost (`LLM_INPUT_COST_PER_MTOK` and `LLM_OUTPUT_COST_PER_MTOK`, left to you so prices are never out of date) in `model_info.usage`. Rate limits (429) and 5xx errors are retried with exponential backoff, honouring `Retry-After`.
+
+**Tracing:** set `LANGFUSE_ENABLED=true` and the keys, and install the extra with `uv sync --extra tracing`. This creates one trace per meeting and one generation per LLM call, tagged with the prompt version. A Langfuse failure never breaks summarization.
+
+### Prompt versioning
+
+The prompts live in `app/services/summarization/prompts/*.j2` (Jinja2). Each file starts with `{#- version: map@1 -#}`. Bump the number whenever the wording changes. The versions used are stored in `model_info.prompt_version` (for example `system@1,single_pass@1`) and tagged in Langfuse, so any summary can be traced back to the prompts that produced it.
+
+### Grounding and safety
+
+- **Verifier** (`verifier.py`), for each piece of evidence:
+  - the utterance ids exist;
+  - the quoted speaker said one of them;
+  - timestamps, if given, match within 1 s (and are then filled in from the transcript);
+  - the quote matches the utterance text with `partial_ratio >= EVIDENCE_MATCH_THRESHOLD`, after NFC normalization and case folding.
+- **What happens on failure:** failing evidence is removed. Items with no evidence left are dropped; items that lost some evidence drop one confidence level.
+- **No invented names:** owners must be speaker labels or `Unassigned`, deciders a label or `group`. Anything else, such as a guessed real name, is reset. Display names are applied only when rendering.
+- **Report:** everything is counted in `verification_report` (`checked`, `passed`, `downgraded`, `dropped`, `issues`, evidence pass rate).
+- **Prompt injection:** the transcript is untrusted input. The defences are:
+  - The transcript goes in a delimited `<transcript>` data block, and the system prompt says to treat it strictly as data.
+  - Angle brackets and newlines in speech are neutralized, so a speaker can't close the block or fake a line.
+  - Output must match the schema.
+  - A lightweight detector (`injection.py`) flags lines such as "ignore previous instructions" or "system prompt", in English, Hindi (including romanized) and Odia. Flags are recorded in `verification_report.injection_flags` and never acted on.
+- **Failure isolation:** summarization is an optional stage. If the provider is down or misconfigured, the meeting ends as `completed_with_errors`. Transcript and analytics stay available, `GET /summary` returns `409` with `summary_error`, and `POST /summary/regenerate` retries.
+
+### Sample minutes (Markdown)
+
+```markdown
+# Mobile release planning
+
+## Executive summary
+
+The team reviewed the 2.4 mobile release and an Android login bug affecting about 5% of users. ...
+
+## Decisions
+
+| # | Decision | By | Confidence | Status |
+|---|---|---|---|---|
+| 1 | Ship the login fix before the release | group | high | active |
+| 2 | Ship version 2.4 on Friday | Ravi | high | active |
+
+## Action items
+
+| # | Task | Owner | Due | Priority | Confidence |
+|---|---|---|---|---|---|
+| 1 | Fix the login bug | Sunita | Wednesday (2026-09-30) | high | high |
+| 2 | वेंडर की सूची भेजना | Person 3 | kal (2026-09-29) | medium | medium |
+
+## Verification
+
+9 items checked: 8 passed, 1 downgraded, 0 dropped. Evidence grounding: 12/13.
+```
+
+### Evaluation
+
+```bash
+uv run python scripts/eval_summary.py                   # uses LLM_PROVIDER; LLM judge
+LLM_PROVIDER=mock uv run python scripts/eval_summary.py # offline smoke run, fuzzy judge
+```
+
+`tests/fixtures/meetings/` holds four synthetic meetings: English, Hindi, Odia, and a code-mixed Hinglish and Odia standup that includes an injection attempt. Each has a hand-written gold list of decisions and action items. The script reports:
+- decision and action-item precision and recall, matched one-to-one by an LLM judge with a rubric, or by fuzzy matching with `--judge fuzzy`;
+- exact owner-match accuracy;
+- the grounding pass rate.
+
+The mock provider's scores only show that the harness works. Real numbers depend on the provider and model, so run the script against yours.
+
+### Known limitations
+
+- **Evidence checks:** the verifier proves a quote exists and belongs to the right speaker. It cannot prove the model's paraphrase of that quote is correct.
+- **ASR errors carry through:** a misheard word can change a task or a date; the evidence quote helps a reader spot it.
+- **Token budgets:** the token estimate is a heuristic (about 4 characters per token for Latin, about 2 for Indic scripts).
+- **Supersession:** it relies on the model giving matching decision `topic`s across chunks.
+- **Injection detection:** it is pattern-based and will miss paraphrased attacks. The structural defences above are what the design relies on.
+- **Small local models:** they may translate quotes despite instructions; the verifier then drops that evidence.
+
+### Summarization configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LLM_PROVIDER` / `LLM_MODEL` | `openai` / provider default | See Providers |
+| `LLM_TEMPERATURE` | `0.2` | Sampling temperature |
+| `LLM_MAX_RETRIES` | `2` | JSON repair attempts, and HTTP retries |
+| `LLM_TIMEOUT_SECONDS` | `120` | Per request |
+| `SUMMARY_OUTPUT_LANGUAGE` | `en` | `en`, `hi` or `or` |
+| `SUMMARY_SINGLE_PASS_TOKENS` | `12000` | Above this, use map-reduce |
+| `SUMMARY_CHUNK_TOKENS` | `6000` | Map chunk budget |
+| `EVIDENCE_MATCH_THRESHOLD` | `80` | Minimum fuzzy score for a quote |
+| `LANGFUSE_ENABLED` | `false` | Tracing (plus the keys and `LANGFUSE_HOST`) |
+
 ## Running with Docker
 
 ```bash
@@ -714,8 +865,8 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | 5 | Multilingual ASR ✅ | Routed ASR: faster-whisper (en/hi) + AI4Bharat IndicConformer (or), NFC native script, hallucination guards, SRT, WER/CER eval |
 | 6 | Language ID + code-switching ✅ | Turn-based spoken LID (MMS), smoothing, per-region ASR routing, code-mix tagging, `/languages` |
 | 7 | Speaker + transcript alignment ✅ | Word-level speaker attribution, utterances, txt/srt/vtt/md, speaker renaming, DER/WDER eval |
-| 8 | **Speaker statistics** ✅ | Talk time, turns, interruptions, WPM, languages, questions per speaker; balance, timeline, CSV, charts |
-| 9 | LLM summarization | Provider-agnostic summary, decisions and action items with structured output |
+| 8 | Speaker statistics ✅ | Talk time, turns, interruptions, WPM, languages, questions per speaker; balance, timeline, CSV, charts |
+| 9 | **LLM summarization** ✅ | Grounded summary, decisions, action items; OpenAI/Azure/Anthropic/Ollama; map-reduce, verifier, injection flags, eval |
 | 10 | Results API & exports | Transcript/summary endpoints, Markdown/PDF/JSON export |
 | 11 | Background workers & persistence | Job queue, durable DB, retries |
 | 12 | Hardening & deployment | Auth, rate limiting, observability, GPU image, release |

@@ -14,6 +14,7 @@ from app.core.exceptions import (
     MeetingNotFoundError,
     MeetingStateConflictError,
     PolymomError,
+    SummaryNotAvailableError,
     TranscriptNotAvailableError,
     ValidationError,
 )
@@ -25,6 +26,7 @@ from app.schemas.asr import ASRResult
 from app.schemas.diarization import DiarizationResult
 from app.schemas.language import LanguageSummary
 from app.schemas.meeting import MeetingStatus
+from app.schemas.summary import MeetingSummary
 from app.schemas.transcript import SpeakerTranscript
 from app.services.audio.validator import AsyncReadable, MediaValidator
 
@@ -166,6 +168,40 @@ class MeetingService:
             speaker.speaker_name = names.get(speaker.speaker)
         return analytics, names
 
+    async def get_summary(self, meeting_id: uuid.UUID) -> tuple[MeetingSummary, dict[str, str]]:
+        """The stored minutes (speaker labels; display names are applied at render time)."""
+        meeting = await self.get(meeting_id)
+        if meeting.summary is None:
+            failed = meeting.summary_error is not None
+            raise SummaryNotAvailableError(
+                "Summarization failed; transcript and analytics are still available. "
+                "Retry with POST /meetings/{id}/summary/regenerate."
+                if failed
+                else "The summary is not available yet. Run POST /meetings/{id}/process "
+                "and wait for status 'completed'.",
+                details={
+                    "meeting_id": str(meeting_id),
+                    "status": meeting.status.value,
+                    "summary_error": meeting.summary_error,
+                },
+            )
+        return MeetingSummary.model_validate(meeting.summary), dict(meeting.speaker_names or {})
+
+    async def check_summary_regeneration(self, meeting_id: uuid.UUID) -> None:
+        """Regeneration needs a speaker transcript and no pipeline run in progress."""
+        meeting = await self.get(meeting_id)
+        if meeting.status == MeetingStatus.PROCESSING:
+            raise MeetingStateConflictError(
+                "Meeting is still processing.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+        if meeting.speaker_transcript is None:
+            raise TranscriptNotAvailableError(
+                "The speaker-attributed transcript is not available yet. Process the meeting "
+                "first.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+
     async def rename_speakers(
         self, meeting_id: uuid.UUID, names: dict[str, str | None]
     ) -> dict[str, str]:
@@ -207,7 +243,11 @@ class MeetingService:
         second request see ``processing`` and get a 409 instead of double-running.
         """
         meeting = await self.get(meeting_id)
-        busy = (MeetingStatus.PROCESSING, MeetingStatus.COMPLETED)
+        busy = (
+            MeetingStatus.PROCESSING,
+            MeetingStatus.COMPLETED,
+            MeetingStatus.COMPLETED_WITH_ERRORS,
+        )
         if meeting.status in busy and not force:
             raise MeetingStateConflictError(
                 f"Meeting is already {meeting.status.value}. Use ?force=true to reprocess.",

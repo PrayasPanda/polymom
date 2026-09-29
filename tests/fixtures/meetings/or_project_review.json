@@ -1,0 +1,19 @@
+{
+  "title": "ପ୍ରକଳ୍ପ ସମୀକ୍ଷା (Odia)",
+  "date": "2026-09-28",
+  "utterances": [
+    {"id": 0, "speaker": "Person 1", "start": 0.0, "end": 6.0, "lang": "or", "text": "ନମସ୍କାର, ଆଜିର ବିଷୟ ହେଉଛି ଗ୍ରାମୀଣ ସଡ଼କ ପ୍ରକଳ୍ପ।"},
+    {"id": 1, "speaker": "Person 2", "start": 6.5, "end": 12.0, "lang": "or", "text": "ବର୍ଷା ଯୋଗୁଁ କାମ ଦୁଇ ସପ୍ତାହ ପଛରେ ଅଛି।"},
+    {"id": 2, "speaker": "Person 1", "start": 12.5, "end": 18.0, "lang": "or", "text": "ଆମେ ରାଜି ଯେ ନୂଆ ସମୟସୀମା ଡିସେମ୍ବର ଶେଷ ହେବ।"},
+    {"id": 3, "speaker": "Person 2", "start": 18.5, "end": 24.0, "lang": "or", "text": "ମୁଁ ଆସନ୍ତାକାଲି ଠିକାଦାରଙ୍କୁ ଚିଠି ପଠାଇବି।"},
+    {"id": 4, "speaker": "Person 3", "start": 24.5, "end": 30.0, "lang": "or", "text": "ଅତିରିକ୍ତ ଖର୍ଚ୍ଚ କିଏ ବହନ କରିବ?"}
+  ],
+  "gold": {
+    "decisions": [
+      {"text": "ନୂଆ ସମୟସୀମା ଡିସେମ୍ବର ଶେଷ", "made_by": "group"}
+    ],
+    "action_items": [
+      {"task": "ଆସନ୍ତାକାଲି ଠିକାଦାରଙ୍କୁ ଚିଠି ପଠାଇବା", "owner": "Person 2"}
+    ]
+  }
+}

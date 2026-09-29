@@ -16,6 +16,9 @@ dependencies = [
     "aiosqlite>=0.22.1",
     "alembic>=1.20.0",
     "filetype>=1.2.0",
+    "jinja2>=3.1.6",
+    "rapidfuzz>=3.14.6",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +41,8 @@ indic = [
 ]
 # Analytics charts (PNG): `uv sync --extra viz`. Without it the chart endpoint returns 503.
 viz = ["matplotlib>=3.8"]
+# Langfuse tracing of LLM calls (LANGFUSE_ENABLED=true): `uv sync --extra tracing`.
+tracing = ["langfuse>=2,<3"]
 
 [dependency-groups]
 dev = [
@@ -92,10 +97,13 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow'"
-markers = ["slow: needs real models / HF_TOKEN; run with `make test-slow`"]
+markers = [
+    "slow: needs real models / HF_TOKEN; run with `make test-slow`",
+    "llm: calls a real LLM provider; skipped without LLM_API_KEY",
+]
 
 [[tool.mypy.overrides]]
-module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "jiwer", "jiwer.*", "matplotlib", "matplotlib.*"]
+module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "jiwer", "jiwer.*", "matplotlib", "matplotlib.*", "langfuse", "langfuse.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

@@ -1,9 +1,10 @@
 """Minutes-of-Meeting pipeline: an ordered list of stages sharing a context.
 
-Stages (planned): preprocess -> diarize -> transcribe -> align -> analytics -> summarize.
-Registered so far: preprocess -> diarize -> identify languages -> transcribe -> align ->
-analytics
-(language ID only when LANGUAGE_ROUTING_ENABLED).
+Stages: preprocess -> diarize -> identify languages -> transcribe -> align -> analytics ->
+summarize (language ID only when LANGUAGE_ROUTING_ENABLED).
+
+Stages marked ``optional`` (summarization) may fail without failing the meeting:
+earlier outputs are kept and the status becomes ``completed_with_errors``.
 """
 
 import time
@@ -12,6 +13,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -28,6 +30,7 @@ from app.schemas.audio import PreprocessResult
 from app.schemas.diarization import DiarizationResult
 from app.schemas.language import LanguageSummary
 from app.schemas.meeting import MeetingStatus
+from app.schemas.summary import MeetingSummary
 from app.schemas.transcript import SpeakerTranscript
 from app.services.alignment.aligner import align_words
 from app.services.alignment.utterances import build_transcript
@@ -39,6 +42,10 @@ from app.services.diarization.base import DiarizationBackend
 from app.services.diarization.service import DiarizationService
 from app.services.language.base import LanguageIdentifier
 from app.services.language.service import LanguageIdResult, LanguageIdService
+from app.services.llm import build_llm_client
+from app.services.llm.base import LLMClient
+from app.services.llm.tracing import build_tracer
+from app.services.summarization.summarizer import Summarizer
 
 logger = get_logger(__name__)
 
@@ -53,6 +60,7 @@ class PipelineContext:
     input_path: Path
     expected_speakers: int | None = None
     languages_hint: list[str] = field(default_factory=list)
+    meeting_date: date | None = None
     processed_path: Path | None = None
     outputs: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, int] = field(default_factory=dict)
@@ -66,12 +74,17 @@ class PipelineStage(ABC):
     """
 
     name: ClassVar[str]
+    optional: ClassVar[bool] = False
+    """An optional stage's failure is recorded but does not fail the meeting."""
 
     @abstractmethod
     async def run(self, context: PipelineContext) -> None: ...
 
     def apply(self, context: PipelineContext, meeting: Meeting) -> None:  # noqa: B027
         """Persist stage outputs on the meeting. Default: nothing to persist."""
+
+    def on_error(self, meeting: Meeting, message: str) -> None:  # noqa: B027
+        """Record an optional stage's failure on the meeting."""
 
 
 class PreprocessStage(PipelineStage):
@@ -242,6 +255,63 @@ class AnalyticsStage(PipelineStage):
         meeting.analytics = result.model_dump(mode="json")
 
 
+class SummarizationStage(PipelineStage):
+    """LLM minutes (summary, decisions, action items) grounded in the aligned transcript.
+
+    Analytics are passed as compact context only. Optional: a provider outage leaves
+    the transcript and analytics available and marks the meeting ``completed_with_errors``.
+    """
+
+    name = "summarize"
+    optional = True
+
+    def __init__(self, settings: Settings, llm: LLMClient | None = None) -> None:
+        self._settings = settings
+        self._llm = llm
+
+    async def summarize(
+        self,
+        meeting_id: uuid.UUID,
+        transcript: SpeakerTranscript,
+        analytics: ConversationAnalytics | None,
+        *,
+        meeting_date: date | None = None,
+        output_language: str | None = None,
+        model: str | None = None,
+    ) -> MeetingSummary:
+        llm = build_llm_client(self._settings, model) if model or self._llm is None else self._llm
+        tracer = build_tracer(self._settings, str(meeting_id))
+        return await Summarizer(llm, self._settings, tracer).summarize(
+            transcript, analytics, output_language=output_language, meeting_date=meeting_date
+        )
+
+    async def run(self, context: PipelineContext) -> None:
+        transcript: SpeakerTranscript | None = context.outputs.get(AlignmentStage.name)
+        if transcript is None:
+            raise RuntimeError("SummarizationStage requires AlignmentStage to run first")
+        context.outputs[self.name] = await self.summarize(
+            context.meeting_id,
+            transcript,
+            context.outputs.get(AnalyticsStage.name),
+            meeting_date=context.meeting_date,
+        )
+
+    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+        result: MeetingSummary = context.outputs[self.name]
+        meeting.summary = result.model_dump(mode="json")
+        meeting.summary_error = None
+
+    def on_error(self, meeting: Meeting, message: str) -> None:
+        meeting.summary = None
+        meeting.summary_error = message
+
+
+def _error_message(exc: Exception, stage: str) -> str:
+    if isinstance(exc, PolymomError):
+        return f"{exc.code}: {exc.message}"
+    return f"internal_error: Unexpected failure in stage '{stage}'."
+
+
 class MoMPipeline:
     """Runs stages in order and owns the meeting status lifecycle.
 
@@ -272,20 +342,34 @@ class MoMPipeline:
                 input_path=Path(meeting.stored_path),
                 expected_speakers=meeting.expected_speakers,
                 languages_hint=list(meeting.languages_hint or []),
+                meeting_date=meeting.created_at.date() if meeting.created_at else None,
             )
             logger.info("pipeline_started", stages=[s.name for s in self.stages])
             started = time.perf_counter()
             current = self.stages[0].name
+            errors: list[str] = []
             try:
                 for stage in self.stages:
                     current = stage.name
                     stage_started = time.perf_counter()
-                    await stage.run(context)
+                    try:
+                        await stage.run(context)
+                    except Exception as exc:
+                        if not stage.optional:
+                            raise
+                        message = _error_message(exc, stage.name)
+                        errors.append(f"{stage.name}: {message}")
+                        stage.on_error(meeting, message)
+                        logger.warning("optional_stage_failed", stage=stage.name, error=message)
+                        continue
                     elapsed = int((time.perf_counter() - stage_started) * 1000)
                     context.timings_ms[stage.name] = elapsed
                     logger.info("stage_completed", stage=stage.name, duration_ms=elapsed)
                     stage.apply(context, meeting)
-                meeting.status = MeetingStatus.COMPLETED
+                meeting.status = (
+                    MeetingStatus.COMPLETED_WITH_ERRORS if errors else MeetingStatus.COMPLETED
+                )
+                meeting.error = "; ".join(errors) or None
             except PolymomError as exc:
                 meeting.status = MeetingStatus.FAILED
                 meeting.error = f"{exc.code}: {exc.message}"
@@ -312,6 +396,7 @@ def build_pipeline(
     diarization_backend: DiarizationBackend,
     asr_router: ASRRouter,
     language_identifier: LanguageIdentifier | None = None,
+    llm: LLMClient | None = None,
 ) -> MoMPipeline:
     """Default stage registry. Later prompts append alignment, analytics, ..."""
     stages: list[PipelineStage] = [
@@ -323,4 +408,51 @@ def build_pipeline(
     stages.append(TranscriptionStage(TranscriptionService(asr_router, settings)))
     stages.append(AlignmentStage(settings))
     stages.append(AnalyticsStage(settings))
+    stages.append(SummarizationStage(settings, llm))
     return MoMPipeline(stages, repositories)
+
+
+class SummaryRegenerator:
+    """Re-runs only the summarization stage for a processed meeting (background task)."""
+
+    def __init__(self, stage: SummarizationStage, repositories: RepositoryFactory) -> None:
+        self._stage = stage
+        self._repositories = repositories
+
+    async def run(
+        self, meeting_id: uuid.UUID, *, output_language: str | None, model: str | None
+    ) -> None:
+        with structlog.contextvars.bound_contextvars(meeting_id=str(meeting_id)):
+            async with self._repositories() as repo:
+                meeting = await repo.get(meeting_id)
+            if meeting is None or meeting.speaker_transcript is None:
+                logger.warning("summary_regenerate_skipped")
+                return
+            try:
+                summary = await self._stage.summarize(
+                    meeting_id,
+                    SpeakerTranscript.model_validate(meeting.speaker_transcript),
+                    ConversationAnalytics.model_validate(meeting.analytics)
+                    if meeting.analytics
+                    else None,
+                    meeting_date=meeting.created_at.date() if meeting.created_at else None,
+                    output_language=output_language,
+                    model=model,
+                )
+            except Exception as exc:
+                message = _error_message(exc, SummarizationStage.name)
+                self._stage.on_error(meeting, message)
+                meeting.status = MeetingStatus.COMPLETED_WITH_ERRORS
+                meeting.error = f"{SummarizationStage.name}: {message}"
+                logger.warning("summary_regenerate_failed", error=message)
+            else:
+                meeting.summary = summary.model_dump(mode="json")
+                meeting.summary_error = None
+                if meeting.status == MeetingStatus.COMPLETED_WITH_ERRORS and (
+                    meeting.error or ""
+                ).startswith(f"{SummarizationStage.name}:"):
+                    meeting.status = MeetingStatus.COMPLETED
+                    meeting.error = None
+                logger.info("summary_regenerated")
+            async with self._repositories() as repo:
+                await repo.save(meeting)

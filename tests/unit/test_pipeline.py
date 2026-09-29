@@ -132,3 +132,33 @@ async def test_missing_meeting_is_a_no_op(repo: DictRepository) -> None:
 def test_pipeline_requires_stages(repo: DictRepository) -> None:
     with pytest.raises(ValueError, match="at least one stage"):
         MoMPipeline([], _factory(repo))
+
+
+class OptionalStage(RecordingStage):
+    optional = True
+
+
+async def test_optional_stage_failure_keeps_earlier_outputs(
+    repo: DictRepository, meeting: Meeting
+) -> None:
+    first = RecordingStage("one")
+    optional = OptionalStage("summarize", RuntimeError("provider down"))
+    after = RecordingStage("after")
+
+    status = await MoMPipeline([first, optional, after], _factory(repo)).run(meeting.id)
+
+    stored = repo.items[meeting.id]
+    assert status == MeetingStatus.COMPLETED_WITH_ERRORS
+    assert stored.title == "t+one-output+after-output"
+    assert stored.error == "summarize: internal_error: Unexpected failure in stage 'summarize'."
+
+
+async def test_summarization_stage_requires_alignment() -> None:
+    from pathlib import Path
+
+    from app.core.config import Settings
+    from app.pipelines.mom_pipeline import SummarizationStage
+
+    stage = SummarizationStage(Settings(_env_file=None, llm_provider="mock"))
+    with pytest.raises(RuntimeError, match="AlignmentStage"):
+        await stage.run(PipelineContext(meeting_id=uuid.uuid4(), input_path=Path("x")))
