@@ -1,29 +1,35 @@
-"""Meeting endpoints: upload, process, speakers, transcript, analytics, summary."""
+"""Meeting endpoints: upload, process, speakers, transcript, analytics, summary, results."""
 
+from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Response, UploadFile, status
 from fastapi.responses import PlainTextResponse
-from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import MeetingServiceDep, PipelineDep, SummaryRegeneratorDep
-from app.core.exceptions import ValidationError
-from app.models.meeting import Meeting
+from app.api.deps import (
+    MeetingServiceDep,
+    PipelineDep,
+    ResultServiceDep,
+    SummaryRegeneratorDep,
+)
+from app.core.exceptions import TranscriptNotAvailableError, ValidationError
+from app.repositories.meeting_repository import MeetingQuery, SortField
+from app.repositories.results_repository import UtteranceQuery
 from app.schemas.analytics import ConversationAnalyticsResponse
 from app.schemas.asr import TranscriptResponse
-from app.schemas.audio import AudioQuality
 from app.schemas.diarization import SpeakersResponse
 from app.schemas.error import error_example
 from app.schemas.language import LanguageSummaryResponse
 from app.schemas.meeting import (
     SUPPORTED_LANGUAGES,
-    AudioMetadata,
     MeetingCreateResponse,
     MeetingList,
     MeetingRead,
+    MeetingStatus,
     ProcessResponse,
 )
+from app.schemas.result import SECTIONS, MeetingResult, RunList, Section, UtterancePage
 from app.schemas.summary import (
     MeetingSummaryResponse,
     RegenerateSummaryRequest,
@@ -34,8 +40,9 @@ from app.schemas.transcript import (
     SpeakerRenameRequest,
     SpeakerTranscriptResponse,
 )
-from app.services.analytics.charts import ChartName, render_chart
+from app.services.analytics.charts import ChartName
 from app.services.analytics.export import speakers_to_csv
+from app.services.export import MEDIA_TYPES, ExportFormat
 from app.services.summarization.render import summary_to_markdown
 from app.utils.subtitles import (
     to_srt,
@@ -49,27 +56,6 @@ from app.utils.subtitles import (
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
 _NOT_FOUND = error_example(404, "meeting_not_found", "Meeting ... not found.", "Unknown meeting")
-
-
-def to_read(meeting: Meeting) -> MeetingRead:
-    return MeetingRead(
-        meeting_id=meeting.id,
-        title=meeting.title,
-        original_filename=meeting.original_filename,
-        mime_type=meeting.mime_type,
-        size_bytes=meeting.size_bytes,
-        duration_seconds=meeting.duration_seconds,
-        audio_metadata=AudioMetadata.model_validate(meeting.audio_metadata),
-        audio_quality=(
-            AudioQuality.model_validate(meeting.audio_quality) if meeting.audio_quality else None
-        ),
-        languages_hint=meeting.languages_hint,
-        expected_speakers=meeting.expected_speakers,
-        status=meeting.status,
-        error=meeting.error,
-        created_at=meeting.created_at,
-        updated_at=meeting.updated_at,
-    )
 
 
 def parse_languages(values: list[str] | None) -> list[str]:
@@ -122,39 +108,88 @@ async def create_meeting(
         list[str] | None,
         Form(description="Language hints: en, hi, or. Repeat the field or comma-separate."),
     ] = None,
+    allow_duplicate: Annotated[
+        bool, Query(description="Store a new meeting even if the same file was uploaded.")
+    ] = False,
+    *,
+    response: Response,
 ) -> MeetingCreateResponse:
-    """Validate the upload, store it and queue the meeting for processing."""
+    """Validate the upload, store it and queue the meeting for processing.
+
+    Uploads are idempotent: the SHA-256 of an identical earlier file returns that
+    meeting with ``200`` and ``duplicate: true`` unless ``?allow_duplicate=true``.
+    """
     langs = parse_languages(languages)
     try:
-        meeting = await service.create(
+        meeting, duplicate = await service.create(
             source=file,
             filename=file.filename,
             title=title.strip() if title and title.strip() else None,
             expected_speakers=expected_speakers,
             languages=langs,
+            allow_duplicate=allow_duplicate,
         )
     finally:
         await file.close()
+    if duplicate:
+        response.status_code = status.HTTP_200_OK
     return MeetingCreateResponse(
-        meeting_id=meeting.id, status=meeting.status, created_at=meeting.created_at
+        meeting_id=meeting.id,
+        status=meeting.status,
+        created_at=meeting.created_at,
+        duplicate=duplicate,
     )
 
 
-@router.get("", response_model=MeetingList, summary="List meetings, newest first")
+@router.get(
+    "",
+    response_model=MeetingList,
+    summary="List meetings with filters, sorting and cursor pagination",
+    responses=error_example(422, "validation_error", "Invalid cursor.", "Bad cursor or filter"),
+)
 async def list_meetings(
     service: MeetingServiceDep,
+    status_: Annotated[MeetingStatus | None, Query(alias="status")] = None,
+    language: Annotated[
+        str | None, Query(description="Spoken language detected in the meeting: en, hi, or.")
+    ] = None,
+    created_from: Annotated[datetime | None, Query(description="ISO 8601, inclusive.")] = None,
+    created_to: Annotated[datetime | None, Query(description="ISO 8601, inclusive.")] = None,
+    min_speakers: Annotated[int | None, Query(ge=0)] = None,
+    max_speakers: Annotated[int | None, Query(ge=0)] = None,
+    sort: Annotated[SortField, Query()] = "created_at",
+    order: Annotated[Literal["asc", "desc"], Query()] = "desc",
+    cursor: Annotated[str | None, Query(description="next_cursor from the previous page.")] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> MeetingList:
-    items, total = await service.list(limit=limit, offset=offset)
-    return MeetingList(items=[to_read(m) for m in items], total=total, limit=limit, offset=offset)
+    """Keyset (cursor) pagination: stable while new meetings arrive, fast on large tables."""
+    page = await service.page(
+        MeetingQuery(
+            status=status_,
+            language=language.lower() if language else None,
+            created_from=created_from,
+            created_to=created_to,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            sort=sort,
+            order=order,
+            cursor=cursor,
+            limit=limit,
+        )
+    )
+    return MeetingList(
+        items=[await service.to_read(m) for m in page.items],
+        total=page.total,
+        limit=limit,
+        next_cursor=page.next_cursor,
+    )
 
 
 @router.get(
     "/{meeting_id}", response_model=MeetingRead, summary="Get a meeting", responses=_NOT_FOUND
 )
 async def get_meeting(meeting_id: UUID, service: MeetingServiceDep) -> MeetingRead:
-    return to_read(await service.get(meeting_id))
+    return await service.to_read(await service.get(meeting_id))
 
 
 @router.delete(
@@ -424,13 +459,10 @@ async def get_analytics(
     },
 )
 async def get_analytics_chart(
-    meeting_id: UUID, chart_name: ChartName, service: MeetingServiceDep
+    meeting_id: UUID, chart_name: ChartName, results: ResultServiceDep
 ) -> Response:
-    """Rendered with matplotlib; needs the optional ``viz`` extra. Uses display names."""
-    analytics, names = await service.get_analytics(meeting_id)
-    turns = (await service.get_diarization(meeting_id)).turns if chart_name == "timeline" else []
-    png = await run_in_threadpool(render_chart, chart_name, analytics, names, turns)
-    return Response(png, media_type="image/png")
+    """Rendered with matplotlib (optional ``viz`` extra), cached in the artifact store."""
+    return Response(await results.chart(meeting_id, chart_name), media_type="image/png")
 
 
 _SUMMARY_NOT_AVAILABLE = error_example(
@@ -499,3 +531,125 @@ async def regenerate_summary(
         regenerator.run, meeting_id, output_language=body.output_language, model=body.model
     )
     return RegenerateSummaryResponse(meeting_id=meeting_id)
+
+
+_RUN_NOT_FOUND = error_example(404, "run_not_found", "Run ... not found.", "Unknown meeting or run")
+RunIdQuery = Annotated[
+    UUID | None, Query(description="A run from /runs; default: the latest successful run.")
+]
+
+
+def parse_include(value: str | None) -> list[Section]:
+    if value is None:
+        return list(SECTIONS)
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    invalid = sorted(set(parts) - set(SECTIONS))
+    if invalid:
+        raise ValidationError(
+            "Unknown include section.", details={"invalid": invalid, "allowed": list(SECTIONS)}
+        )
+    return [p for p in SECTIONS if p in parts]
+
+
+@router.get(
+    "/{meeting_id}/result",
+    response_model=MeetingResult,
+    response_model_exclude_none=False,
+    summary="Consolidated minutes-of-meeting result (schema: /api/v1/schema/meeting-result)",
+    responses={**_NOT_FOUND, **_RUN_NOT_FOUND},
+)
+async def get_result(
+    meeting_id: UUID,
+    results: ResultServiceDep,
+    run_id: RunIdQuery = None,
+    include: Annotated[
+        str | None,
+        Query(description="Comma-separated: transcript, analytics, summary. Default: all."),
+    ] = None,
+) -> MeetingResult:
+    """Metadata, audio quality, languages, speakers (with display names), transcript,
+    analytics, summary, verification report, warnings and processing info in one document."""
+    return await results.result(meeting_id, run_id, parse_include(include))
+
+
+@router.get(
+    "/{meeting_id}/export",
+    response_class=Response,
+    summary="Minutes of meeting as docx, pdf, md or json",
+    responses={
+        200: {"content": {t.split(";")[0]: {} for t in MEDIA_TYPES.values()}},
+        **_NOT_FOUND,
+        **_RUN_NOT_FOUND,
+    },
+)
+async def export_meeting(
+    meeting_id: UUID,
+    results: ResultServiceDep,
+    format: Annotated[ExportFormat, Query(description="docx, pdf, md or json.")] = "pdf",
+    run_id: RunIdQuery = None,
+) -> Response:
+    """Formal MoM document; cached per run and format until names or the summary change."""
+    data, used_run = await results.export(meeting_id, format, run_id)
+    stem = f"{meeting_id}-{used_run}" if used_run else str(meeting_id)
+    return Response(
+        data,
+        media_type=MEDIA_TYPES[format],
+        headers={"Content-Disposition": f'attachment; filename="minutes-{stem}.{format}"'},
+    )
+
+
+@router.get(
+    "/{meeting_id}/utterances",
+    response_model=UtterancePage,
+    summary="Query utterances by speaker, language, time range and text",
+    responses={**_NOT_FOUND, **_RUN_NOT_FOUND},
+)
+async def list_utterances(
+    meeting_id: UUID,
+    results: ResultServiceDep,
+    speaker: Annotated[str | None, Query(description='Label, e.g. "Person 2".')] = None,
+    language: Annotated[str | None, Query(description="Primary language: en, hi, or.")] = None,
+    start: Annotated[float | None, Query(ge=0, description="Seconds; overlapping from.")] = None,
+    end: Annotated[float | None, Query(ge=0, description="Seconds; overlapping until.")] = None,
+    q: Annotated[
+        str | None, Query(max_length=200, description="Case-insensitive substring.")
+    ] = None,
+    run_id: RunIdQuery = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> UtterancePage:
+    query = UtteranceQuery(
+        speaker=speaker,
+        language=language,
+        start_from=start,
+        end_to=end,
+        q=q,
+        limit=limit,
+        offset=offset,
+    )
+    page = await results.utterances(meeting_id, query, run_id)
+    if page is None:
+        raise TranscriptNotAvailableError(
+            "The meeting has not been processed yet.", details={"meeting_id": str(meeting_id)}
+        )
+    return page
+
+
+@router.get(
+    "/{meeting_id}/runs",
+    response_model=RunList,
+    summary="Processing history, newest first",
+    responses=_NOT_FOUND,
+)
+async def list_runs(meeting_id: UUID, results: ResultServiceDep) -> RunList:
+    return await results.runs(meeting_id)
+
+
+@router.get(
+    "/{meeting_id}/runs/{run_id}",
+    response_model=MeetingResult,
+    summary="The consolidated result of one specific run",
+    responses={**_NOT_FOUND, **_RUN_NOT_FOUND},
+)
+async def get_run(meeting_id: UUID, run_id: UUID, results: ResultServiceDep) -> MeetingResult:
+    return await results.result(meeting_id, run_id)
