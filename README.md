@@ -587,6 +587,104 @@ For each `<stem>.rttm` reference, the script reads the system output from `<stem
 | `UTTERANCE_MAX_SECONDS` | `30` | Split longer utterances at sentence punctuation |
 | `UTTERANCE_MIN_WORDS` | `2` | Utterances with fewer words are merge candidates |
 
+## Speaker analytics
+
+`AnalyticsStage` (after alignment) computes per-speaker conversation statistics and meeting-level analytics and stores them with the meeting. The code in `app/services/analytics/` is made of pure functions (`speaker_stats.py`, `meeting_stats.py`).
+
+```bash
+curl .../meetings/{id}/analytics               # JSON: meeting_stats, speakers, timeline, metric_definitions
+curl .../meetings/{id}/analytics?format=csv    # per-speaker table
+curl .../meetings/{id}/analytics/charts/speaking-time -o talk.png   # needs the viz extra
+curl .../meetings/{id}/analytics/charts/timeline -o timeline.png
+```
+
+### Sources of truth
+
+- **Time** comes from diarization turns: speaking time, turns, overlap, interruptions and first/last spoke. Turns are acoustic truth, so a pause inside someone's turn counts the same way for every speaker, whatever the ASR produced.
+- **Words, segments, questions and languages** come from the aligned utterances. The spoken-language shares from Prompt 6 are used when language ID ran; otherwise each utterance's `primary_language` is used.
+- Utterances labelled `Unknown` are excluded from per-speaker counts, so segment shares add up to 100.
+
+### How overlap is counted
+
+When two people talk at once, **the overlap counts in full for each of them**. Each person really was speaking, so a speaker's time is never cut short because someone else talked over them. As a result, per-speaker times can add up to more than the total speech time:
+
+```
+sum(speaking_time_seconds) = total_speech_seconds + overlap_double_counted_seconds
+```
+
+`meeting_stats.overlap_seconds` is the time two or more people talk at once. With two overlapping speakers it equals `overlap_double_counted_seconds`; with three at once the double-counted figure is larger. `speaking_time_percent_of_speech` therefore adds up to more than 100 when speech overlaps, while `segment_share_percent` always adds up to 100.
+
+### Metric definitions
+
+| Metric | Definition |
+| --- | --- |
+| `speaking_time_seconds` | Union of the speaker's diarization turns (overlap counted in full) |
+| `speaking_time_percent_of_speech` / `_of_meeting` | Speaking time ÷ total speech time / meeting duration |
+| `num_segments`, `segment_share_percent` | Utterances attributed to the speaker, and their share of all attributed utterances |
+| `num_turns` | Times the floor switched to the speaker (consecutive turns of one speaker merged) |
+| `avg_` / `median_utterance_seconds`, `longest_utterance` | Utterance durations; the longest has `start` / `end` |
+| `word_count`, `words_per_minute` | Attributed words; words ÷ speaking minutes (0 without speaking time) |
+| `first_spoke_at`, `last_spoke_at` | Start of the first turn, end of the last turn |
+| `interruptions_made` / `_received` | A turn that starts strictly inside another speaker's turn and overlaps it by more than `INTERRUPTION_MIN_OVERLAP_SECONDS`. Each turn interrupts at most one speaker, the one it overlaps most |
+| `overlap_seconds` (speaker) | Time the speaker talks while anyone else does |
+| `language_breakdown` | Seconds and percent per language |
+| `questions_asked` | Utterances ending in `?`, or containing a question word: Hindi क्या क्यों कैसे कब कहाँ/कहां कौन कौनसा कितना/कितने/कितनी; Odia କଣ/କ'ଣ କି କାହିଁକି କିପରି କେମିତି କେବେ କେଉଁଠି କିଏ କେତେ |
+| `total_speech_seconds`, `total_silence_seconds`, `silence_percent` | Union of all turns; the rest of the meeting |
+| `total_turn_switches` | Times the floor passed from one speaker to another |
+| `overlap_seconds` / `overlap_percent` (meeting) | Time with two or more speakers, and its share of speech time |
+| `gini_coefficient`, `participation_balance` | Gini of speaking time: ≤ `GINI_BALANCED_MAX` (0.2) `balanced`, ≥ `GINI_DOMINATED_MIN` (0.4) `dominated`, otherwise `moderately dominated`; `not applicable` below two speakers. For two speakers, 0.2 is about a 60/40 split and 0.4 about 70/30 |
+| `dominant_speaker`, `least_active_speaker` | Most and least speaking time |
+| `language_distribution`, `num_language_switches` | From the Prompt 6 `LanguageSummary`, or from utterances when LID did not run |
+| `longest_monologue` | Longest run of speech by one speaker without a floor switch |
+| `timeline` | Speaking seconds per speaker in `BUCKET_SECONDS` windows, for charting |
+
+All durations and percentages are rounded to 2 decimals. The same one-line definitions are returned in `metric_definitions`.
+
+### Sample
+
+```json
+{
+  "meeting_stats": {
+    "meeting_duration_seconds": 40.0, "total_speech_seconds": 21.0,
+    "total_silence_seconds": 19.0, "silence_percent": 47.5,
+    "num_speakers": 3, "total_utterances": 4, "total_words": 12, "total_turn_switches": 3,
+    "overlap_seconds": 2.0, "overlap_percent": 9.52, "overlap_double_counted_seconds": 2.0,
+    "gini_coefficient": 0.41, "participation_balance": "dominated",
+    "dominant_speaker": "Person 1", "least_active_speaker": "Person 3",
+    "language_distribution": [{"language": "en", "duration_seconds": 15.0, "percentage": 68.18}],
+    "num_language_switches": 2,
+    "longest_monologue": {"speaker": "Person 1", "start": 0.0, "end": 10.0, "duration": 10.0}
+  },
+  "speakers": [{
+    "speaker": "Person 1", "speaker_name": "Ravi",
+    "speaking_time_seconds": 15.0, "speaking_time_percent_of_speech": 71.43,
+    "speaking_time_percent_of_meeting": 37.5, "num_segments": 3, "segment_share_percent": 75.0,
+    "num_turns": 2, "word_count": 8, "words_per_minute": 32.0,
+    "interruptions_made": 0, "interruptions_received": 1, "overlap_seconds": 2.0,
+    "questions_asked": 1, "...": "..."
+  }],
+  "timeline": [{"start": 0.0, "end": 60.0, "speakers": {"Person 1": 10.0, "Person 2": 2.0}}]
+}
+```
+
+### Display names and charts
+
+JSON keeps the stable `Person N` labels as keys and adds `speaker_name` from `PATCH /speakers`, as the transcript does. The CSV `display_name` column and the chart labels use the display name.
+
+Charts need the optional extra: `uv sync --extra viz` (matplotlib). Without it, the chart endpoint returns `503 charts_unavailable` and everything else works as before. The images below come from a synthetic fixture (`uv run python scripts/make_analytics_charts.py`):
+
+![Speaking time per speaker](docs/images/speaking-time.png)
+![Who spoke when](docs/images/timeline.png)
+
+### Analytics configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `INTERRUPTION_MIN_OVERLAP_SECONDS` | `0.5` | Minimum overlap for a turn to count as an interruption |
+| `BUCKET_SECONDS` | `60` | Timeline window |
+| `GINI_BALANCED_MAX` | `0.2` | At or below this: `balanced` |
+| `GINI_DOMINATED_MIN` | `0.4` | At or above this: `dominated` |
+
 ## Running with Docker
 
 ```bash
@@ -615,8 +713,8 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | 4 | Speaker diarization ✅ | pyannote 3.1 stage, consistent Person N labels, overlaps, chunk re-linking |
 | 5 | Multilingual ASR ✅ | Routed ASR: faster-whisper (en/hi) + AI4Bharat IndicConformer (or), NFC native script, hallucination guards, SRT, WER/CER eval |
 | 6 | Language ID + code-switching ✅ | Turn-based spoken LID (MMS), smoothing, per-region ASR routing, code-mix tagging, `/languages` |
-| 7 | **Speaker + transcript alignment** ✅ | Word-level speaker attribution, utterances, txt/srt/vtt/md, speaker renaming, DER/WDER eval |
-| 8 | Speaker statistics | Talk time, turns, interruptions, WPM per speaker |
+| 7 | Speaker + transcript alignment ✅ | Word-level speaker attribution, utterances, txt/srt/vtt/md, speaker renaming, DER/WDER eval |
+| 8 | **Speaker statistics** ✅ | Talk time, turns, interruptions, WPM, languages, questions per speaker; balance, timeline, CSV, charts |
 | 9 | LLM summarization | Provider-agnostic summary, decisions and action items with structured output |
 | 10 | Results API & exports | Transcript/summary endpoints, Markdown/PDF/JSON export |
 | 11 | Background workers & persistence | Job queue, durable DB, retries |
