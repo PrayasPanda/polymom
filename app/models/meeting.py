@@ -31,6 +31,8 @@ class Meeting(Base):
     language_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     speaker_transcript: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     analytics: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    summary_error: Mapped[str | None] = mapped_column(Text)
     speaker_names: Mapped[dict[str, str] | None] = mapped_column(JSON)
     languages_hint: Mapped[list[str]] = mapped_column(JSON, default=list)
     expected_speakers: Mapped[int | None] = mapped_column(Integer)
@@ -38,7 +40,7 @@ class Meeting(Base):
         Enum(
             MeetingStatus,
             native_enum=False,
-            length=16,
+            length=32,
             values_callable=lambda e: [m.value for m in e],
         ),
         default=MeetingStatus.QUEUED,
