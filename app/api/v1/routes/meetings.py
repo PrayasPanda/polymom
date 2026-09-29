@@ -1,4 +1,4 @@
-"""Meeting endpoints: upload, fetch, list, delete, process, speakers, transcript, analytics."""
+"""Meeting endpoints: upload, process, speakers, transcript, analytics, summary."""
 
 from typing import Annotated, Literal
 from uuid import UUID
@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Response, Upl
 from fastapi.responses import PlainTextResponse
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import MeetingServiceDep, PipelineDep
+from app.api.deps import MeetingServiceDep, PipelineDep, SummaryRegeneratorDep
 from app.core.exceptions import ValidationError
 from app.models.meeting import Meeting
 from app.schemas.analytics import ConversationAnalyticsResponse
@@ -24,6 +24,11 @@ from app.schemas.meeting import (
     MeetingRead,
     ProcessResponse,
 )
+from app.schemas.summary import (
+    MeetingSummaryResponse,
+    RegenerateSummaryRequest,
+    RegenerateSummaryResponse,
+)
 from app.schemas.transcript import (
     SpeakerNamesResponse,
     SpeakerRenameRequest,
@@ -31,6 +36,7 @@ from app.schemas.transcript import (
 )
 from app.services.analytics.charts import ChartName, render_chart
 from app.services.analytics.export import speakers_to_csv
+from app.services.summarization.render import summary_to_markdown
 from app.utils.subtitles import (
     to_srt,
     to_text,
@@ -425,3 +431,71 @@ async def get_analytics_chart(
     turns = (await service.get_diarization(meeting_id)).turns if chart_name == "timeline" else []
     png = await run_in_threadpool(render_chart, chart_name, analytics, names, turns)
     return Response(png, media_type="image/png")
+
+
+_SUMMARY_NOT_AVAILABLE = error_example(
+    409,
+    "summary_not_available",
+    "The summary is not available yet.",
+    "Not processed yet, or summarization failed (see details.summary_error)",
+)
+
+
+@router.get(
+    "/{meeting_id}/summary",
+    response_model=MeetingSummaryResponse,
+    summary="Minutes of meeting: summary, decisions, action items (json, md)",
+    responses={
+        200: {"content": {"text/markdown": {"example": "# Budget review\n\n## Decisions\n..."}}},
+        **_NOT_FOUND,
+        **_SUMMARY_NOT_AVAILABLE,
+    },
+)
+async def get_summary(
+    meeting_id: UUID,
+    service: MeetingServiceDep,
+    format: Annotated[Literal["json", "md"], Query(description="Response format.")] = "json",
+) -> MeetingSummaryResponse | Response:
+    """Every item cites transcript evidence that passed verification.
+
+    JSON uses speaker labels plus ``speaker_names``; Markdown shows display names.
+    """
+    summary, names = await service.get_summary(meeting_id)
+    if format == "md":
+        return Response(
+            summary_to_markdown(summary, names), media_type="text/markdown; charset=utf-8"
+        )
+    return MeetingSummaryResponse(
+        meeting_id=meeting_id, speaker_names=names, **summary.model_dump()
+    )
+
+
+@router.post(
+    "/{meeting_id}/summary/regenerate",
+    response_model=RegenerateSummaryResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Regenerate the summary (optionally another language or model)",
+    responses={
+        **_NOT_FOUND,
+        **error_example(
+            409,
+            "transcript_not_available",
+            "The speaker-attributed transcript is not available yet.",
+            "Not processed yet, or still processing",
+        ),
+    },
+)
+async def regenerate_summary(
+    meeting_id: UUID,
+    service: MeetingServiceDep,
+    regenerator: SummaryRegeneratorDep,
+    background_tasks: BackgroundTasks,
+    body: RegenerateSummaryRequest | None = None,
+) -> RegenerateSummaryResponse:
+    """Re-runs only summarization in the background. Poll ``GET /summary``."""
+    await service.check_summary_regeneration(meeting_id)
+    body = body or RegenerateSummaryRequest()
+    background_tasks.add_task(
+        regenerator.run, meeting_id, output_language=body.output_language, model=body.model
+    )
+    return RegenerateSummaryResponse(meeting_id=meeting_id)
