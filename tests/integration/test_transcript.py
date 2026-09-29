@@ -30,7 +30,7 @@ async def test_transcript_json_is_nfc_native_script(client: AsyncClient) -> None
     # 12 s, no hint: mock LID says en for 0-6 s and hi for 6-12 s; each region is routed.
     meeting_id = await _process(client, seconds=12)
 
-    response = await client.get(f"{URL}/{meeting_id}/transcript")
+    response = await client.get(f"{URL}/{meeting_id}/transcript", params={"view": "raw"})
 
     assert response.status_code == 200
     body = response.json()
@@ -51,7 +51,7 @@ async def test_transcript_json_is_nfc_native_script(client: AsyncClient) -> None
 async def test_single_language_hint_forces_language(client: AsyncClient) -> None:
     meeting_id = await _process(client, languages="or")
 
-    body = (await client.get(f"{URL}/{meeting_id}/transcript")).json()
+    body = (await client.get(f"{URL}/{meeting_id}/transcript", params={"view": "raw"})).json()
 
     assert {s["language"] for s in body["segments"]} == {"or"}
     assert body["requested_language"] == "or"
@@ -60,8 +60,12 @@ async def test_single_language_hint_forces_language(client: AsyncClient) -> None
 async def test_transcript_txt_and_srt(client: AsyncClient) -> None:
     meeting_id = await _process(client, seconds=6, languages="hi")
 
-    txt = await client.get(f"{URL}/{meeting_id}/transcript", params={"format": "txt"})
-    srt = await client.get(f"{URL}/{meeting_id}/transcript", params={"format": "srt"})
+    txt = await client.get(
+        f"{URL}/{meeting_id}/transcript", params={"format": "txt", "view": "raw"}
+    )
+    srt = await client.get(
+        f"{URL}/{meeting_id}/transcript", params={"format": "srt", "view": "raw"}
+    )
 
     assert txt.headers["content-type"].startswith("text/plain")
     assert txt.text.splitlines()[0] == "[00:00:00.000] (hi) नमस्ते सभी को, चलिए शुरू करते हैं।"
@@ -74,7 +78,9 @@ async def test_transcript_txt_and_srt(client: AsyncClient) -> None:
 async def test_transcript_rejects_unknown_format(client: AsyncClient) -> None:
     meeting_id = await _process(client, seconds=3)
 
-    response = await client.get(f"{URL}/{meeting_id}/transcript", params={"format": "docx"})
+    response = await client.get(
+        f"{URL}/{meeting_id}/transcript", params={"format": "docx", "view": "raw"}
+    )
 
     assert response.status_code == 422
 
@@ -83,11 +89,13 @@ async def test_transcript_before_processing_is_409_and_unknown_is_404(client: As
     upload = await client.post(URL, files={"file": ("m.wav", make_wav(seconds=3))})
     meeting_id = upload.json()["meeting_id"]
 
-    early = await client.get(f"{URL}/{meeting_id}/transcript")
+    early = await client.get(f"{URL}/{meeting_id}/transcript", params={"view": "raw"})
 
     assert early.status_code == 409
     assert early.json()["error"]["code"] == "transcript_not_available"
-    assert (await client.get(f"{URL}/{uuid4()}/transcript")).status_code == 404
+    assert (
+        await client.get(f"{URL}/{uuid4()}/transcript", params={"view": "raw"})
+    ).status_code == 404
 
 
 async def test_asr_failure_keeps_earlier_stage_outputs(
@@ -112,7 +120,9 @@ async def test_asr_failure_keeps_earlier_stage_outputs(
         assert body["audio_quality"] is not None
         speakers = await client.get(f"{URL}/{meeting_id}/speakers")
         assert speakers.status_code == 200  # diarization survived the ASR failure
-        assert (await client.get(f"{URL}/{meeting_id}/transcript")).status_code == 409
+        assert (
+            await client.get(f"{URL}/{meeting_id}/transcript", params={"view": "raw"})
+        ).status_code == 409
 
 
 def test_eval_script_end_to_end_with_mock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

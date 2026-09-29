@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     lid_min_window_seconds: float = Field(default=1.5, ge=0)
     lid_max_window_seconds: float = Field(default=15.0, gt=0)
 
+    # Speaker / transcript alignment
+    align_max_gap_seconds: float = Field(default=1.0, ge=0)
+    align_merge_gap_seconds: float = Field(default=1.0, ge=0)
+    utterance_max_seconds: float = Field(default=30.0, gt=0)
+    utterance_min_words: int = Field(default=2, ge=1)
+
     @field_validator("allowed_extensions", mode="before")
     @classmethod
     def _split_extensions(cls, value: object) -> object:

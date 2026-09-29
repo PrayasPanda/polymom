@@ -22,7 +22,19 @@ from app.schemas.meeting import (
     MeetingRead,
     ProcessResponse,
 )
-from app.utils.subtitles import to_srt, to_text
+from app.schemas.transcript import (
+    SpeakerNamesResponse,
+    SpeakerRenameRequest,
+    SpeakerTranscriptResponse,
+)
+from app.utils.subtitles import (
+    to_srt,
+    to_text,
+    utterances_to_markdown,
+    utterances_to_srt,
+    utterances_to_text,
+    utterances_to_vtt,
+)
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
@@ -207,15 +219,21 @@ async def get_speakers(meeting_id: UUID, service: MeetingServiceDep) -> Speakers
 
 @router.get(
     "/{meeting_id}/transcript",
-    response_model=TranscriptResponse,
-    summary="Timestamped transcript (json, txt or srt)",
+    response_model=SpeakerTranscriptResponse | TranscriptResponse,
+    summary="Speaker-attributed transcript (json, txt, srt, vtt, md); raw ASR with ?view=raw",
     responses={
         200: {
             "content": {
-                "text/plain": {"example": "[00:00:00.520] (hi) आज की मीटिंग का एजेंडा बजट है।\n"},
-                "application/x-subrip": {
-                    "example": "1\n00:00:00,520 --> 00:00:03,900\nआज की मीटिंग का एजेंडा बजट है।\n"
+                "text/plain": {
+                    "example": "[00:00:00 - 00:00:07] Person 1: आज की मीटिंग का एजेंडा बजट है।\n"
                 },
+                "application/x-subrip": {
+                    "example": "1\n00:00:00,520 --> 00:00:07,100\nPerson 1: आज की मीटिंग ...\n"
+                },
+                "text/vtt": {
+                    "example": "WEBVTT\n\n00:00:00.520 --> 00:00:07.100\n<v Ravi>आज की मीटिंग ...\n"
+                },
+                "text/markdown": {"example": "# Transcript\n\n**Ravi** · 00:00:00\n\n..."},
             }
         },
         **_NOT_FOUND,
@@ -231,10 +249,24 @@ async def get_transcript(
     meeting_id: UUID,
     service: MeetingServiceDep,
     format: Annotated[
-        Literal["json", "txt", "srt"], Query(description="Response format.")
+        Literal["json", "txt", "srt", "vtt", "md"], Query(description="Response format.")
     ] = "json",
-) -> TranscriptResponse | Response:
-    """Raw ASR segments in native script (NFC). Not yet attributed to speakers."""
+    view: Annotated[
+        Literal["speaker", "raw"],
+        Query(description="speaker: utterances per speaker (default); raw: ASR segments."),
+    ] = "speaker",
+) -> SpeakerTranscriptResponse | TranscriptResponse | Response:
+    """Chronological, speaker-attributed transcript in native script (NFC).
+
+    Display names from ``PATCH /speakers`` are applied in every format.
+    """
+    if view == "speaker":
+        return await _speaker_transcript(meeting_id, service, format)
+    if format in ("vtt", "md"):
+        raise ValidationError(
+            f"format={format} is only available for view=speaker.",
+            details={"view": view, "format": format},
+        )
     result = await service.get_transcript(meeting_id)
     if format == "txt":
         return PlainTextResponse(to_text(result.segments), media_type="text/plain; charset=utf-8")
@@ -265,3 +297,52 @@ async def get_languages(meeting_id: UUID, service: MeetingServiceDep) -> Languag
     """Per-language and per-speaker time, switch points and code-mixed segment count."""
     summary = await service.get_language_summary(meeting_id)
     return LanguageSummaryResponse(meeting_id=meeting_id, **summary.model_dump())
+
+
+_MEDIA_TYPES = {
+    "txt": "text/plain; charset=utf-8",
+    "srt": "application/x-subrip; charset=utf-8",
+    "vtt": "text/vtt; charset=utf-8",
+    "md": "text/markdown; charset=utf-8",
+}
+
+
+async def _speaker_transcript(
+    meeting_id: UUID, service: MeetingServiceDep, format: str
+) -> SpeakerTranscriptResponse | Response:
+    transcript, names = await service.get_speaker_transcript(meeting_id)
+    if format == "json":
+        return SpeakerTranscriptResponse(
+            meeting_id=meeting_id, speaker_names=names, **transcript.model_dump()
+        )
+    renderers = {
+        "txt": utterances_to_text,
+        "srt": utterances_to_srt,
+        "vtt": utterances_to_vtt,
+        "md": utterances_to_markdown,
+    }
+    headers = (
+        {"Content-Disposition": f'attachment; filename="{meeting_id}.{format}"'}
+        if format in ("srt", "vtt")
+        else None
+    )
+    return Response(
+        renderers[format](transcript.utterances), media_type=_MEDIA_TYPES[format], headers=headers
+    )
+
+
+@router.patch(
+    "/{meeting_id}/speakers",
+    response_model=SpeakerNamesResponse,
+    summary="Set display names for speakers",
+    responses={
+        **_NOT_FOUND,
+        **error_example(422, "validation_error", "Unknown speaker label(s).", "Unknown label"),
+    },
+)
+async def rename_speakers(
+    meeting_id: UUID, body: SpeakerRenameRequest, service: MeetingServiceDep
+) -> SpeakerNamesResponse:
+    """Map "Person N" labels to names. Labels themselves never change; ``null`` clears a name."""
+    names = await service.rename_speakers(meeting_id, body.names)
+    return SpeakerNamesResponse(meeting_id=meeting_id, speaker_names=names)

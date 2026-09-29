@@ -21,7 +21,7 @@ async def test_code_switching_meeting_is_routed_per_language(client: AsyncClient
     # Mock diarization: speakers alternate every 2 s. Mock LID: en 0-6 s, hi 6-12 s, or 12-18 s.
     meeting_id = await _process(client, 18)
 
-    transcript = (await client.get(f"{URL}/{meeting_id}/transcript")).json()
+    transcript = (await client.get(f"{URL}/{meeting_id}/transcript", params={"view": "raw"})).json()
     segments = transcript["segments"]
     assert [(s["start"], s["language"], s["backend"]) for s in segments] == [
         (0, "en", "mock-whisper"),
