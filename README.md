@@ -9,7 +9,7 @@ Voice-based **Minutes of Meeting** pipeline. Upload a meeting recording and get 
 
 Everything is exposed through a FastAPI service.
 
-> Status: **upload**, **audio preprocessing**, **speaker diarization** and **multilingual ASR** (English, Hindi, Odia) work. Aligning words to speakers and summarization come next. See the [roadmap](#roadmap).
+> Status: **upload**, **audio preprocessing**, **speaker diarization**, **spoken language ID with code-switching** and **multilingual ASR** (English, Hindi, Odia) work. Aligning words to speakers and summarization come next. See the [roadmap](#roadmap).
 
 ## Architecture
 
@@ -113,6 +113,7 @@ Interactive docs with schemas and example responses: <http://localhost:8000/docs
 | `GET` | `/api/v1/meetings` | Paginated list, newest first (`limit` 1-100, default 20; `offset`) |
 | `GET` | `/api/v1/meetings/{meeting_id}` | Metadata and status |
 | `DELETE` | `/api/v1/meetings/{meeting_id}` | Delete the record, the upload and the processed audio (`204`) |
+| `GET` | `/api/v1/meetings/{meeting_id}/languages` | Language shares, per-speaker breakdown, switch points; `409` until identified |
 | `GET` | `/api/v1/meetings/{meeting_id}/transcript` | Timestamped transcript; `?format=json` (default), `txt` or `srt`; `409` until transcribed |
 | `GET` | `/api/v1/meetings/{meeting_id}/speakers` | Speaker turns (`Person 1..N`), speaker count and overlap regions; `409` until diarized |
 | `POST` | `/api/v1/meetings/{meeting_id}/process` | Run the pipeline in the background (`202`); `409` if already processing/completed unless `?force=true` |
@@ -161,6 +162,7 @@ Every error uses the same envelope:
 | 415 | `unsupported_file_type` | Extension not allowed, or content does not match it |
 | 422 | `empty_file` / `corrupted_media` | Zero bytes; unreadable file; no audio stream |
 | 422 | `validation_error` | Invalid form/query fields |
+| 409 | `language_summary_not_available` | `/languages` before language ID ran (or with routing disabled) |
 | 409 | `transcript_not_available` | `/transcript` before the meeting has been transcribed |
 | 409 | `diarization_not_available` | `/speakers` before the meeting has been diarized |
 | 409 | `meeting_state_conflict` | `/process` on a meeting that is processing or completed, without `force` |
@@ -185,10 +187,12 @@ flowchart TD
     BG --> ORCH[MoMPipeline.run]
     ORCH --> S1[PreprocessStage]
     S1 --> S2[DiarizationStage]
-    S2 --> S3[TranscriptionStage]
+    S2 --> SL[LanguageIdentificationStage]
+    SL --> S3[TranscriptionStage]
     S3 -.-> SN["alignment, analytics, summary"]
     S1 -->|"apply(): processed_path, audio_quality"| DB[(meetings)]
     S2 -->|"apply(): diarization"| DB
+    SL -->|"apply(): language_summary"| DB
     S3 -->|"apply(): transcript"| DB
     ORCH -->|"all stages ok"| DONE[status = completed]
     ORCH -->|"PolymomError"| FAIL["status = failed<br/>error = 'code: message'"]
@@ -400,6 +404,98 @@ Before scoring, both texts are NFC-normalized, case-folded and stripped of punct
 | `ASR_LOW_CONFIDENCE_THRESHOLD` | `0.5` | Flag segments below this average confidence |
 | `ASR_COMPRESSION_RATIO_THRESHOLD` / `ASR_NO_SPEECH_THRESHOLD` | `2.4` / `0.6` | Hallucination guards |
 
+## Language identification and code-switching
+
+Meetings often switch between English, Hindi and Odia, both between speakers and within one speaker's talk. `LanguageIdentificationStage` (between diarization and transcription) decides which language each stretch of audio is in, so that `TranscriptionStage` sends each stretch to the right ASR backend.
+
+Language is handled at **two levels**:
+
+| Level | Question | How | Used for |
+| --- | --- | --- | --- |
+| **Audio** | Which language is being spoken in this part of the meeting? | A spoken-LID model runs per diarization turn | Choosing the ASR backend and the forced language |
+| **Text** | Which language is each transcribed word? | Unicode script plus a small romanized-word lexicon | Labelling code-mixed text (Hinglish, Odia with English terms) |
+
+```mermaid
+flowchart LR
+    T[diarization turns] --> W["LID windows<br/>1 per turn, long turns split<br/>(LID_MAX_WINDOW_SECONDS)"]
+    W --> L["spoken LID per window<br/>restricted to hint / supported,<br/>renormalized; low conf = uncertain"]
+    L --> S1["smoothing<br/>1. short low-conf window -> speaker's language<br/>2. uncertain -> nearest same-speaker window,<br/>   else meeting's dominant<br/>3. merge same speaker + language"]
+    S1 --> R["regions<br/>(non-overlapping)"]
+    R --> B["batch consecutive<br/>same-language regions"]
+    B -->|"en / hi"| WH["Whisper, forced language"]
+    B -->|"or"| IC[IndicConformer]
+    IC -. "fails" .-> WF["Whisper, auto-detect<br/>fallback_used = true"]
+    WH --> ST["shift to meeting time,<br/>stitch chronologically"]
+    IC --> ST
+    WF --> ST
+    ST --> TG["text-level tagging<br/>word script / language,<br/>code-mix stats"]
+    R --> SUM["LanguageSummary<br/>shares, speakers, switch points"]
+```
+
+**Why diarization turns?** People usually switch language at turn boundaries, and a turn is long enough for reliable LID while being short enough to be monolingual. Turns longer than `LID_MAX_WINDOW_SECONDS` (15 s) are split into sub-windows. Without diarization, fixed windows of that length are used.
+
+**Hints are priors.** If the upload has `languages=en,or`, LID only chooses between English and Odia. A single hinted language skips the LID model entirely.
+
+**Scores are restricted and renormalized.** The model's probabilities are cut down to the candidate languages (`SUPPORTED_LANGUAGES`, or the hint) and renormalized. A multilingual model spreads probability over close relatives (Bengali and Assamese for Odia, Urdu for Hindi), and renormalizing turns the question into "which of *our* languages is it". A window whose top renormalized score is below `LID_MIN_CONFIDENCE` is marked `uncertain`, and smoothing resolves it.
+
+**Routing:**
+- Consecutive regions in the same language are batched into one model call. Batches only break at turn boundaries, and are capped at `CHUNK_LENGTH_SECONDS`.
+- Each batch is cut into a temporary WAV, which is deleted afterwards, and transcribed with the language forced: `hi` and `en` go to Whisper, `or` to IndicConformer.
+- Timestamps are shifted back to meeting time and the batches are stitched in order.
+- If the Odia backend fails, the batch is retried with Whisper without a forced language, and its segments get `fallback_used: true`.
+- Set `LANGUAGE_ROUTING_ENABLED=false` to go back to single-pass transcription (hint or auto-detect).
+
+**Text-level tagging** is applied to every transcript segment:
+- Each word gets a `script` (`Latn`, `Deva`, `Orya`) and a `language`: `hi`, `or` or `en`, or `hi-Latn`/`or-Latn` for romanized Hindi or Odia found in a small lexicon of frequent function words (*kal, baje, hai, nahi / kemiti, achi, heba ...*). Words that are also common English words (*main, the, pain*) are left out of the lexicon on purpose, so the tagger favours precision over recall.
+- Segments get `primary_language`, `languages_present`, `is_code_mixed` and `code_mix_ratio`. Romanized Hindi counts as Hindi, so "मीटिंग kal 5 baje hai" is Hindi and not code-mixed, while "ଆଜି budget meeting ରେ ଆଲୋଚନା ହେବ" is Odia with English terms (ratio 0.33).
+
+`GET /meetings/{id}/languages` returns:
+- each language's total time and percentage
+- a per-speaker breakdown with each speaker's dominant language
+- every switch point (time, from, to, incoming speaker)
+- the number of code-mixed segments
+- the regions themselves
+
+### LID model choice
+
+The spec suggested `speechbrain/lang-id-voxlingua107-ecapa`, but its `label_encoder.txt` confirms that **VoxLingua107 has no Odia**: 107 languages, including `hi`, `bn`, `as` and `ur`, but not `or`. The maintained audio LID models that cover Odia are Meta's **MMS-LID** family; `facebook/mms-lid-126` is the smallest one with `ory`, `hin` and `eng`.
+
+| `LID_BACKEND` | Model | Languages here | License |
+| --- | --- | --- | --- |
+| `mms` (default) | `facebook/mms-lid-126` (wav2vec2, 1B params) | en, hi, **or** | **CC-BY-NC-4.0, non-commercial** |
+| `speechbrain` | `speechbrain/lang-id-voxlingua107-ecapa` | en, hi | Apache-2.0 |
+| `whisper` | faster-whisper language detection (reuses the ASR model) | en, hi | MIT |
+| `mock` | Deterministic en → hi → or every 6 s | en, hi, or | – |
+
+> ⚠️ **Commercial use:** MMS-LID's CC-BY-NC-4.0 license forbids it. Use `speechbrain` or `whisper` (English and Hindi only), and have Odia speakers pass `languages=or`, or single-language hints, so Odia is routed without LID.
+
+### Evaluating LID and routing
+
+```bash
+uv run python scripts/eval_asr.py data/ --routed          # WER/CER + LID confusion matrix
+```
+
+`--routed` runs LID without a hint and routes each region to its backend, then prints an **LID confusion matrix in seconds** alongside WER and CER. The reference languages come from `<stem>.lang.json` (`[{"start": 0, "end": 12.5, "language": "hi"}, ...]`) when present; otherwise the folder language covers the whole file. The eval script has no diarization, so it uses fixed `LID_MAX_WINDOW_SECONDS` windows, which are coarser than the turn-based windows in the real pipeline.
+
+### Known limitations
+
+- **Switching inside a sentence:** a mid-sentence switch ("budget ko approve karna hai") stays in one audio region. The whole turn goes to one backend, and only the text-level tags reveal the mix.
+- **Romanized text:** the lexicon covers only frequent, unambiguous words. Romanized Hindi or Odia outside it is tagged English, and there is no transliteration model.
+- **Short utterances:** LID on a turn under about 1.5 s is unreliable. Smoothing hands such turns the speaker's usual language, which can mislabel a genuine one-word switch.
+- **Hindi and Odia accents:** the two are related Indo-Aryan languages, and short or accented Odia can be classified as Hindi (or as Bengali, which renormalization discards). Pass `languages=or` when a meeting is known to be Odia.
+- **License and size:** MMS-LID is non-commercial and has 1B parameters, so it is slow on CPU. SpeechBrain and Whisper LID cannot detect Odia.
+
+### Language ID configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SUPPORTED_LANGUAGES` | `en,hi,or` | Languages LID may choose (the upload hint narrows this further) |
+| `LANGUAGE_ROUTING_ENABLED` | `true` | Per-region routing; `false` restores single-pass ASR |
+| `LID_BACKEND` / `LID_MODEL_ID` | `mms` / `facebook/mms-lid-126` | LID model (see the table above) |
+| `LID_MIN_CONFIDENCE` | `0.5` | Below this, a window is `uncertain` |
+| `LID_MIN_WINDOW_SECONDS` | `1.5` | Shorter low-confidence windows inherit the speaker's language |
+| `LID_MAX_WINDOW_SECONDS` | `15` | Longer turns are split for LID |
+
 ## Running with Docker
 
 ```bash
@@ -426,9 +522,9 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | 2 | Upload API ✅ | Multipart upload, size/extension validation, storage, meeting records |
 | 3 | Audio preprocessing ✅ | ffmpeg extract, resample, loudness-normalize, silence/quality analysis, chunking, stage-based pipeline |
 | 4 | Speaker diarization ✅ | pyannote 3.1 stage, consistent Person N labels, overlaps, chunk re-linking |
-| 5 | **Multilingual ASR** ✅ | Routed ASR: faster-whisper (en/hi) + AI4Bharat IndicConformer (or), NFC native script, hallucination guards, SRT, WER/CER eval |
-| 6 | Alignment | Word-to-speaker attribution, speaker turns |
-| 7 | Speaker analytics | Talk time, turns, interruptions, WPM |
+| 5 | Multilingual ASR ✅ | Routed ASR: faster-whisper (en/hi) + AI4Bharat IndicConformer (or), NFC native script, hallucination guards, SRT, WER/CER eval |
+| 6 | **Language ID + code-switching** ✅ | Turn-based spoken LID (MMS), smoothing, per-region ASR routing, code-mix tagging, `/languages` |
+| 7 | Speaker + transcript alignment | Word-to-speaker attribution, speaker turns, speaker analytics |
 | 8 | LLM summarization | Provider-agnostic summary, decisions and action items with structured output |
 | 9 | Pipeline orchestration | End-to-end `MoMPipeline`, progress tracking, error handling |
 | 10 | Background workers & persistence | Job queue, durable DB, retries |

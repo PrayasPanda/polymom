@@ -1,140 +1,149 @@
 ## Summary
 
-Prompt 5 of 12 adds multilingual speech-to-text for **English, Hindi and Odia** as a third pipeline stage (preprocess → diarize → **transcribe**). It produces a standalone timestamped transcript: segments with word timings, confidence, language and backend, in each language's native script, NFC-normalized. The transcript is served by `GET /api/v1/meetings/{id}/transcript` as JSON, plain text or SRT. Aligning words to speakers is out of scope and comes later.
+Prompt 6 of 12 adds spoken language identification and code-switching, so each part of a meeting is transcribed by the right backend, even when speakers switch between English, Hindi and Odia.
 
-ASR is **routed per language** to interchangeable backends:
-- faster-whisper for English and Hindi
-- AI4Bharat IndicConformer for Odia
-- a deterministic mock for tests
+There's a new `LanguageIdentificationStage` between diarization and transcription:
+- it identifies the language of each diarization turn and smooths the results into language regions
+- `TranscriptionStage` then routes each region to its backend (Whisper with the language forced for en/hi, IndicConformer for Odia) and stitches the results in chronological order
+- a text-level tagger labels each word's script and language (including romanized Hindi and Odia) and marks code-mixed segments
+- `GET /api/v1/meetings/{id}/languages` returns language shares, a per-speaker breakdown and switch points
 
-## Model choices and rationale
+## Approach and rationale
 
-I checked model availability and licenses on the Hugging Face API before wiring anything in.
+- **Two levels of language:**
+  - *Audio-level* LID decides which ASR backend runs.
+  - *Text-level* tagging labels what was actually said: Hinglish, or Odia with English terms. Each fixes what the other can't see.
+- **Diarization turns as LID windows:** people usually switch language at turn boundaries, and a turn is long enough for reliable LID while being short enough to be monolingual. Turns over `LID_MAX_WINDOW_SECONDS` (15 s) are split. Without diarization, fixed windows are used.
+- **Restrict and renormalize:** LID probabilities are reduced to `SUPPORTED_LANGUAGES`, or to the upload hint if one was given, and renormalized. A 100+ language model splits Odia speech across Odia, Bengali and Assamese; renormalizing asks "which of *our* languages is it".
+  - Below `LID_MIN_CONFIDENCE` a window is `uncertain`.
+  - A single hinted language skips the model entirely.
+- **Smoothing** (pure functions):
+  1. A short (< `LID_MIN_WINDOW_SECONDS`), low-confidence window that disagrees with its speaker's dominant language takes that language. The profile is built from the speaker's *other* confident windows.
+  2. Uncertain windows take the nearest confident window of the same speaker, then the meeting's dominant language.
+  3. Contiguous windows with the same speaker and language are merged.
+  4. Overlapping speech is clipped, so no audio is transcribed twice.
+- **Routing:**
+  - Consecutive same-language regions are batched into one model call. Batches break only at turn boundaries and are capped at `CHUNK_LENGTH_SECONDS`.
+  - Each batch is cut into a temporary WAV (deleted afterwards), transcribed with its language forced, and shifted back to meeting time.
+  - If the Odia backend fails, the batch is retried with Whisper without a forced language and flagged `fallback_used`.
+  - `LANGUAGE_ROUTING_ENABLED=false` restores the Prompt 5 single-pass behaviour exactly.
 
-| Language | Model | License / access | Why |
-| --- | --- | --- | --- |
-| en, hi | `Systran/faster-whisper-large-v3` (size configurable) | MIT, not gated | Strongest open model for English and Hindi, with built-in language ID, native word timestamps and Silero VAD. The CTranslate2 build is up to 4× faster and uses less memory (int8 on CPU, float16 on GPU). |
-| or | `ai4bharat/indic-conformer-600m-multilingual` (configurable via `ODIA_MODEL_ID`) | MIT, gated (terms auto-approved) | Whisper doesn't support Odia. This is AI4Bharat's current maintained multilingual IndicConformer (updated Feb 2026, about 580k downloads) and covers Odia. It ships as **ONNX with a transformers remote-code loader, so NeMo isn't needed**, and the new `indic` extra is just `transformers` + `onnxruntime`. |
+### LID model: MMS-LID, not VoxLingua107 (verified on Hugging Face)
 
-**Alternatives considered:**
-- `ai4bharat/indicwav2vec-odia` (wav2vec2 CTC, Apache-2.0): it would give native CTC word offsets, but it's from 2023, has around 40 downloads, and predates IndicConformer's accuracy gains. Since the model id is configurable, a CTC word-offset backend could be added later if word-level Odia timing becomes critical.
-- `ai4bharat/IndicConformer-or` (a per-language checkpoint): not available on the Hub (the API returned an auth error).
-
-**Odia timestamps:** IndicConformer returns text only. Segments are cut at energy-based speech regions (accurate to one 30 ms frame, split at 20 s), and each is transcribed separately. **Word timings are approximated** in proportion to word length within each segment, and there are no confidence scores. This trade-off is documented in the README.
-
-**Not verified:** I couldn't read the gated IndicConformer model card without a token. The call signature `model(wav, "or", "ctc"|"rnnt") -> str` is based on AI4Bharat's documented usage and on the remote-code files visible in the repo (`model_onnx.py`, the CTC and RNNT decoders). The slow test confirms it once `HF_TOKEN` is available.
+- **VoxLingua107 has no Odia.** `speechbrain/lang-id-voxlingua107-ecapa/label_encoder.txt` lists 107 languages, including `hi`, `bn`, `as` and `ur`, but not `or`.
+- **MMS-LID is the replacement.** The maintained audio LID models that include Odia are Meta's MMS-LID family. `facebook/mms-lid-126` is the smallest checkpoint whose `id2label` has `ory`, `hin` and `eng`. It loads through transformers `Wav2Vec2ForSequenceClassification`, so it adds no new dependency beyond the `indic` extra. It's the default: `LID_BACKEND=mms`.
+- ⚠️ **MMS-LID is CC-BY-NC-4.0 (non-commercial).** For commercial deployments, use `LID_BACKEND=speechbrain` (Apache-2.0) or `whisper` (MIT). Both are implemented but can only choose between English and Hindi; Odia meetings would then rely on `languages=or` hints.
+- **Other options I checked:** the Hugging Face "indic language identification" audio models are unmaintained community uploads (fewer than 20 downloads each).
 
 ## Changes
 
-- **Dependencies:**
-  - the `ml` extra gains `faster-whisper`
-  - new `indic` extra (`transformers`, `onnxruntime`)
-  - `jiwer` in the dev group
-  - all ML imports are lazy, so the base install and CI stay light
-- **`app/services/asr/`:**
-  - `base.py`: the `ASRBackend` ABC, with `transcribe(audio_path, language, offset)`, `supported_languages` and `supports_auto_detect`.
-  - `whisper_backend.py`:
-    - model loaded lazily as a thread-safe singleton per (size, device, compute type)
-    - `DEVICE=auto|cpu|cuda`, and `compute_type` set to `auto` (float16 on CUDA, int8 on CPU)
-    - runs in a worker thread with word timestamps, VAD and `condition_on_previous_text=False`
-  - `indic_backend.py`: IndicConformer (lazy, thread-safe), energy-based segmentation and approximate word timings.
-  - `mock_backend.py`: scripted en/hi/or lines. Indic lines are emitted in NFD on purpose, so NFC normalization is tested end to end.
-  - `router.py`: `ASRRouter`, driven by `ASR_LANGUAGE_BACKENDS`. It's validated at construction, raises `UnsupportedLanguageError` with the fix in the message, and is ready for per-segment routing in Prompt 6.
-  - `service.py`:
-    - language strategy: one hint → forced; none or several → Whisper auto-detect
-    - chunking with offset shifting
-    - central post-processing
-    - `build_router` (the factory for `ASR_BACKEND=real|mock`)
-  - `postprocess.py`, all pure functions:
-    - NFC normalization, preserving native script
-    - hallucination guards
-    - low-confidence flags
-    - `merge_chunks`: overlap de-duplication by midpoint ownership, time overlap and fuzzy text match
-    - `approximate_words`
-  - `segmentation.py`: pure speech-region detection.
-- **Schemas** (`app/schemas/asr.py`):
-  - `Word`
-  - `TranscriptSegment`, with `low_confidence`, `no_speech_prob` and `compression_ratio` diagnostics
-  - `LanguageDuration`
-  - `ASRResult`, with `detected_languages`, `model_names` and `requested_language`
-  - `TranscriptResponse`
-- **Pipeline:** `TranscriptionStage` is registered after `DiarizationStage` and receives the upload's `languages_hint` through `PipelineContext`.
-- **Storage:** migration `0004` adds a `transcript` JSON column, following the JSON-column choice from Prompt 4. `alembic check` reports no drift.
-- **API:** `GET /api/v1/meetings/{id}/transcript?format=json|txt|srt`.
-  - `txt` returns `text/plain` lines like `[HH:MM:SS.mmm] (lang) text`.
-  - `srt` returns `application/x-subrip` as an attachment.
-  - It returns 409 `transcript_not_available` before transcription and 404 for an unknown meeting.
-- **Utilities:** `app/utils/subtitles.py` provides `to_srt`, `to_text` and `format_timestamp`.
-- **Errors:**
-  - `ASRModelLoadError` (503 `asr_model_unavailable`): missing extras, token or terms, a load failure, or CUDA unavailable
-  - `UnsupportedLanguageError` (422)
-  - `TranscriptionError` (500)
-  - `TranscriptNotAvailableError` (409)
-  - An ASR failure marks the meeting `failed` but keeps `audio_quality` and `diarization`; a test covers this.
+- **`app/services/language/`:**
+  - `base.py`: the `LanguageIdentifier` ABC (`identify(audio_path, start, end, candidates)` → language, confidence, top-k, uncertain) plus the pure `restrict_scores` and `predict` functions.
+  - Backends:
+    - `mms_lid.py`: the default; maps ISO 639-3 labels to ISO 639-1.
+    - `speechbrain_lid.py`: VoxLingua107, en/hi only.
+    - `whisper_lid.py`: reuses the loaded ASR model's language detection, en/hi only.
+    - `mock_lid.py`: en → hi → or every 6 s.
+
+    All are lazy, thread-safe singletons that run in a worker thread and raise typed errors.
+  - `smoothing.py`: `windows_from_turns`, `inherit_short_windows`, `resolve_uncertain`, `merge_adjacent`, `smooth`, `to_regions`.
+  - `text_tagger.py`: script from Unicode blocks (Latn, Deva, Orya), and a romanized Hindi/Odia lexicon that leaves out words that are also common English words, favouring precision. Computes the segment-level code-mix stats.
+  - `summary.py`: language shares, per-speaker breakdown and switch points.
+  - `service.py`: `LanguageIdService`, `build_identifier` and hint handling.
+- **ASR:** `ASRRouter.transcribe_regions` plus `batch_regions` (Odia falls back to Whisper). `TranscriptionService.transcribe_routed`. Text tagging now runs on every transcript, routed or not. The mock ASR backends are named per route (`mock-whisper`, `mock-indic`), so tests can see where each segment was routed.
+- **Audio:** `app/services/audio/slicing.py` provides sample-accurate WAV slicing (stdlib) and a numpy sample reader for the models.
+- **Schemas:**
+  - `Word` gains `language` and `script`.
+  - `TranscriptSegment` gains `primary_language`, `languages_present`, `is_code_mixed`, `code_mix_ratio`, `lid_confidence` and `fallback_used`. All are defaulted, so transcripts stored by Prompt 5 still load.
+  - New: `LanguagePrediction`, `LanguageRegion` and `LanguageSummary` (shares, speakers, switch points, code-mixed count, regions).
+- **Pipeline:** `LanguageIdentificationStage` is registered only when `LANGUAGE_ROUTING_ENABLED`. `TranscriptionStage` routes when regions exist and updates `code_mixed_segments` in the summary.
+- **Storage and API:**
+  - Migration `0005` adds a `language_summary` JSON column, the same JSON-column approach as before. `alembic check` reports no drift.
+  - New endpoint: `GET /api/v1/meetings/{id}/languages`. It returns 409 `language_summary_not_available` before language ID and 404 for an unknown meeting.
+- **Errors:** `LanguageIdModelLoadError` (503), `LanguageIdError` (500) and `LanguageSummaryNotAvailableError` (409).
 - **Config:**
-  - `ASR_BACKEND`, `ASR_LANGUAGE_BACKENDS`
-  - `WHISPER_MODEL_SIZE`, `WHISPER_COMPUTE_TYPE`, `ASR_BEAM_SIZE`, `ASR_VAD_FILTER`
-  - `ODIA_MODEL_ID`, `ODIA_DECODING`
-  - `ASR_LOW_CONFIDENCE_THRESHOLD`, `ASR_COMPRESSION_RATIO_THRESHOLD`, `ASR_NO_SPEECH_THRESHOLD`
-- **Evaluation:** `scripts/eval_asr.py` computes WER and CER per language with jiwer on a folder of audio files plus `.txt` references. Text is NFC-normalized, case-folded and stripped of punctuation (including the danda) before scoring. It can write a JSON report. Also added a `make eval-asr DATA=...` target.
-- **Docker:** new `INSTALL_INDIC` build arg, alongside `INSTALL_ML`/`TORCH_VARIANT`. Whisper and IndicConformer downloads share the Prompt 4 `model-cache` volume.
-- **Docs:** a README section covering the routing design (Mermaid), model choices, native script and NFC handling, quality guards, setup, the eval script and known limitations.
+  - `SUPPORTED_LANGUAGES`, `LANGUAGE_ROUTING_ENABLED`
+  - `LID_BACKEND`, `LID_MODEL_ID`
+  - `LID_MIN_CONFIDENCE`, `LID_MIN_WINDOW_SECONDS`, `LID_MAX_WINDOW_SECONDS`
+- **Dependencies:** `speechbrain` joins the `ml` extra. MMS uses transformers from `indic`, so the Dockerfile is unchanged; `INSTALL_ML=true INSTALL_INDIC=true` includes everything.
+- **Eval:** `scripts/eval_asr.py --routed` runs LID and routing and prints an **LID confusion matrix in seconds**. The reference comes from `<stem>.lang.json` spans, or the folder language.
+- **Docs:** a README section with a Mermaid diagram of LID → smoothing → routing → stitching → tagging, audio-level vs text-level handling, the model choice and license warning, eval usage, known limitations and config. The roadmap now matches the prompt numbering.
+
+## Evaluation results
+
+**No real evaluation ran in this environment.** There's no `HF_TOKEN` here, MMS-LID is a 1B-parameter download, and there's no labelled en/hi/or meeting audio. What I could produce:
+
+- **Pipeline check with mock models,** using an 18 s meeting (speakers alternate every 2 s; the mock LID says en for 0–6 s, hi for 6–12 s, or for 12–18 s):
+  - regions are identified and routed as en → `mock-whisper`, hi → `mock-whisper`, or → `mock-indic`
+  - segments are stitched in order
+  - `/languages` reports 33.33% per language, with 2 switch points at 6 s (en→hi) and 12 s (hi→or)
+- **`eval_asr.py --routed --backend mock` on the same audio, without diarization** (15 s fixed windows):
+
+  ```text
+  LID accuracy 0.667 over 18.0s (rows: reference, cols: predicted, seconds)
+  ref/pred         en       hi       or
+  en              6.0      0.0      0.0
+  hi              3.0      0.0      3.0
+  or              0.0      0.0      6.0
+  ```
+
+  This shows the report working. It also shows why the pipeline uses diarization turns and not coarse fixed windows: the 6 s Hindi stretch falls inside two 9 s windows. These are **not** model accuracy numbers.
+- **To produce real numbers:** run `make install-ml` and `HF_TOKEN=...`, then `uv run python scripts/eval_asr.py data/ --routed`, with `<stem>.lang.json` references for mixed-language files.
 
 ## Test coverage
 
-229 tests pass, plus 3 slow real-model tests that are deselected by default. Overall coverage is 96%; for the new code:
+288 tests pass, plus 4 slow real-model tests that are deselected by default. Overall coverage is 96%; for the new code:
 
 | Module | Coverage |
 | --- | --- |
+| `language/base.py` | 100% |
 | `service.py` | 100% |
-| `mock_backend.py` | 100% |
-| `segmentation.py` | 100% |
-| `subtitles.py` | 100% |
-| `postprocess.py` | 99% |
-| `whisper_backend.py` | 99% |
-| `router.py` | 97% |
-| `indic_backend.py` | 85% (the uncovered lines are the numpy audio loader, which needs the extras) |
+| `summary.py` | 100% |
+| `text_tagger.py` | 100% |
+| `mms_lid.py` | 100% |
+| `mock_lid.py` | 100% |
+| `whisper_lid.py` | 100% |
+| `speechbrain_lid.py` | 98% |
+| `smoothing.py` | 95% |
+| `asr/router.py` | 99% |
+| `audio/slicing.py` | 65% (the uncovered lines are the numpy sample reader, which needs the extras) |
 
 - **Unit tests:**
-  - **Router:** selection per language (including upper-case codes and auto-detect), unconfigured language, a backend that can't handle the language, auto-detect on an incapable backend, mapping validation, config parsing, and the language strategy.
-  - **Chunks:** timestamp shifting, overlap de-duplication (midpoint ownership, fuzzy duplicates, keeping the more complete version, keeping distinct text), and chunked transcription through the service.
-  - **Hallucination guards:** empty output, fillers during silence, known phrases, a confident real "umm" being kept, "Thank you." being kept, compression ratio (computed and backend-supplied), and repeats.
-  - **NFC normalization:** Devanagari nukta exclusions (precomposed ज़ becomes ज + ़), ऩ composition, Odia two-part vowels (ୋ ୈ ୌ), Odia ଡ଼, an NFD Odia sentence round trip, and a check that nothing is transliterated.
-  - **Exports:** SRT and TXT formatting, and speech-region detection.
-  - **Eval script:** normalization, per-language scoring, sample discovery, and the end-to-end CLI with the mock.
-- **Backends with faked `faster_whisper`, `ctranslate2`, `transformers`, `onnxruntime` and `torch`:**
-  - Whisper: kwargs passed through, loaded once then cached, cuda/float16 vs cpu/int8, word to segment mapping, confidence fallback, load and inference failures, missing extras.
-  - IndicConformer: segments built from speech regions with offsets, approximate words, the `trust_remote_code` token, caching, missing token or extras, load and inference failures.
-- **Integration tests** (mock backend):
-  - `/transcript` as JSON (NFC, native script, language durations), `txt` and `srt` (headers and cue layout), an invalid format → 422, before processing → 409, unknown meeting → 404
-  - a single-language hint forces that language
-  - an ASR failure keeps diarization and audio quality
-- **Slow tests,** skipped without the extras:
-  - real Whisper on a short public-domain English clip (JFK), fetched at test time
-  - real IndicConformer on Odia, which runs only if `HF_TOKEN` and `POLYMOM_ODIA_SAMPLE_URL` are set, because no stable public-domain Odia clip URL was found
-
-No audio is committed.
+  - **Scores:** renormalization over allowed languages, uniform fallback, top-k, the uncertain threshold, hint filtering changing the winner, candidate selection.
+  - **Windows:** following turns, splitting long turns, covering the recording without turns.
+  - **Smoothing:** short-window inheritance (confident windows keep their language; inheritance uses the speaker's own profile only), uncertain resolution (nearest same-speaker window, closer neighbour wins, meeting-dominant and default fallbacks), merging with weighted confidence, the end-to-end `smooth`, clipping of overlapping speech.
+  - **Routing:** batching (consecutive same-language regions, span cap), sample-accurate slicing with clamping, routed transcription shifting timestamps and stitching with the right backend per language, temp files cleaned up, Odia failure falling back to Whisper with `fallback_used`, a failing default backend not being retried.
+  - **Text tagging:** parametrized script and language cases, *"मीटिंग kal 5 baje hai"* (Devanagari plus romanized Hindi counts as monolingual Hindi), Odia with English terms (ratio 0.33), tie-breaking toward the audio language.
+  - **Summary:** switch points, shares and percentages, speaker ordering and dominant language, the empty case.
+  - **LID backends with faked `transformers`/`torch`/`speechbrain`/faster-whisper:** label mapping and renormalization (Bengali dropped), load caching, device selection, load/inference/missing-extras errors, SpeechBrain limited to en/hi, the single-hint fast path never loading a model.
+- **Integration tests** (mock diarization + mock LID + mock ASR):
+  - a full 18 s en/hi/or meeting: routing per language, chronological stitching, word scripts, the `/languages` shares and switch points and speakers
+  - a hint restricting the candidates
+  - 409 and 404 on `/languages`
+  - Prompt 5 transcript tests updated for routed output
+- **Slow test:** real SpeechBrain LID, skipped without the extras.
 
 ## Known limitations
 
-- **Odia timing:** Odia word timestamps are approximate (segment boundaries are accurate to 30 ms), and there are no Odia confidence scores.
-- **Code-mixed speech:** without a single hint, Whisper decodes everything, including Odia, which it can't transcribe well. Per-segment language ID and routing comes in Prompt 6. Whisper sometimes labels Hindi as Urdu (Perso-Arabic script); passing `languages=hi` avoids that.
-- **Compute:** large-v3 needs roughly 5 GB of GPU memory in float16. On CPU, use `small` or `medium`. Inference runs in the API process until the worker queue arrives in Prompt 11.
-- **Real models not run by me:** they haven't run in this environment, because I have no `HF_TOKEN` here and the downloads are several GB. The integration code is tested against fakes that follow each library's API, and the ML Docker image builds with all the extras. Please run `make install-ml && HF_TOKEN=... make test-slow` once.
+- **Switching inside a sentence:** a mid-sentence switch stays in one audio region and goes to one backend. Only the text-level tags reveal the mix.
+- **Romanized text:** the lexicon is deliberately small and precise. Romanized Hindi or Odia outside it is tagged English, with no transliteration model.
+- **Short utterances:** LID below about 1.5 s is unreliable. Smoothing gives such turns the speaker's usual language, which can hide a genuine one-word switch.
+- **Hindi and Odia accents:** short or accented Odia can be classified as Hindi (or Bengali, which is discarded). Hint `languages=or` for known Odia meetings.
+- **MMS-LID:** it's non-commercial and has 1B parameters (slow on CPU). The commercial alternatives can't detect Odia.
+- **Real models not run by me:** nothing ran against the real LID or ASR models here; see Evaluation results.
 
 ## Checklist
 
 - [x] `make lint` passes
 - [x] `make typecheck` (mypy strict) passes, without the ML extras installed
 - [x] `make test` passes, with coverage of new code at least 85%
-- [x] Docker build passes without extras
-- [x] Docker build passes with `INSTALL_ML=true INSTALL_INDIC=true`
-- [x] Migration 0004 applies on top of 0003, and `alembic check` is clean
-- [x] Native scripts preserved, NFC throughout, nothing transliterated
+- [x] Docker build passes without extras, and with `INSTALL_ML=true INSTALL_INDIC=true`
+- [x] Migration 0005 applies on top of 0004, and `alembic check` is clean
+- [x] `LANGUAGE_ROUTING_ENABLED=false` keeps the Prompt 5 behaviour
 - [x] No audio, model weights or secrets committed
 
 ## Next steps
 
-**Prompt 6: language detection and code-switching.** Run segment-level language ID (Whisper LID and script detection), then use `ASRRouter.select` per segment so that Odia stretches inside a Hindi or English meeting are re-transcribed by IndicConformer, and record code-switch points.
+**Prompt 7: speaker and transcript alignment.** Assign transcript words to diarization turns using word timestamps (approximate for Odia) and the overlap regions. This produces a speaker-attributed transcript ("Person 1: ...") that keeps the per-word language tags from this PR.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
