@@ -56,7 +56,8 @@ RUN apt-get update \
 # HF_HOME holds downloaded models (pyannote, Whisper, IndicConformer); mount a volume there.
 ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     APP_ENV=production STORAGE_DIR=/app/storage \
-    HF_HOME=/app/.cache/huggingface TORCH_HOME=/app/.cache/torch \n    MPLCONFIGDIR=/app/.cache/matplotlib
+    HF_HOME=/app/.cache/huggingface TORCH_HOME=/app/.cache/torch \
+    MPLCONFIGDIR=/app/.cache/matplotlib
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=app:app app ./app
