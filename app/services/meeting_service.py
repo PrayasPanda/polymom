@@ -14,6 +14,7 @@ from app.core.exceptions import (
     MeetingStateConflictError,
     PolymomError,
     TranscriptNotAvailableError,
+    ValidationError,
 )
 from app.core.logging import get_logger
 from app.models.meeting import Meeting
@@ -22,6 +23,7 @@ from app.schemas.asr import ASRResult
 from app.schemas.diarization import DiarizationResult
 from app.schemas.language import LanguageSummary
 from app.schemas.meeting import MeetingStatus
+from app.schemas.transcript import SpeakerTranscript
 from app.services.audio.validator import AsyncReadable, MediaValidator
 
 logger = get_logger(__name__)
@@ -126,6 +128,58 @@ class MeetingService:
                 details={"meeting_id": str(meeting_id), "status": meeting.status.value},
             )
         return LanguageSummary.model_validate(meeting.language_summary)
+
+    async def get_speaker_transcript(
+        self, meeting_id: uuid.UUID
+    ) -> tuple[SpeakerTranscript, dict[str, str]]:
+        """The aligned transcript with display names applied, plus the name mapping."""
+        meeting = await self.get(meeting_id)
+        if meeting.speaker_transcript is None:
+            raise TranscriptNotAvailableError(
+                "The speaker-attributed transcript is not available yet. Run "
+                "POST /meetings/{id}/process and wait for status 'completed'; the raw ASR "
+                "output may already be available with ?view=raw.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+        names = dict(meeting.speaker_names or {})
+        transcript = SpeakerTranscript.model_validate(meeting.speaker_transcript)
+        for utterance in transcript.utterances:
+            utterance.speaker_name = names.get(utterance.speaker)
+        return transcript, names
+
+    async def rename_speakers(
+        self, meeting_id: uuid.UUID, names: dict[str, str | None]
+    ) -> dict[str, str]:
+        """Set display names for diarization labels; ``None`` removes one.
+
+        Original labels are never changed; names are applied when rendering.
+        """
+        meeting = await self.get(meeting_id)
+        known: set[str] = set()
+        if meeting.diarization:
+            known |= {t["speaker_label"] for t in meeting.diarization.get("turns", [])}
+        if meeting.speaker_transcript:
+            known |= set(meeting.speaker_transcript.get("speakers", []))
+        if not known:
+            raise DiarizationNotAvailableError(
+                "Speakers are not known yet. Process the meeting first.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+        unknown = sorted(set(names) - known)
+        if unknown:
+            raise ValidationError(
+                "Unknown speaker label(s).", details={"unknown": unknown, "speakers": sorted(known)}
+            )
+        current = dict(meeting.speaker_names or {})
+        for label, name in names.items():
+            cleaned = (name or "").strip()
+            if cleaned:
+                current[label] = cleaned[:100]
+            else:
+                current.pop(label, None)
+        meeting.speaker_names = current
+        await self._repo.save(meeting)
+        return current
 
     async def request_processing(self, meeting_id: uuid.UUID, *, force: bool = False) -> Meeting:
         """Mark a meeting as ``processing`` so the pipeline can be scheduled.
