@@ -1,7 +1,8 @@
 """Minutes-of-Meeting pipeline: an ordered list of stages sharing a context.
 
 Stages (planned): preprocess -> diarize -> transcribe -> align -> analytics -> summarize.
-Registered so far: preprocess -> diarize -> identify languages -> transcribe -> align
+Registered so far: preprocess -> diarize -> identify languages -> transcribe -> align ->
+analytics
 (language ID only when LANGUAGE_ROUTING_ENABLED).
 """
 
@@ -21,6 +22,7 @@ from app.core.exceptions import PolymomError
 from app.core.logging import get_logger
 from app.models.meeting import Meeting
 from app.repositories.meeting_repository import MeetingRepository
+from app.schemas.analytics import ConversationAnalytics
 from app.schemas.asr import ASRResult
 from app.schemas.audio import PreprocessResult
 from app.schemas.diarization import DiarizationResult
@@ -29,6 +31,7 @@ from app.schemas.meeting import MeetingStatus
 from app.schemas.transcript import SpeakerTranscript
 from app.services.alignment.aligner import align_words
 from app.services.alignment.utterances import build_transcript
+from app.services.analytics.meeting_stats import build_analytics
 from app.services.asr.router import ASRRouter
 from app.services.asr.service import TranscriptionService
 from app.services.audio.preprocessor import AudioPreprocessor
@@ -209,6 +212,36 @@ class AlignmentStage(PipelineStage):
         meeting.speaker_transcript = result.model_dump(mode="json")
 
 
+class AnalyticsStage(PipelineStage):
+    """Speaker-wise and meeting-level conversation statistics. Requires :class:`AlignmentStage`."""
+
+    name = "analytics"
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def run(self, context: PipelineContext) -> None:
+        transcript: SpeakerTranscript | None = context.outputs.get(AlignmentStage.name)
+        if transcript is None:
+            raise RuntimeError("AnalyticsStage requires AlignmentStage to run first")
+        diarization: DiarizationResult | None = context.outputs.get(DiarizationStage.name)
+        language_id: LanguageIdResult | None = context.outputs.get(LanguageIdentificationStage.name)
+        settings = self._settings
+        context.outputs[self.name] = build_analytics(
+            diarization.turns if diarization else [],
+            transcript,
+            language_summary=language_id.summary if language_id else None,
+            interruption_min_overlap=settings.interruption_min_overlap_seconds,
+            bucket_seconds=settings.bucket_seconds,
+            gini_balanced_max=settings.gini_balanced_max,
+            gini_dominated_min=settings.gini_dominated_min,
+        )
+
+    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+        result: ConversationAnalytics = context.outputs[self.name]
+        meeting.analytics = result.model_dump(mode="json")
+
+
 class MoMPipeline:
     """Runs stages in order and owns the meeting status lifecycle.
 
@@ -289,4 +322,5 @@ def build_pipeline(
         stages.append(LanguageIdentificationStage(LanguageIdService(language_identifier, settings)))
     stages.append(TranscriptionStage(TranscriptionService(asr_router, settings)))
     stages.append(AlignmentStage(settings))
+    stages.append(AnalyticsStage(settings))
     return MoMPipeline(stages, repositories)

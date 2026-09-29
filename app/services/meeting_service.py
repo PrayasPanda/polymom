@@ -8,6 +8,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.config import Settings
 from app.core.exceptions import (
+    AnalyticsNotAvailableError,
     DiarizationNotAvailableError,
     LanguageSummaryNotAvailableError,
     MeetingNotFoundError,
@@ -19,6 +20,7 @@ from app.core.exceptions import (
 from app.core.logging import get_logger
 from app.models.meeting import Meeting
 from app.repositories.meeting_repository import MeetingRepository
+from app.schemas.analytics import ConversationAnalytics
 from app.schemas.asr import ASRResult
 from app.schemas.diarization import DiarizationResult
 from app.schemas.language import LanguageSummary
@@ -146,6 +148,23 @@ class MeetingService:
         for utterance in transcript.utterances:
             utterance.speaker_name = names.get(utterance.speaker)
         return transcript, names
+
+    async def get_analytics(
+        self, meeting_id: uuid.UUID
+    ) -> tuple[ConversationAnalytics, dict[str, str]]:
+        """Conversation analytics with display names applied, plus the name mapping."""
+        meeting = await self.get(meeting_id)
+        if meeting.analytics is None:
+            raise AnalyticsNotAvailableError(
+                "Analytics are not available yet. Run POST /meetings/{id}/process "
+                "and wait for status 'completed'.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+        names = dict(meeting.speaker_names or {})
+        analytics = ConversationAnalytics.model_validate(meeting.analytics)
+        for speaker in analytics.speakers:
+            speaker.speaker_name = names.get(speaker.speaker)
+        return analytics, names
 
     async def rename_speakers(
         self, meeting_id: uuid.UUID, names: dict[str, str | None]
