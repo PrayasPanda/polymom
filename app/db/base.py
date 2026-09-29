@@ -1,10 +1,12 @@
 """Declarative base and portable column types."""
 
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import DateTime, Dialect, MetaData
+from sqlalchemy import JSON, DateTime, Dialect, MetaData
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.types import TypeDecorator
+from sqlalchemy.types import TypeDecorator, TypeEngine
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -36,6 +38,18 @@ class UTCDateTime(TypeDecorator[datetime]):
         if value is None:
             return None
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+class JSONDocument(TypeDecorator[Any]):
+    """JSONB on Postgres (indexable, compact), plain JSON elsewhere (SQLite)."""
+
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect: Dialect) -> TypeEngine[Any]:
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(JSONB())
+        return dialect.type_descriptor(JSON())
 
 
 def utcnow() -> datetime:

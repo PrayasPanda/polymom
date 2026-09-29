@@ -10,14 +10,38 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 
-async def upgrade_to_head(engine: AsyncEngine) -> None:
-    """Apply all pending migrations over a connection from ``engine``."""
+async def _run(engine: AsyncEngine, action: str, revision: str) -> None:
     cfg = Config()
     cfg.set_main_option("script_location", str(MIGRATIONS_DIR))
 
-    def _upgrade(connection: Connection) -> None:
+    def _migrate(connection: Connection) -> None:
         cfg.attributes["connection"] = connection
-        command.upgrade(cfg, "head")
+        getattr(command, action)(cfg, revision)
 
-    async with engine.begin() as conn:
-        await conn.run_sync(_upgrade)
+    async with engine.connect() as conn:
+        sqlite = conn.dialect.name == "sqlite"
+        if sqlite:
+            # Batch migrations rebuild tables on SQLite; with foreign keys on, dropping
+            # the old table would cascade-delete child rows. Must run outside a transaction.
+            await conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            await conn.commit()
+        try:
+            async with conn.begin():
+                await conn.run_sync(_migrate)
+        finally:
+            if sqlite:
+                await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                await conn.commit()
+
+
+async def upgrade_to_head(engine: AsyncEngine) -> None:
+    """Apply all pending migrations over a connection from ``engine``."""
+    await _run(engine, "upgrade", "head")
+
+
+async def upgrade_to(engine: AsyncEngine, revision: str) -> None:
+    await _run(engine, "upgrade", revision)
+
+
+async def downgrade_to(engine: AsyncEngine, revision: str) -> None:
+    await _run(engine, "downgrade", revision)

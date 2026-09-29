@@ -39,6 +39,8 @@ async def _run_async_migrations() -> None:
     url = config.get_main_option("sqlalchemy.url") or get_settings().resolved_database_url
     engine = create_engine(url)
     async with engine.connect() as connection:
+        if connection.dialect.name == "sqlite":
+            await connection.exec_driver_sql("PRAGMA foreign_keys=OFF")  # see app.db.migrate
         await connection.run_sync(_do_run_migrations)
         await connection.commit()
     await engine.dispose()
