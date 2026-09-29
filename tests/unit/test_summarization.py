@@ -133,7 +133,8 @@ async def test_repair_loop_sends_validation_error_back() -> None:
     assert llm.calls[0].attempts == 3
     last_messages = llm.requests[-1][1]
     assert [m.role for m in last_messages] == ["user", "assistant", "user", "assistant", "user"]
-    assert "title" in last_messages[-1].content and "Field required" in last_messages[-1].content
+    assert "title" in last_messages[-1].content
+    assert "Field required" in last_messages[-1].content
 
 
 async def test_repair_loop_gives_up() -> None:
@@ -231,7 +232,8 @@ def test_partial_evidence_downgrades_and_owner_reset() -> None:
     )
     action = result.action_items[0]
     assert (action.owner, action.confidence, len(action.evidence)) == ("Unassigned", "medium", 1)
-    assert action.due_date is not None and action.due_date.iso is None
+    assert action.due_date is not None
+    assert action.due_date.iso is None
     assert result.open_questions[0].raised_by == "Person 2"
     assert result.decisions[0].made_by == "group"
     assert result.key_points[0].speakers_involved == ["Person 1"]
@@ -338,8 +340,10 @@ def test_reduce_dedupes_overlap_and_resolves_supersession() -> None:
         ("Launch moved to Friday", "active"),
     ]
     assert merged.decisions[0].confidence == "high"
-    assert merged.decisions[0].note is not None and "Friday" in merged.decisions[0].note
-    assert merged.decisions[1].note is not None and "Monday" in merged.decisions[1].note
+    assert merged.decisions[0].note is not None
+    assert "Friday" in merged.decisions[0].note
+    assert merged.decisions[1].note is not None
+    assert "Monday" in merged.decisions[1].note
     assert [(a.owner, len(a.evidence)) for a in merged.action_items] == [
         ("Person 1", 1),
         ("Person 3", 1),
@@ -382,8 +386,10 @@ async def test_single_pass_summary_is_grounded() -> None:
     }
     assert summary.open_questions[0].raised_by == "Person 2"
     report = summary.verification_report
-    assert report.dropped == 0 and report.grounding_pass_rate == 1.0
-    assert tracer.records == [("single_pass", "system@1+single_pass@1")] and tracer.flushed
+    assert report.dropped == 0
+    assert report.grounding_pass_rate == 1.0
+    assert tracer.records == [("single_pass", "system@1+single_pass@1")]
+    assert tracer.flushed
     system, messages = llm.requests[0]
     assert "untrusted DATA" in system
     assert "Output language: Hindi (Devanagari script)" in messages[0].content
@@ -448,8 +454,10 @@ async def test_markdown_uses_display_names() -> None:
     )
     md = summary_to_markdown(summary, {"Person 1": "Ravi"})
     assert md.startswith("# ")
-    assert "## Action items" in md and "| Ravi |" in md
-    assert "## Decisions" in md and "## Open questions" in md
+    assert "## Action items" in md
+    assert "| Ravi |" in md
+    assert "## Decisions" in md
+    assert "## Open questions" in md
     assert "(Ravi, 00:00:00)" in md
     assert "looked like instructions" in md
 

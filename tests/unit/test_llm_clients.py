@@ -171,7 +171,8 @@ async def test_retries_rate_limit_with_backoff() -> None:
     client = make(OpenAIClient, lambda r: responses.pop(0), delays)
     assert (await client.generate_structured("s", "u", SummaryHeader)).title == "T"
     assert delays == [3.0, backoff(1)]
-    assert backoff(0) == 1.0 and backoff(10) == 30.0
+    assert backoff(0) == 1.0
+    assert backoff(10) == 30.0
 
 
 async def test_gives_up_after_retries() -> None:

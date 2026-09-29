@@ -34,7 +34,8 @@ async def test_summary_json_md_and_regenerate(client: AsyncClient) -> None:
     assert body["model_info"]["strategy"] == "single_pass"
     assert body["source_languages"] == ["en", "hi", "or"]
     report = body["verification_report"]
-    assert report["dropped"] == 0 and report["evidence_passed"] == report["evidence_checked"]
+    assert report["dropped"] == 0
+    assert report["evidence_passed"] == report["evidence_checked"]
 
     md = await client.get(f"{URL}/{meeting_id}/summary", params={"format": "md"})
     assert md.headers["content-type"].startswith("text/markdown")

@@ -1,0 +1,23 @@
+{
+  "title": "Sprint planning (English)",
+  "date": "2026-09-28",
+  "utterances": [
+    {"id": 0, "speaker": "Person 1", "start": 0.0, "end": 6.0, "lang": "en", "text": "Good morning. Today's agenda item is the mobile release and the login bug."},
+    {"id": 1, "speaker": "Person 2", "start": 6.5, "end": 12.0, "lang": "en", "text": "The login bug affects about five percent of Android users."},
+    {"id": 2, "speaker": "Person 1", "start": 12.5, "end": 18.0, "lang": "en", "text": "Then we agreed the fix goes out before the release, not after."},
+    {"id": 3, "speaker": "Person 2", "start": 18.5, "end": 23.0, "lang": "en", "text": "I will fix the login bug by Wednesday."},
+    {"id": 4, "speaker": "Person 3", "start": 23.5, "end": 29.0, "lang": "en", "text": "Should we also update the privacy policy screen?"},
+    {"id": 5, "speaker": "Person 1", "start": 29.5, "end": 35.0, "lang": "en", "text": "Let's decide that next week. For now we decided to ship version 2.4 on Friday."},
+    {"id": 6, "speaker": "Person 3", "start": 35.5, "end": 40.0, "lang": "en", "text": "I will prepare the release notes by Thursday EOD."}
+  ],
+  "gold": {
+    "decisions": [
+      {"text": "Ship the login fix before the release", "made_by": "group"},
+      {"text": "Ship version 2.4 on Friday", "made_by": "Person 1"}
+    ],
+    "action_items": [
+      {"task": "Fix the login bug by Wednesday", "owner": "Person 2"},
+      {"task": "Prepare the release notes by Thursday EOD", "owner": "Person 3"}
+    ]
+  }
+}
