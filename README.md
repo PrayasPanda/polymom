@@ -74,8 +74,9 @@ make dev                   # uv sync --all-groups + pre-commit install
 | `HF_TOKEN` | – | Hugging Face token (for diarization models) |
 | `LLM_PROVIDER` | `openai` | LLM backend for summaries: `openai`, `azure`, `anthropic`, `ollama`, `mock` |
 | `LLM_API_KEY` | – | API key for the LLM provider |
-| `STORAGE_DIR` | `./storage` | Uploads go to `STORAGE_DIR/uploads/{meeting_id}.{ext}` |
-| `DATABASE_URL` | SQLite at `STORAGE_DIR/polymom.db` | Any SQLAlchemy async URL, e.g. `postgresql+asyncpg://...` (install `asyncpg`) |
+| `STORAGE_DIR` | `./storage` | Root of the local artifact store and the SQLite file |
+| `DATABASE_URL` | SQLite at `STORAGE_DIR/polymom.db` | Any SQLAlchemy async URL, e.g. `postgresql+asyncpg://...` (`uv sync --extra postgres`) |
+| `ARTIFACT_STORE` | `local` | `local` or `s3` (see [Storage and retrieval](#storage-and-retrieval)) |
 | `AUTO_MIGRATE` | `true` | Run Alembic migrations on startup |
 | `MAX_UPLOAD_MB` | `200` | Upload size limit, enforced while streaming |
 | `ALLOWED_EXTENSIONS` | `wav,mp3,m4a,flac,ogg,aac,mp4,mkv,mov,webm` | Comma-separated accepted file types |
@@ -836,6 +837,197 @@ The mock provider's scores only show that the harness works. Real numbers depend
 | `EVIDENCE_MATCH_THRESHOLD` | `80` | Minimum fuzzy score for a quote |
 | `LANGFUSE_ENABLED` | `false` | Tracing (plus the keys and `LANGFUSE_HOST`) |
 
+## Storage and retrieval
+
+Every processing run is recorded with its configuration, model versions and per-stage timings. Its results live in normalized tables, and files live in an artifact store. **The latest successful run is the default everywhere**; older runs stay retrievable by `run_id`.
+
+### Data model
+
+```mermaid
+erDiagram
+    meetings ||--o{ processing_runs : "has runs"
+    meetings ||--o{ speakers : "has"
+    meetings ||--o{ utterances : "has"
+    meetings ||--o{ summaries : "has"
+    processing_runs ||--o{ stage_results : "records"
+    processing_runs ||--o{ utterances : "produced"
+    processing_runs ||--o{ summaries : "produced"
+    meetings {
+        uuid id PK
+        string upload_key "artifact key"
+        string processed_key
+        string sha256 "duplicate detection"
+        string status "queued, processing, completed, completed_with_errors, failed"
+        string detected_languages "denormalized for filtering"
+        int num_speakers
+        datetime raw_audio_purged_at
+    }
+    processing_runs {
+        uuid id PK
+        uuid meeting_id FK
+        string status
+        json config_snapshot "all settings, secrets masked"
+        json model_versions
+        json timings_ms
+        datetime started_at
+        datetime finished_at
+    }
+    stage_results {
+        int id PK
+        uuid run_id FK
+        string stage_name "unique per run"
+        string status
+        int duration_ms
+        json output "inline"
+        string output_ref "artifact key when large"
+        text error
+    }
+    speakers {
+        int id PK
+        uuid meeting_id FK
+        string label "Person N, unique per meeting"
+        string display_name
+        json stats "latest analytics"
+    }
+    utterances {
+        int id PK
+        uuid meeting_id FK
+        uuid run_id FK
+        int utterance_index
+        string speaker
+        float start "indexed with meeting_id"
+        float end
+        text text
+        string primary_language
+    }
+    summaries {
+        int id PK
+        uuid run_id FK
+        string output_language
+        string model
+        string prompt_version
+        json content
+        json verification_report
+    }
+```
+
+- **JSON columns** use `JSONB` on Postgres and `JSON` on SQLite, through one type (`JSONDocument`).
+- **Deletes:** every foreign key cascades `ON DELETE`. SQLite gets `PRAGMA foreign_keys=ON` so it behaves like Postgres.
+- **Search index:** `search_index` is an FTS5 table on SQLite and a `tsvector` table on Postgres (see Search).
+- **Multi-table writes** (a stage result plus its utterances, speakers and search rows) go through a **Unit of Work** (`app/repositories/unit_of_work.py`) and commit together.
+
+**Migrating existing databases:**
+- `0009` creates the tables and backfills one run per already-processed meeting from the old per-stage JSON columns, then rewrites file paths as artifact keys.
+- `0010` drops those columns.
+- Both downgrade without data loss: `0010`'s downgrade refills the JSON columns from each meeting's latest run.
+
+### Artifact storage
+
+Uploads, processed audio, large stage outputs, charts and exports all go through `ArtifactStore` (`put`, `get`, `stream`, `exists`, `delete`, `presigned_url`). The key layout is:
+
+```
+meetings/{meeting_id}/upload/original.{ext}
+meetings/{meeting_id}/{run_id}/processed.wav
+meetings/{meeting_id}/{run_id}/stages/{stage}.json      # outputs > STAGE_OUTPUT_INLINE_MAX_BYTES
+meetings/{meeting_id}/{run_id}/charts/{name}.png
+meetings/{meeting_id}/{run_id}/exports/minutes.{fmt}
+```
+
+- **Local (default):** files under `STORAGE_DIR`.
+- **S3 or MinIO:** `uv sync --extra s3`, then:
+
+  ```bash
+  # .env
+  ARTIFACT_STORE=s3
+  S3_BUCKET=polymom
+  S3_ENDPOINT_URL=http://minio:9000   # omit for AWS S3
+  S3_ACCESS_KEY=polymom
+  S3_SECRET_KEY=polymom-secret
+
+  docker compose -f docker/docker-compose.yml --profile minio up   # MinIO + bucket creation
+  ```
+
+Models need local files, so the pipeline downloads the upload to a temporary file for the run (the local store uses the file in place) and uploads the processed audio when the run finishes.
+
+### Consolidated result
+
+`GET /api/v1/meetings/{id}/result` returns everything in one `MeetingResult` document:
+- meeting metadata and audio quality;
+- language summary;
+- speakers with display names and stats;
+- the speaker transcript, analytics, and the summary with its verification report;
+- human-readable warnings;
+- processing info (run id, model versions, per-stage status and timings);
+- `schema_version`.
+
+Options:
+- `?run_id=` pins a run.
+- `?include=summary` (or any of `transcript,analytics,summary`) trims the payload.
+
+The JSON Schema is published at **`GET /api/v1/schema/meeting-result`** (`$id` and `version` included) so other applications can validate responses or generate clients.
+
+```json
+{
+  "schema_version": "1.0.0",
+  "meeting": {"meeting_id": "3f8b...", "title": "Daily standup", "status": "completed",
+              "detected_languages": ["en", "hi", "or"], "num_speakers": 3, "...": "..."},
+  "processing": {"run_id": "9c1e...", "status": "completed",
+                 "model_versions": {"diarize": "pyannote/speaker-diarization-3.1",
+                                    "transcribe": "faster-whisper/large-v3,indic-conformer",
+                                    "summarize": "openai/gpt-4o-mini"},
+                 "timings_ms": {"preprocess": 812, "diarize": 20411, "...": 0},
+                 "stages": [{"name": "summarize", "status": "completed", "duration_ms": 6120}]},
+  "speakers": [{"label": "Person 1", "display_name": "Ravi", "stats": {"speaking_time_seconds": 812.3}}],
+  "transcript": {"utterances": ["..."]},
+  "analytics": {"meeting_stats": {"...": "..."}},
+  "summary": {"title": "...", "decisions": ["..."], "action_items": ["..."]},
+  "verification_report": {"checked": 14, "passed": 13, "dropped": 1},
+  "warnings": ["Audio is quiet (-38 LUFS)."],
+  "included": ["transcript", "analytics", "summary"]
+}
+```
+
+### Exports
+
+`GET /api/v1/meetings/{id}/export?format=docx|pdf|md|json` returns a formal minutes document: title, date, duration, participants with speaking time, languages, executive summary, key points, decisions table, action items table (owner, due date, priority), open questions, and an appendix with the full speaker-wise transcript and timestamps.
+
+- **Caching:** exports are cached in the artifact store per run and format. Renaming a speaker or regenerating the summary invalidates the cache.
+- **PDF engine:** fpdf2 with HarfBuzz shaping (`uharfbuzz`), with the bundled **Noto Sans, Noto Sans Devanagari and Noto Sans Oriya** fonts (SIL OFL, `app/services/export/fonts/`).
+  - Hindi conjuncts and pre-base vowel signs render correctly, and the text stays extractable.
+  - fpdf2 instead of WeasyPrint or ReportLab: WeasyPrint needs the Pango system libraries, and open-source ReportLab has no dependable Indic shaping.
+- **DOCX** (python-docx): runs set Noto as the complex-script font.
+
+Samples: [docs/samples/sample-minutes.pdf](docs/samples/sample-minutes.pdf) and [.md](docs/samples/sample-minutes.md), generated from the code-mixed fixture by `uv run python scripts/make_sample_export.py`.
+
+### Retrieval and search
+
+```bash
+curl '.../meetings?status=completed&language=hi&min_speakers=3&created_from=2026-09-01T00:00:00Z&sort=duration_seconds&order=desc&limit=20'
+curl '.../meetings?cursor=<next_cursor>'                    # keyset pagination
+curl '.../meetings/{id}/utterances?speaker=Person%202&language=or&start=60&end=300&q=budget'
+curl '.../meetings/{id}/runs'                               # history, newest first; is_default marks the served run
+curl '.../meetings/{id}/runs/{run_id}'                      # MeetingResult of that run
+curl '.../search?q=बजट'                                     # utterances and summaries across meetings
+```
+
+Search indexes each meeting's latest utterances and summary:
+- **SQLite:** FTS5 with the `trigram` tokenizer. It needs no word segmentation, so Devanagari and Odia match as substrings; queries under 3 characters use `LIKE`.
+- **Postgres:** `to_tsvector('simple', text)` with a GIN index (no stemming, no stop words, so any script works), OR-ed with `ILIKE`.
+
+### Integrity and retention
+
+- **Idempotent uploads:** the SHA-256 of each upload is stored. An identical file returns the existing meeting (`200`, `duplicate: true`) unless `?allow_duplicate=true`.
+- **Deletes:** rows are deleted first, in one transaction, and cascade to runs, stage results, speakers, utterances, summaries and search rows. Artifacts are deleted after the commit. Deletions that fail go to `artifact_cleanup_log` and are retried by the cleanup script.
+- **Retention:** `scripts/cleanup.py` (a dry run unless `--apply`) removes the upload and the processed audio of meetings older than `RETENTION_DAYS`. Transcripts, analytics, summaries and exports are kept. A purged meeting records `raw_audio_purged_at` and can no longer be reprocessed. `KEEP_RAW_AUDIO=true` or `RETENTION_DAYS=0` disables purging.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ARTIFACT_STORE` | `local` | `local` (under `STORAGE_DIR`) or `s3` |
+| `S3_BUCKET`, `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | `polymom`, – | S3 / MinIO settings |
+| `STAGE_OUTPUT_INLINE_MAX_BYTES` | `524288` | Larger stage outputs are stored as artifacts |
+| `RETENTION_DAYS` | `90` | Age after which raw audio is purged (`0` = never) |
+| `KEEP_RAW_AUDIO` | `false` | `true` keeps raw audio regardless of age |
+
 ## Running with Docker
 
 ```bash
@@ -867,7 +1059,7 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | 7 | Speaker + transcript alignment ✅ | Word-level speaker attribution, utterances, txt/srt/vtt/md, speaker renaming, DER/WDER eval |
 | 8 | Speaker statistics ✅ | Talk time, turns, interruptions, WPM, languages, questions per speaker; balance, timeline, CSV, charts |
 | 9 | **LLM summarization** ✅ | Grounded summary, decisions, action items; OpenAI/Azure/Anthropic/Ollama; map-reduce, verifier, injection flags, eval |
-| 10 | Results API & exports | Transcript/summary endpoints, Markdown/PDF/JSON export |
+| 10 | **Storage & retrieval** ✅ | Run history, normalized results, artifact store (local/S3), consolidated result + JSON Schema, docx/pdf/md/json exports, search, retention |
 | 11 | Background workers & persistence | Job queue, durable DB, retries |
 | 12 | Hardening & deployment | Auth, rate limiting, observability, GPU image, release |
 
