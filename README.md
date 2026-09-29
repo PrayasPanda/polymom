@@ -9,7 +9,7 @@ Voice-based **Minutes of Meeting** pipeline. Upload a meeting recording and get 
 
 Everything is exposed through a FastAPI service.
 
-> Status: **upload**, **audio preprocessing**, **speaker diarization**, **spoken language ID with code-switching** and **multilingual ASR** (English, Hindi, Odia) work. Aligning words to speakers and summarization come next. See the [roadmap](#roadmap).
+> Status: the pipeline produces a **speaker-attributed, multilingual transcript** (English, Hindi, Odia, code-switched): upload, preprocessing, diarization, language ID, routed ASR and word-to-speaker alignment all work. Speaker statistics and summaries come next. See the [roadmap](#roadmap).
 
 ## Architecture
 
@@ -114,7 +114,8 @@ Interactive docs with schemas and example responses: <http://localhost:8000/docs
 | `GET` | `/api/v1/meetings/{meeting_id}` | Metadata and status |
 | `DELETE` | `/api/v1/meetings/{meeting_id}` | Delete the record, the upload and the processed audio (`204`) |
 | `GET` | `/api/v1/meetings/{meeting_id}/languages` | Language shares, per-speaker breakdown, switch points; `409` until identified |
-| `GET` | `/api/v1/meetings/{meeting_id}/transcript` | Timestamped transcript; `?format=json` (default), `txt` or `srt`; `409` until transcribed |
+| `GET` | `/api/v1/meetings/{meeting_id}/transcript` | Speaker-attributed transcript; `?format=json` (default), `txt`, `srt`, `vtt`, `md`; raw ASR segments with `?view=raw` (`json`, `txt`, `srt`); `409` until processed |
+| `PATCH` | `/api/v1/meetings/{meeting_id}/speakers` | Display names, e.g. `{"names": {"Person 1": "Ravi"}}` (`null` clears one) |
 | `GET` | `/api/v1/meetings/{meeting_id}/speakers` | Speaker turns (`Person 1..N`), speaker count and overlap regions; `409` until diarized |
 | `POST` | `/api/v1/meetings/{meeting_id}/process` | Run the pipeline in the background (`202`); `409` if already processing/completed unless `?force=true` |
 
@@ -134,6 +135,8 @@ curl -X POST http://localhost:8000/api/v1/meetings/3f8b6f0e-.../process
 curl http://localhost:8000/api/v1/meetings/3f8b6f0e-...   # includes audio_quality
 curl http://localhost:8000/api/v1/meetings/3f8b6f0e-.../speakers
 curl "http://localhost:8000/api/v1/meetings/3f8b6f0e-.../transcript?format=srt" -o meeting.srt
+curl -X PATCH http://localhost:8000/api/v1/meetings/3f8b6f0e-.../speakers \
+     -H 'Content-Type: application/json' -d '{"names": {"Person 1": "Ravi"}}'
 ```
 
 ### Upload validation
@@ -189,11 +192,13 @@ flowchart TD
     S1 --> S2[DiarizationStage]
     S2 --> SL[LanguageIdentificationStage]
     SL --> S3[TranscriptionStage]
+    S3 --> S4[AlignmentStage]
     S3 -.-> SN["alignment, analytics, summary"]
     S1 -->|"apply(): processed_path, audio_quality"| DB[(meetings)]
     S2 -->|"apply(): diarization"| DB
     SL -->|"apply(): language_summary"| DB
     S3 -->|"apply(): transcript"| DB
+    S4 -->|"apply(): speaker_transcript"| DB
     ORCH -->|"all stages ok"| DONE[status = completed]
     ORCH -->|"PolymomError"| FAIL["status = failed<br/>error = 'code: message'"]
 ```
@@ -496,6 +501,92 @@ uv run python scripts/eval_asr.py data/ --routed          # WER/CER + LID confus
 | `LID_MIN_WINDOW_SECONDS` | `1.5` | Shorter low-confidence windows inherit the speaker's language |
 | `LID_MAX_WINDOW_SECONDS` | `15` | Longer turns are split for LID |
 
+## Speaker-attributed transcript
+
+`AlignmentStage` (after transcription) combines the transcript's timed words with the diarization turns to produce the system's core output: a **chronological transcript where every word belongs to a speaker**, grouped into readable utterances. The alignment code (`app/services/alignment/`) is pure and deterministic, so the same input always gives the same output.
+
+### How words are assigned
+
+```mermaid
+gantt
+    title Word-to-speaker assignment (seconds)
+    dateFormat X
+    axisFormat %s
+    section Diarization
+    Person 1 turn           :p1, 0, 50
+    Person 2 turn           :p2, 42, 90
+    section Words
+    "so the plan" -> P1     :done, 10, 30
+    "works" (overlap) -> P1 :active, 38, 47
+    "yes agreed" -> P2      :done, 55, 75
+    "ok" (gap) -> P2        :crit, 92, 96
+```
+
+1. **Largest overlap wins.** Each word goes to the turn that overlaps `[word.start, word.end]` the most. Ties go to the earlier turn, then the lower label.
+2. **Overlapping speech.** Other speakers active during the word are kept, and the utterance gets `has_overlap: true` with them listed in `overlapping_speakers`. In the chart, "works" falls where Person 1 and Person 2 overlap; it goes to Person 1, who covers more of it, and Person 2 is listed as overlapping.
+3. **Gaps.** A word overlapping no turn goes to the nearest turn within `ALIGN_MAX_GAP_SECONDS` (1 s), else to `Unknown`.
+4. **No reliable word times.** Segments with no words, or with words that have no confidence (the Odia backend's length-based estimates), are split across the turns they overlap **in proportion to overlap duration**, keeping word order. Those words and utterances are marked `alignment_precision: "segment"`.
+
+### Utterances
+
+- Consecutive words from the same speaker form an utterance.
+- Fragments shorter than `UTTERANCE_MIN_WORDS` merge into the nearest utterance of the same speaker within `ALIGN_MERGE_GAP_SECONDS`.
+- Utterances longer than `UTTERANCE_MAX_SECONDS` (30 s) are split after sentence punctuation: `. ? !` and the danda `।` / `॥` used by Hindi and Odia. If no punctuation appears within 2× that length, they are cut at a word boundary.
+- Text is rebuilt from the words with correct spacing in every script ("है ।" → "है।").
+- Each utterance carries `primary_language`, `languages_present` and `is_code_mixed` from the per-word language tags (Prompt 6), plus `avg_confidence`.
+
+**Labels are never renumbered here.** "Person N" comes straight from diarization. A sanity pass adds `warnings` for speakers who have turns but no words (silent or misdiarized) and for words labelled `Unknown`. `alignment_stats` reports the percentage of words assigned, unknown and segment-level.
+
+### Output formats
+
+`GET /meetings/{id}/transcript?format=...` (speaker view, the default):
+
+| `format` | Sample |
+| --- | --- |
+| `json` | `{"utterances": [{"speaker": "Person 1", "speaker_name": "Ravi", "start": 83.2, "text": "...", "words": [...], "has_overlap": false, ...}], "speakers": [...], "warnings": [...], "alignment_stats": {...}}` |
+| `txt` | `[00:01:23 - 00:01:30] Ravi: आज बजट पर बात करेंगे।` |
+| `srt` | `1` / `00:01:23,200 --> 00:01:30,400` / `Ravi: आज बजट पर बात करेंगे।` |
+| `vtt` | `WEBVTT` … `00:01:23.200 --> 00:01:30.400` / `<v Ravi>आज बजट पर बात करेंगे।` |
+| `md` | `**Ravi** · 00:01:23` then the text; consecutive utterances of one speaker share a block |
+
+The Prompt 5 raw ASR output is still available at `?view=raw` (`json`, `txt`, `srt`).
+
+### Renaming speakers
+
+```bash
+curl -X PATCH .../meetings/{id}/speakers -H 'Content-Type: application/json' \
+     -d '{"names": {"Person 1": "Ravi", "Person 2": "Sunita"}}'
+```
+
+Names are stored separately as display names; the original labels never change. Every format uses the display names (`speaker_name` in JSON, the name in text formats). Unknown labels are rejected with `422`, and `null` clears a name.
+
+### Evaluating diarization and attribution
+
+```bash
+uv run python scripts/eval_diarization.py data/ --collar 0.25
+```
+
+For each `<stem>.rttm` reference, the script reads the system output from `<stem>.json` (a saved `/transcript` response) and reports:
+
+- **DER** (diarization error rate), via `pyannote.metrics`, which needs the `ml` extra.
+- **WDER** (word diarization error rate), when a `<stem>.words.tsv` reference (`start⇥end⇥speaker⇥word`) is present. It is the share of time-matched reference words attributed to the wrong speaker after the best speaker mapping. Because it isolates attribution from recognition errors, it compares fairly across languages.
+
+### Known limitations
+
+- **Odia timing:** Odia words are only as precise as their segment (`alignment_precision: "segment"`), so a speaker change inside one Odia segment is placed by duration, not by what was said.
+- **Overlapping speech:** each overlapped word is given to one speaker. The other voice is recorded in `overlapping_speakers`, but its words are not transcribed separately.
+- **Diarization errors propagate:** a misattributed turn misattributes its words. Alignment cannot fix diarization, but the warnings flag speakers with no words.
+- **Short backchannels:** "hmm" or "yes" inside another person's turn may land in that turn if the ASR word timing is off by more than the backchannel's length.
+
+### Alignment configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ALIGN_MAX_GAP_SECONDS` | `1.0` | Nearest-turn fallback distance before a word is `Unknown` |
+| `ALIGN_MERGE_GAP_SECONDS` | `1.0` | Maximum gap for merging fragments into the same speaker |
+| `UTTERANCE_MAX_SECONDS` | `30` | Split longer utterances at sentence punctuation |
+| `UTTERANCE_MIN_WORDS` | `2` | Utterances with fewer words are merge candidates |
+
 ## Running with Docker
 
 ```bash
@@ -523,12 +614,12 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | 3 | Audio preprocessing ✅ | ffmpeg extract, resample, loudness-normalize, silence/quality analysis, chunking, stage-based pipeline |
 | 4 | Speaker diarization ✅ | pyannote 3.1 stage, consistent Person N labels, overlaps, chunk re-linking |
 | 5 | Multilingual ASR ✅ | Routed ASR: faster-whisper (en/hi) + AI4Bharat IndicConformer (or), NFC native script, hallucination guards, SRT, WER/CER eval |
-| 6 | **Language ID + code-switching** ✅ | Turn-based spoken LID (MMS), smoothing, per-region ASR routing, code-mix tagging, `/languages` |
-| 7 | Speaker + transcript alignment | Word-to-speaker attribution, speaker turns, speaker analytics |
-| 8 | LLM summarization | Provider-agnostic summary, decisions and action items with structured output |
-| 9 | Pipeline orchestration | End-to-end `MoMPipeline`, progress tracking, error handling |
-| 10 | Background workers & persistence | Job queue, durable DB, retries |
-| 11 | Results API & exports | Transcript/summary endpoints, Markdown/PDF/JSON export |
+| 6 | Language ID + code-switching ✅ | Turn-based spoken LID (MMS), smoothing, per-region ASR routing, code-mix tagging, `/languages` |
+| 7 | **Speaker + transcript alignment** ✅ | Word-level speaker attribution, utterances, txt/srt/vtt/md, speaker renaming, DER/WDER eval |
+| 8 | Speaker statistics | Talk time, turns, interruptions, WPM per speaker |
+| 9 | LLM summarization | Provider-agnostic summary, decisions and action items with structured output |
+| 10 | Results API & exports | Transcript/summary endpoints, Markdown/PDF/JSON export |
+| 11 | Background workers & persistence | Job queue, durable DB, retries |
 | 12 | Hardening & deployment | Auth, rate limiting, observability, GPU image, release |
 
 ## License
