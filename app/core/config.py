@@ -21,8 +21,34 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     hf_token: SecretStr | None = None
-    llm_provider: str = "openai"
+
+    # LLM summarization
+    llm_provider: Literal["openai", "azure", "anthropic", "ollama", "mock"] = "openai"
+    llm_model: str | None = Field(
+        default=None, description="Empty = provider default (see DEFAULT_LLM_MODELS)."
+    )
     llm_api_key: SecretStr | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    anthropic_base_url: str = "https://api.anthropic.com"
+    azure_openai_endpoint: str | None = None
+    azure_openai_deployment: str | None = None
+    azure_openai_api_version: str = "2024-10-21"
+    ollama_base_url: str = "http://localhost:11434"
+    llm_temperature: float = Field(default=0.2, ge=0, le=2)
+    llm_max_retries: int = Field(default=2, ge=0, le=10)
+    llm_timeout_seconds: float = Field(default=120.0, gt=0)
+    llm_max_output_tokens: int = Field(default=4096, gt=0)
+    llm_input_cost_per_mtok: float = Field(default=0.0, ge=0, description="USD per 1M tokens.")
+    llm_output_cost_per_mtok: float = Field(default=0.0, ge=0)
+    summary_output_language: Literal["en", "hi", "or"] = "en"
+    summary_single_pass_tokens: int = Field(default=12000, gt=0)
+    summary_chunk_tokens: int = Field(default=6000, gt=0)
+    summary_chunk_overlap_utterances: int = Field(default=2, ge=0)
+    evidence_match_threshold: float = Field(default=80.0, ge=0, le=100)
+    langfuse_enabled: bool = False
+    langfuse_public_key: SecretStr | None = None
+    langfuse_secret_key: SecretStr | None = None
+    langfuse_host: str = "https://cloud.langfuse.com"
 
     storage_dir: Path = Path("./storage")
     database_url: str | None = None
