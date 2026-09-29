@@ -4,6 +4,7 @@ Uploads are streamed to disk in chunks (never fully buffered in memory), checked
 then atomically renamed to ``{stem}.{ext}``. Any failure removes partial files.
 """
 
+import hashlib
 import json
 import re
 import subprocess
@@ -65,6 +66,7 @@ class ValidatedMedia:
     mime_type: str
     size_bytes: int
     metadata: AudioMetadata
+    sha256: str
 
 
 def _is_name_char(char: str) -> bool:
@@ -121,14 +123,16 @@ class MediaValidator:
             )
         return detected
 
-    async def stream_to_disk(self, source: AsyncReadable, dest: Path) -> tuple[int, bytes]:
+    async def stream_to_disk(self, source: AsyncReadable, dest: Path) -> tuple[int, bytes, str]:
         """Copy ``source`` to ``dest`` chunk by chunk, enforcing the size limit.
 
-        Returns the byte count and the leading bytes needed for magic detection.
+        Returns the byte count, the leading bytes needed for magic detection and the
+        SHA-256 hex digest (used to detect duplicate uploads).
         """
         limit = self._settings.max_upload_bytes
         size = 0
         head = bytearray()
+        digest = hashlib.sha256()
         with dest.open("xb") as out:
             while chunk := await source.read(self._settings.upload_chunk_bytes):
                 size += len(chunk)
@@ -139,8 +143,9 @@ class MediaValidator:
                     )
                 if len(head) < MAGIC_HEAD_BYTES:
                     head += chunk[: MAGIC_HEAD_BYTES - len(head)]
+                digest.update(chunk)
                 await run_in_threadpool(out.write, chunk)
-        return size, bytes(head)
+        return size, bytes(head), digest.hexdigest()
 
     async def probe(self, path: Path) -> AudioMetadata:
         """Run ffprobe and return metadata for the first audio stream."""
@@ -213,7 +218,7 @@ class MediaValidator:
         partial = dest_dir / f"{stem}.{ext}.part"
         final = dest_dir / f"{stem}.{ext}"
         try:
-            size, head = await self.stream_to_disk(source, partial)
+            size, head, sha256 = await self.stream_to_disk(source, partial)
             if size == 0:
                 raise EmptyFileError("The uploaded file is empty.")
             mime = self.check_magic(head, ext)
@@ -230,6 +235,7 @@ class MediaValidator:
             mime_type=mime,
             size_bytes=size,
             metadata=metadata,
+            sha256=sha256,
         )
 
 

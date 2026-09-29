@@ -8,12 +8,17 @@ import subprocess
 import wave
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.core.config import Settings
 from app.main import create_app
+
+if TYPE_CHECKING:
+    from app.repositories.artifacts import LocalArtifactStore
+    from app.repositories.unit_of_work import UnitOfWorkFactory
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 requires_ffmpeg = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg/ffprobe not installed")
@@ -181,3 +186,27 @@ def padded_path(media_dir: Path) -> Path:
 def long_3min_path(media_dir: Path) -> Path:
     """3-minute 16 kHz mono tone for chunking tests."""
     return _lavfi(media_dir, "long.wav", "-f", "lavfi", "-i", "sine=f=440:d=180:sample_rate=16000")
+
+
+# --- Persistence fixtures: a migrated SQLite database and a local artifact store ---
+
+
+@pytest.fixture
+async def uow_factory(settings: Settings) -> AsyncIterator["UnitOfWorkFactory"]:
+    from app.db.migrate import upgrade_to_head
+    from app.db.session import create_engine, create_sessionmaker
+    from app.repositories.unit_of_work import unit_of_work_factory
+
+    settings.storage_dir.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(settings.resolved_database_url)
+    await upgrade_to_head(engine)
+    yield unit_of_work_factory(create_sessionmaker(engine))
+    await engine.dispose()
+
+
+@pytest.fixture
+def store(settings: Settings) -> "LocalArtifactStore":
+    from app.repositories.artifacts import LocalArtifactStore
+
+    settings.storage_dir.mkdir(parents=True, exist_ok=True)
+    return LocalArtifactStore(settings.storage_dir)

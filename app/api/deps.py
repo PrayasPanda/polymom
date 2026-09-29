@@ -1,7 +1,6 @@
 """Dependency-injection providers for FastAPI routes."""
 
 from collections.abc import AsyncIterator
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -10,12 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core.config import Settings, get_settings
 from app.pipelines.mom_pipeline import (
     MoMPipeline,
-    RepositoryFactory,
     SummarizationStage,
     SummaryRegenerator,
     build_pipeline,
 )
-from app.repositories.meeting_repository import MeetingRepository, SqlAlchemyMeetingRepository
+from app.repositories.artifacts import ArtifactStore, build_artifact_store
+from app.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory, unit_of_work_factory
 from app.services.asr.router import ASRRouter
 from app.services.asr.service import build_router
 from app.services.audio.validator import MediaValidator
@@ -26,53 +25,49 @@ from app.services.language.service import build_identifier
 from app.services.llm import build_llm_client
 from app.services.llm.base import LLMClient
 from app.services.meeting_service import MeetingService
+from app.services.result_service import ResultService
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
-async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
-    """Yield a session from the sessionmaker created in the app lifespan."""
+def get_uow_factory(request: Request) -> UnitOfWorkFactory:
+    """Short-lived units of work for work that outlives the request (background tasks)."""
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
-    async with sessionmaker() as session:
-        yield session
+    return unit_of_work_factory(sessionmaker)
 
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+UowFactoryDep = Annotated[UnitOfWorkFactory, Depends(get_uow_factory)]
 
 
-def get_meeting_repository(session: SessionDep) -> MeetingRepository:
-    return SqlAlchemyMeetingRepository(session)
+async def get_uow(factory: UowFactoryDep) -> AsyncIterator[UnitOfWork]:
+    async with factory() as uow:
+        yield uow
 
 
-def get_media_validator(settings: SettingsDep) -> MediaValidator:
-    return MediaValidator(settings)
+def get_artifact_store(settings: SettingsDep) -> ArtifactStore:
+    """Chosen by ``ARTIFACT_STORE`` (local files under STORAGE_DIR, or S3/MinIO)."""
+    return build_artifact_store(settings)
+
+
+ArtifactStoreDep = Annotated[ArtifactStore, Depends(get_artifact_store)]
 
 
 def get_meeting_service(
-    repository: Annotated[MeetingRepository, Depends(get_meeting_repository)],
-    validator: Annotated[MediaValidator, Depends(get_media_validator)],
+    uow: Annotated[UnitOfWork, Depends(get_uow)],
     settings: SettingsDep,
+    store: ArtifactStoreDep,
 ) -> MeetingService:
-    return MeetingService(repository, validator, settings)
+    return MeetingService(uow, MediaValidator(settings), settings, store)
 
 
 MeetingServiceDep = Annotated[MeetingService, Depends(get_meeting_service)]
 
 
-def repository_factory(
-    sessionmaker: async_sessionmaker[AsyncSession],
-) -> RepositoryFactory:
-    """Short-lived repositories for work that outlives the request (background tasks)."""
+def get_result_service(meetings: MeetingServiceDep) -> ResultService:
+    return ResultService(meetings)
 
-    @asynccontextmanager
-    async def _factory() -> AsyncIterator[MeetingRepository]:
-        async with sessionmaker() as session:
-            yield SqlAlchemyMeetingRepository(session)
 
-    def _make() -> AbstractAsyncContextManager[MeetingRepository]:
-        return _factory()
-
-    return _make
+ResultServiceDep = Annotated[ResultService, Depends(get_result_service)]
 
 
 def get_diarization_backend(settings: SettingsDep) -> DiarizationBackend:
@@ -99,20 +94,16 @@ LLMClientDep = Annotated[LLMClient, Depends(get_llm_client)]
 
 
 def get_pipeline(
-    request: Request,
     settings: SettingsDep,
+    uow_factory: UowFactoryDep,
+    store: ArtifactStoreDep,
     diarization_backend: Annotated[DiarizationBackend, Depends(get_diarization_backend)],
     asr_router: Annotated[ASRRouter, Depends(get_asr_router)],
     language_identifier: Annotated[LanguageIdentifier, Depends(get_language_identifier)],
     llm: LLMClientDep,
 ) -> MoMPipeline:
     return build_pipeline(
-        settings,
-        repository_factory(request.app.state.sessionmaker),
-        diarization_backend,
-        asr_router,
-        language_identifier,
-        llm,
+        settings, uow_factory, store, diarization_backend, asr_router, language_identifier, llm
     )
 
 
@@ -120,11 +111,9 @@ PipelineDep = Annotated[MoMPipeline, Depends(get_pipeline)]
 
 
 def get_summary_regenerator(
-    request: Request, settings: SettingsDep, llm: LLMClientDep
+    settings: SettingsDep, uow_factory: UowFactoryDep, store: ArtifactStoreDep, llm: LLMClientDep
 ) -> SummaryRegenerator:
-    return SummaryRegenerator(
-        SummarizationStage(settings, llm), repository_factory(request.app.state.sessionmaker)
-    )
+    return SummaryRegenerator(SummarizationStage(settings, llm), uow_factory, store, settings)
 
 
 SummaryRegeneratorDep = Annotated[SummaryRegenerator, Depends(get_summary_regenerator)]

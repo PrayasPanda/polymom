@@ -7,23 +7,25 @@ Stages marked ``optional`` (summarization) may fail without failing the meeting:
 earlier outputs are kept and the status becomes ``completed_with_errors``.
 """
 
+import json
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
-from contextlib import AbstractAsyncContextManager
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, ClassVar
 
 import structlog
+from pydantic import BaseModel
 
 from app.core.config import Settings
 from app.core.exceptions import PolymomError
 from app.core.logging import get_logger
-from app.models.meeting import Meeting
-from app.repositories.meeting_repository import MeetingRepository
+from app.db.base import utcnow
+from app.repositories.artifacts import ArtifactStore, run_key
+from app.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from app.schemas.analytics import ConversationAnalytics
 from app.schemas.asr import ASRResult
 from app.schemas.audio import PreprocessResult
@@ -45,11 +47,10 @@ from app.services.language.service import LanguageIdResult, LanguageIdService
 from app.services.llm import build_llm_client
 from app.services.llm.base import LLMClient
 from app.services.llm.tracing import build_tracer
+from app.services.stage_outputs import load_stage_output
 from app.services.summarization.summarizer import Summarizer
 
 logger = get_logger(__name__)
-
-RepositoryFactory = Callable[[], AbstractAsyncContextManager[MeetingRepository]]
 
 
 @dataclass
@@ -69,8 +70,8 @@ class PipelineContext:
 class PipelineStage(ABC):
     """One step of the pipeline.
 
-    ``run`` does the work and records results on the context; ``apply`` copies
-    whatever should be persisted onto the meeting entity.
+    ``run`` does the work and records results on the context; ``persist`` writes
+    them through the run's :class:`RunWriter` (one unit of work per stage).
     """
 
     name: ClassVar[str]
@@ -80,11 +81,19 @@ class PipelineStage(ABC):
     @abstractmethod
     async def run(self, context: PipelineContext) -> None: ...
 
-    def apply(self, context: PipelineContext, meeting: Meeting) -> None:  # noqa: B027
-        """Persist stage outputs on the meeting. Default: nothing to persist."""
+    def output(self, context: PipelineContext) -> BaseModel | dict[str, Any] | None:
+        """What to store as this stage's result. Default: ``context.outputs[name]``."""
+        value = context.outputs.get(self.name)
+        return value if isinstance(value, BaseModel | dict) else None
 
-    def on_error(self, meeting: Meeting, message: str) -> None:  # noqa: B027
-        """Record an optional stage's failure on the meeting."""
+    def model_version(self, context: PipelineContext) -> str | None:
+        """Model identifier recorded in ``processing_runs.model_versions``."""
+        return None
+
+    async def persist(self, context: PipelineContext, writer: "RunWriter") -> None:
+        await writer.save_stage(
+            self.name, self.output(context), duration_ms=context.timings_ms.get(self.name)
+        )
 
 
 class PreprocessStage(PipelineStage):
@@ -98,10 +107,9 @@ class PreprocessStage(PipelineStage):
         context.processed_path = result.processed_path
         context.outputs[self.name] = result
 
-    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+    def output(self, context: PipelineContext) -> dict[str, Any]:
         result: PreprocessResult = context.outputs[self.name]
-        meeting.processed_path = str(result.processed_path.resolve())
-        meeting.audio_quality = result.model_dump(mode="json", exclude={"processed_path"})
+        return result.model_dump(mode="json", exclude={"processed_path"})
 
 
 class DiarizationStage(PipelineStage):
@@ -119,9 +127,15 @@ class DiarizationStage(PipelineStage):
             context.meeting_id, context.processed_path, num_speakers=context.expected_speakers
         )
 
-    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+    def model_version(self, context: PipelineContext) -> str | None:
         result: DiarizationResult = context.outputs[self.name]
-        meeting.diarization = result.model_dump(mode="json")
+        return result.model_name
+
+    async def persist(self, context: PipelineContext, writer: "RunWriter") -> None:
+        await super().persist(context, writer)
+        result: DiarizationResult = context.outputs[self.name]
+        labels = sorted({t.speaker_label for t in result.turns})
+        await writer.uow.results.upsert_speakers(writer.meeting_id, labels)
 
 
 class LanguageIdentificationStage(PipelineStage):
@@ -147,9 +161,12 @@ class LanguageIdentificationStage(PipelineStage):
             context.languages_hint,
         )
 
-    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+    def output(self, context: PipelineContext) -> LanguageSummary:
         result: LanguageIdResult = context.outputs[self.name]
-        meeting.language_summary = result.summary.model_dump(mode="json")
+        return result.summary
+
+    def model_version(self, context: PipelineContext) -> str | None:
+        return self.output(context).lid_model
 
 
 class TranscriptionStage(PipelineStage):
@@ -182,13 +199,21 @@ class TranscriptionStage(PipelineStage):
             )
         context.outputs[self.name] = result
 
-    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+    def model_version(self, context: PipelineContext) -> str | None:
         result: ASRResult = context.outputs[self.name]
-        meeting.transcript = result.model_dump(mode="json")
-        if meeting.language_summary is not None:
-            summary = LanguageSummary.model_validate(meeting.language_summary)
-            summary.code_mixed_segments = sum(s.is_code_mixed for s in result.segments)
-            meeting.language_summary = summary.model_dump(mode="json")
+        return ",".join(result.model_names) or None
+
+    async def persist(self, context: PipelineContext, writer: "RunWriter") -> None:
+        await super().persist(context, writer)
+        language_id: LanguageIdResult | None = context.outputs.get(LanguageIdentificationStage.name)
+        if language_id is not None:
+            result: ASRResult = context.outputs[self.name]
+            language_id.summary.code_mixed_segments = sum(s.is_code_mixed for s in result.segments)
+            await writer.save_stage(
+                LanguageIdentificationStage.name,
+                language_id.summary,
+                duration_ms=context.timings_ms.get(LanguageIdentificationStage.name),
+            )
 
 
 class AlignmentStage(PipelineStage):
@@ -220,9 +245,13 @@ class AlignmentStage(PipelineStage):
             merge_gap=settings.align_merge_gap_seconds,
         )
 
-    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+    async def persist(self, context: PipelineContext, writer: "RunWriter") -> None:
+        await super().persist(context, writer)
         result: SpeakerTranscript = context.outputs[self.name]
-        meeting.speaker_transcript = result.model_dump(mode="json")
+        uow = writer.uow
+        await uow.results.replace_utterances(writer.meeting_id, writer.run_id, result.utterances)
+        await uow.search.index_utterances(writer.meeting_id, writer.run_id, result.utterances)
+        await uow.results.upsert_speakers(writer.meeting_id, result.speakers)
 
 
 class AnalyticsStage(PipelineStage):
@@ -250,9 +279,11 @@ class AnalyticsStage(PipelineStage):
             gini_dominated_min=settings.gini_dominated_min,
         )
 
-    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+    async def persist(self, context: PipelineContext, writer: "RunWriter") -> None:
+        await super().persist(context, writer)
         result: ConversationAnalytics = context.outputs[self.name]
-        meeting.analytics = result.model_dump(mode="json")
+        stats = {s.speaker: s.model_dump(mode="json") for s in result.speakers}
+        await writer.uow.results.upsert_speakers(writer.meeting_id, list(stats), stats)
 
 
 class SummarizationStage(PipelineStage):
@@ -296,14 +327,21 @@ class SummarizationStage(PipelineStage):
             meeting_date=context.meeting_date,
         )
 
-    def apply(self, context: PipelineContext, meeting: Meeting) -> None:
+    def model_version(self, context: PipelineContext) -> str | None:
         result: MeetingSummary = context.outputs[self.name]
-        meeting.summary = result.model_dump(mode="json")
-        meeting.summary_error = None
+        return f"{result.model_info.provider}/{result.model_info.model}"
 
-    def on_error(self, meeting: Meeting, message: str) -> None:
-        meeting.summary = None
-        meeting.summary_error = message
+    async def persist(self, context: PipelineContext, writer: "RunWriter") -> None:
+        await save_summary(writer, context.outputs[self.name], context.timings_ms.get(self.name))
+
+
+async def save_summary(
+    writer: "RunWriter", summary: MeetingSummary, duration_ms: int | None
+) -> None:
+    """Summaries live in their own table; the stage row only records status and timing."""
+    await writer.save_stage(SummarizationStage.name, None, duration_ms=duration_ms)
+    await writer.uow.results.add_summary(writer.meeting_id, writer.run_id, summary)
+    await writer.uow.search.index_summary(writer.meeting_id, writer.run_id, summary)
 
 
 def _error_message(exc: Exception, stage: str) -> str:
@@ -312,93 +350,231 @@ def _error_message(exc: Exception, stage: str) -> str:
     return f"internal_error: Unexpected failure in stage '{stage}'."
 
 
-class MoMPipeline:
-    """Runs stages in order and owns the meeting status lifecycle.
+def config_snapshot(settings: Settings) -> dict[str, Any]:
+    """Every setting, secrets masked (SecretStr dumps as ``**********``)."""
+    return settings.model_dump(mode="json")
 
-    ``processing`` -> ``completed`` on success, or ``failed`` with
-    ``"<error code>: <message>"`` when a stage raises.
+
+@dataclass
+class RunWriter:
+    """Writes one run's stage results through a unit of work.
+
+    Outputs larger than ``STAGE_OUTPUT_INLINE_MAX_BYTES`` are stored as artifacts
+    (``meetings/{id}/{run_id}/stages/{stage}.json``) and referenced by key.
     """
 
-    def __init__(self, stages: Sequence[PipelineStage], repositories: RepositoryFactory) -> None:
+    uow: UnitOfWork
+    store: ArtifactStore
+    meeting_id: uuid.UUID
+    run_id: uuid.UUID
+    inline_max_bytes: int
+
+    async def save_stage(
+        self,
+        name: str,
+        output: BaseModel | dict[str, Any] | None,
+        *,
+        status: str = "completed",
+        duration_ms: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        data = output.model_dump(mode="json") if isinstance(output, BaseModel) else output
+        ref = None
+        if data is not None:
+            raw = json.dumps(data, ensure_ascii=False).encode()
+            if len(raw) > self.inline_max_bytes:
+                ref = run_key(self.meeting_id, self.run_id, f"stages/{name}.json")
+                await self.store.put(ref, raw, "application/json")
+                data = None
+        await self.uow.results.save_stage(
+            self.run_id,
+            name,
+            status=status,
+            output=data,
+            output_ref=ref,
+            duration_ms=duration_ms,
+            error=error,
+        )
+
+
+class MoMPipeline:
+    """Runs stages in order, records a :class:`ProcessingRun`, owns the status lifecycle.
+
+    ``processing`` -> ``completed`` / ``completed_with_errors`` (an optional stage
+    failed) / ``failed`` with ``"<error code>: <message>"``. Each stage's results are
+    committed as soon as it finishes, so a later failure never discards them.
+    """
+
+    def __init__(
+        self,
+        stages: Sequence[PipelineStage],
+        uow_factory: UnitOfWorkFactory,
+        store: ArtifactStore,
+        settings: Settings,
+    ) -> None:
         if not stages:
             raise ValueError("a pipeline needs at least one stage")
         self.stages = list(stages)
-        self._repositories = repositories
+        self._uow = uow_factory
+        self._store = store
+        self._settings = settings
+
+    def _writer(self, uow: UnitOfWork, meeting_id: uuid.UUID, run_id: uuid.UUID) -> RunWriter:
+        return RunWriter(
+            uow, self._store, meeting_id, run_id, self._settings.stage_output_inline_max_bytes
+        )
 
     async def run(self, meeting_id: uuid.UUID) -> MeetingStatus | None:
         """Process one meeting. Never raises for stage failures; returns the final status."""
         with structlog.contextvars.bound_contextvars(meeting_id=str(meeting_id)):
-            async with self._repositories() as repo:
-                meeting = await repo.get(meeting_id)
+            async with self._uow() as uow:
+                meeting = await uow.meetings.get(meeting_id)
                 if meeting is None:
                     logger.warning("pipeline_meeting_missing")
                     return None
                 meeting.status = MeetingStatus.PROCESSING
                 meeting.error = None
-                meeting = await repo.save(meeting)
+                run = await uow.results.create_run(meeting_id, config_snapshot(self._settings))
+                run_id, upload_key = run.id, meeting.upload_key
+                context = PipelineContext(
+                    meeting_id=meeting_id,
+                    input_path=Path(),
+                    expected_speakers=meeting.expected_speakers,
+                    languages_hint=list(meeting.languages_hint or []),
+                    meeting_date=meeting.created_at.date() if meeting.created_at else None,
+                )
+                await uow.commit()
 
-            context = PipelineContext(
-                meeting_id=meeting_id,
-                input_path=Path(meeting.stored_path),
-                expected_speakers=meeting.expected_speakers,
-                languages_hint=list(meeting.languages_hint or []),
-                meeting_date=meeting.created_at.date() if meeting.created_at else None,
-            )
-            logger.info("pipeline_started", stages=[s.name for s in self.stages])
-            started = time.perf_counter()
-            current = self.stages[0].name
-            errors: list[str] = []
-            try:
+            with structlog.contextvars.bound_contextvars(run_id=str(run_id)):
+                status, error, versions = await self._run_stages(context, upload_key, run_id)
+                processed_key = await self._store_processed_audio(context, run_id)
+                await self._finish(context, run_id, status, error, versions, processed_key)
+            return status
+
+    async def _run_stages(
+        self, context: PipelineContext, upload_key: str, run_id: uuid.UUID
+    ) -> tuple[MeetingStatus, str | None, dict[str, str]]:
+        logger.info("pipeline_started", stages=[s.name for s in self.stages])
+        errors: list[str] = []
+        versions: dict[str, str] = {}
+        current = self.stages[0].name
+        try:
+            async with self._store.local_path(upload_key) as input_path:
+                context.input_path = input_path
                 for stage in self.stages:
                     current = stage.name
-                    stage_started = time.perf_counter()
+                    started = time.perf_counter()
                     try:
                         await stage.run(context)
                     except Exception as exc:
+                        message = _error_message(exc, stage.name)
+                        await self._save_failed_stage(context, run_id, stage.name, message)
                         if not stage.optional:
                             raise
-                        message = _error_message(exc, stage.name)
                         errors.append(f"{stage.name}: {message}")
-                        stage.on_error(meeting, message)
                         logger.warning("optional_stage_failed", stage=stage.name, error=message)
                         continue
-                    elapsed = int((time.perf_counter() - stage_started) * 1000)
-                    context.timings_ms[stage.name] = elapsed
-                    logger.info("stage_completed", stage=stage.name, duration_ms=elapsed)
-                    stage.apply(context, meeting)
-                meeting.status = (
-                    MeetingStatus.COMPLETED_WITH_ERRORS if errors else MeetingStatus.COMPLETED
-                )
-                meeting.error = "; ".join(errors) or None
-            except PolymomError as exc:
-                meeting.status = MeetingStatus.FAILED
-                meeting.error = f"{exc.code}: {exc.message}"
-                logger.warning("stage_failed", stage=current, code=exc.code, error=exc.message)
-            except Exception:
-                meeting.status = MeetingStatus.FAILED
-                meeting.error = f"internal_error: Unexpected failure in stage '{current}'."
-                logger.exception("stage_crashed", stage=current)
-
-            async with self._repositories() as repo:
-                await repo.save(meeting)
-            logger.info(
-                "pipeline_finished",
-                status=meeting.status.value,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                timings_ms=context.timings_ms,
+                    context.timings_ms[stage.name] = int((time.perf_counter() - started) * 1000)
+                    async with self._uow() as uow:
+                        await stage.persist(context, self._writer(uow, context.meeting_id, run_id))
+                        await uow.commit()
+                    if version := stage.model_version(context):
+                        versions[stage.name] = version
+                    logger.info(
+                        "stage_completed",
+                        stage=stage.name,
+                        duration_ms=context.timings_ms[stage.name],
+                    )
+        except FileNotFoundError:
+            logger.warning("upload_missing", key=upload_key)
+            return (
+                MeetingStatus.FAILED,
+                "upload_missing: The uploaded file is no longer stored.",
+                versions,
             )
-            return meeting.status
+        except PolymomError as exc:
+            logger.warning("stage_failed", stage=current, code=exc.code, error=exc.message)
+            return MeetingStatus.FAILED, f"{exc.code}: {exc.message}", versions
+        except Exception:
+            logger.exception("stage_crashed", stage=current)
+            return (
+                MeetingStatus.FAILED,
+                f"internal_error: Unexpected failure in stage '{current}'.",
+                versions,
+            )
+        status = MeetingStatus.COMPLETED_WITH_ERRORS if errors else MeetingStatus.COMPLETED
+        return status, "; ".join(errors) or None, versions
+
+    async def _save_failed_stage(
+        self, context: PipelineContext, run_id: uuid.UUID, stage: str, message: str
+    ) -> None:
+        try:
+            async with self._uow() as uow:
+                writer = self._writer(uow, context.meeting_id, run_id)
+                await writer.save_stage(stage, None, status="failed", error=message)
+                await uow.commit()
+        except Exception:  # pragma: no cover - never mask the stage error
+            logger.exception("stage_failure_not_recorded", stage=stage)
+
+    async def _store_processed_audio(
+        self, context: PipelineContext, run_id: uuid.UUID
+    ) -> str | None:
+        path = context.processed_path
+        if path is None or not path.is_file():
+            return None
+        key = run_key(context.meeting_id, run_id, "processed.wav")
+        try:
+            await self._store.put_file(key, path, "audio/wav")
+        except Exception:  # pragma: no cover - results matter more than the audio copy
+            logger.exception("processed_audio_upload_failed")
+            return None
+        path.unlink(missing_ok=True)
+        return key
+
+    async def _finish(
+        self,
+        context: PipelineContext,
+        run_id: uuid.UUID,
+        status: MeetingStatus,
+        error: str | None,
+        versions: dict[str, str],
+        processed_key: str | None,
+    ) -> None:
+        async with self._uow() as uow:
+            meeting = await uow.meetings.get(context.meeting_id)
+            run = await uow.results.get_run(context.meeting_id, run_id)
+            if meeting is None or run is None:  # deleted while processing
+                return
+            meeting.status = status
+            meeting.error = error
+            if processed_key:
+                meeting.processed_key = processed_key
+            transcript: SpeakerTranscript | None = context.outputs.get(AlignmentStage.name)
+            if status != MeetingStatus.FAILED and transcript is not None:
+                langs = sorted(
+                    {lang for u in transcript.utterances for lang in u.languages_present}
+                )
+                meeting.detected_languages = f",{','.join(langs)}," if langs else None
+                meeting.num_speakers = len(transcript.speakers) or None
+            run.status = status.value
+            run.error = error
+            run.finished_at = utcnow()
+            run.timings_ms = dict(context.timings_ms)
+            run.model_versions = versions
+            await uow.commit()
+        logger.info("pipeline_finished", status=status.value, timings_ms=context.timings_ms)
 
 
 def build_pipeline(
     settings: Settings,
-    repositories: RepositoryFactory,
+    uow_factory: UnitOfWorkFactory,
+    store: ArtifactStore,
     diarization_backend: DiarizationBackend,
     asr_router: ASRRouter,
     language_identifier: LanguageIdentifier | None = None,
     llm: LLMClient | None = None,
 ) -> MoMPipeline:
-    """Default stage registry. Later prompts append alignment, analytics, ..."""
+    """Default stage registry."""
     stages: list[PipelineStage] = [
         PreprocessStage(AudioPreprocessor(settings)),
         DiarizationStage(DiarizationService(diarization_backend, settings)),
@@ -409,50 +585,89 @@ def build_pipeline(
     stages.append(AlignmentStage(settings))
     stages.append(AnalyticsStage(settings))
     stages.append(SummarizationStage(settings, llm))
-    return MoMPipeline(stages, repositories)
+    return MoMPipeline(stages, uow_factory, store, settings)
 
 
 class SummaryRegenerator:
-    """Re-runs only the summarization stage for a processed meeting (background task)."""
+    """Re-runs only summarization on the latest successful run (background task).
 
-    def __init__(self, stage: SummarizationStage, repositories: RepositoryFactory) -> None:
+    The new summary is added to that run (older ones stay in ``summaries``) and the
+    run's cached exports are invalidated.
+    """
+
+    def __init__(
+        self,
+        stage: SummarizationStage,
+        uow_factory: UnitOfWorkFactory,
+        store: ArtifactStore,
+        settings: Settings,
+    ) -> None:
         self._stage = stage
-        self._repositories = repositories
+        self._uow = uow_factory
+        self._store = store
+        self._settings = settings
 
     async def run(
         self, meeting_id: uuid.UUID, *, output_language: str | None, model: str | None
     ) -> None:
         with structlog.contextvars.bound_contextvars(meeting_id=str(meeting_id)):
-            async with self._repositories() as repo:
-                meeting = await repo.get(meeting_id)
-            if meeting is None or meeting.speaker_transcript is None:
-                logger.warning("summary_regenerate_skipped")
-                return
+            async with self._uow() as uow:
+                meeting = await uow.meetings.get(meeting_id)
+                run = await uow.results.latest_run(meeting_id) if meeting else None
+                raw = (
+                    await load_stage_output(uow.results, self._store, run.id, AlignmentStage.name)
+                    if run
+                    else None
+                )
+                if meeting is None or run is None or raw is None:
+                    logger.warning("summary_regenerate_skipped")
+                    return
+                analytics_raw = await load_stage_output(
+                    uow.results, self._store, run.id, AnalyticsStage.name
+                )
+                run_id = run.id
+                meeting_date = meeting.created_at.date() if meeting.created_at else None
+            started = time.perf_counter()
             try:
                 summary = await self._stage.summarize(
                     meeting_id,
-                    SpeakerTranscript.model_validate(meeting.speaker_transcript),
-                    ConversationAnalytics.model_validate(meeting.analytics)
-                    if meeting.analytics
-                    else None,
-                    meeting_date=meeting.created_at.date() if meeting.created_at else None,
+                    SpeakerTranscript.model_validate(raw),
+                    ConversationAnalytics.model_validate(analytics_raw) if analytics_raw else None,
+                    meeting_date=meeting_date,
                     output_language=output_language,
                     model=model,
                 )
             except Exception as exc:
                 message = _error_message(exc, SummarizationStage.name)
-                self._stage.on_error(meeting, message)
-                meeting.status = MeetingStatus.COMPLETED_WITH_ERRORS
-                meeting.error = f"{SummarizationStage.name}: {message}"
                 logger.warning("summary_regenerate_failed", error=message)
-            else:
-                meeting.summary = summary.model_dump(mode="json")
-                meeting.summary_error = None
-                if meeting.status == MeetingStatus.COMPLETED_WITH_ERRORS and (
-                    meeting.error or ""
-                ).startswith(f"{SummarizationStage.name}:"):
+                async with self._uow() as uow:
+                    writer = RunWriter(uow, self._store, meeting_id, run_id, 0)
+                    await writer.save_stage(
+                        SummarizationStage.name, None, status="failed", error=message
+                    )
+                    meeting = await uow.meetings.get(meeting_id)
+                    if meeting is not None:
+                        meeting.status = MeetingStatus.COMPLETED_WITH_ERRORS
+                        meeting.error = f"{SummarizationStage.name}: {message}"
+                    await uow.commit()
+                return
+            async with self._uow() as uow:
+                writer = RunWriter(
+                    uow,
+                    self._store,
+                    meeting_id,
+                    run_id,
+                    self._settings.stage_output_inline_max_bytes,
+                )
+                await save_summary(writer, summary, int((time.perf_counter() - started) * 1000))
+                meeting = await uow.meetings.get(meeting_id)
+                if (
+                    meeting is not None
+                    and meeting.status == MeetingStatus.COMPLETED_WITH_ERRORS
+                    and (meeting.error or "").startswith(f"{SummarizationStage.name}:")
+                ):
                     meeting.status = MeetingStatus.COMPLETED
                     meeting.error = None
-                logger.info("summary_regenerated")
-            async with self._repositories() as repo:
-                await repo.save(meeting)
+                await uow.commit()
+            await self._store.delete_prefix(run_key(meeting_id, run_id, "exports/"))
+            logger.info("summary_regenerated")

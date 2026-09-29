@@ -37,7 +37,9 @@ async def test_process_completes_and_populates_audio_quality(
     assert quality["duration_seconds"] > 2.9
     assert quality["warnings"] == []
     assert "processed_path" not in quality
-    assert (settings.processed_dir / f"{meeting_id}.wav").exists()
+    run_id = (await client.get(f"{URL}/{meeting_id}/runs")).json()["items"][0]["run_id"]
+    assert (settings.storage_dir / "meetings" / meeting_id / run_id / "processed.wav").exists()
+    assert not (settings.processed_dir / f"{meeting_id}.wav").exists()  # work copy removed
 
 
 async def test_process_rejects_completed_unless_forced(
@@ -95,7 +97,8 @@ async def test_delete_removes_processed_file(
 ) -> None:
     meeting_id = await _upload(client, stereo_44k_path)
     await client.post(f"{URL}/{meeting_id}/process")
-    processed = settings.processed_dir / f"{meeting_id}.wav"
+    run_id = (await client.get(f"{URL}/{meeting_id}/runs")).json()["items"][0]["run_id"]
+    processed = settings.storage_dir / "meetings" / meeting_id / run_id / "processed.wav"
     assert processed.exists()
 
     assert (await client.delete(f"{URL}/{meeting_id}")).status_code == 204
