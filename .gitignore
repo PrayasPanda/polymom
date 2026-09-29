@@ -47,3 +47,6 @@ hf_cache/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Hypothesis example database
+.hypothesis/

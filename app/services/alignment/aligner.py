@@ -91,7 +91,10 @@ def split_segment(
         parts = [(segment.start, segment.end, speaker)]
 
     total = sum(end - start for start, end, _ in parts)
-    exact = [len(tokens) * (end - start) / total for start, end, _ in parts]
+    if total > 0:
+        exact = [len(tokens) * (end - start) / total for start, end, _ in parts]
+    else:  # zero-length segment: everything goes to its only speaker
+        exact = [float(len(tokens))] + [0.0] * (len(parts) - 1)
     counts = [int(x) for x in exact]
     for i in sorted(range(len(parts)), key=lambda i: (-(exact[i] - counts[i]), i))[
         : len(tokens) - sum(counts)
@@ -103,6 +106,8 @@ def split_segment(
     for (start, end, speaker), count in zip(parts, counts, strict=True):
         chunk = tokens[cursor : cursor + count]
         timed = approximate_words(" ".join(chunk), start, end)
+        if len(timed) != len(chunk):  # zero-length span: keep every word, untimed
+            timed = [Word(text=t, start=start, end=end) for t in chunk]
         for i, estimate in enumerate(timed):
             original = segment.words[cursor + i] if segment.words else None
             base = (

@@ -50,7 +50,7 @@ def ends_sentence(word: AlignedWord) -> bool:
 
 def group_by_speaker(words: Sequence[AlignedWord]) -> list[list[AlignedWord]]:
     groups: list[list[AlignedWord]] = []
-    for w in sorted(words, key=lambda w: (w.start, w.end)):
+    for w in sorted(words, key=lambda w: (w.start, w.end, w.speaker)):
         if groups and groups[-1][-1].speaker == w.speaker:
             groups[-1].append(w)
         else:
@@ -129,9 +129,27 @@ def build_utterances(
     words: Sequence[AlignedWord], *, max_seconds: float, min_words: int, merge_gap: float
 ) -> list[Utterance]:
     groups = merge_fragments(group_by_speaker(words), min_words, merge_gap)
-    parts = [part for g in groups for part in split_long(g, max_seconds)]
-    parts.sort(key=lambda p: (p[0].start, p[0].speaker))
-    return [to_utterance(p, i) for i, p in enumerate(parts)]
+    parts = merge_same_speaker_overlaps([p for g in groups for p in split_long(g, max_seconds)])
+    # Order on the rounded values the API exposes, ties broken by speaker.
+    built = sorted((to_utterance(p, 0) for p in parts), key=lambda u: (u.start, u.speaker))
+    return [u.model_copy(update={"id": i}) for i, u in enumerate(built)]
+
+
+def merge_same_speaker_overlaps(parts: list[list[AlignedWord]]) -> list[list[AlignedWord]]:
+    """Join same-speaker parts whose time spans overlap (only happens when one
+    speaker's words overlap in time), so a speaker's utterances never overlap."""
+    last: dict[str, list[AlignedWord]] = {}
+    merged: list[list[AlignedWord]] = []
+    for part in sorted(parts, key=lambda p: (p[0].start, p[0].speaker)):
+        speaker = part[0].speaker
+        prev = last.get(speaker)
+        if prev is not None and part[0].start < max(w.end for w in prev):
+            prev.extend(part)
+            prev.sort(key=lambda w: (w.start, w.end))
+        else:
+            merged.append(part)
+            last[speaker] = part
+    return sorted(merged, key=lambda p: (p[0].start, p[0].speaker))
 
 
 def build_transcript(
