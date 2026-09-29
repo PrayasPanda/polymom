@@ -45,6 +45,9 @@ class MeetingCreateResponse(BaseModel):
     meeting_id: UUID
     status: MeetingStatus
     created_at: datetime
+    duplicate: bool = Field(
+        default=False, description="True when an identical file was already uploaded."
+    )
 
 
 class MeetingRead(BaseModel):
@@ -90,6 +93,12 @@ class MeetingRead(BaseModel):
     )
     languages_hint: list[Language]
     expected_speakers: int | None
+    detected_languages: list[str] = Field(
+        default_factory=list, description="Spoken languages found by the latest run."
+    )
+    num_speakers: int | None = None
+    sha256: str | None = Field(default=None, description="SHA-256 of the uploaded file.")
+    raw_audio_purged_at: datetime | None = None
     status: MeetingStatus
     error: str | None
     created_at: datetime
@@ -98,9 +107,11 @@ class MeetingRead(BaseModel):
 
 class MeetingList(BaseModel):
     items: list[MeetingRead]
-    total: int = Field(description="Total number of meetings, ignoring pagination.")
+    total: int = Field(description="Meetings matching the filters, ignoring pagination.")
     limit: int
-    offset: int
+    next_cursor: str | None = Field(
+        default=None, description="Pass as ?cursor= for the next page; null on the last page."
+    )
 
 
 class ProcessResponse(BaseModel):

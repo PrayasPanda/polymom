@@ -54,6 +54,23 @@ class Settings(BaseSettings):
     database_url: str | None = None
     auto_migrate: bool = True
 
+    # Artifact storage (uploads, processed audio, charts, exports)
+    artifact_store: Literal["local", "s3"] = "local"
+    s3_bucket: str = "polymom"
+    s3_endpoint_url: str | None = Field(default=None, description="Set for MinIO.")
+    s3_access_key: SecretStr | None = None
+    s3_secret_key: SecretStr | None = None
+    s3_region: str | None = None
+    stage_output_inline_max_bytes: int = Field(
+        default=512 * 1024, gt=0, description="Larger stage outputs go to the artifact store."
+    )
+
+    # Retention (scripts/cleanup.py)
+    retention_days: int = Field(default=90, ge=0, description="0 disables raw-audio purging.")
+    keep_raw_audio: bool = Field(
+        default=False, description="true keeps uploads and processed audio forever."
+    )
+
     max_upload_mb: int = Field(default=200, gt=0)
     upload_chunk_bytes: int = Field(default=1024 * 1024, gt=0)
     allowed_extensions: Annotated[frozenset[str], NoDecode] = frozenset(

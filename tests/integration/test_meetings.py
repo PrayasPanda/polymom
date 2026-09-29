@@ -31,8 +31,9 @@ async def test_upload_returns_202_and_stores_file(
     assert result["status"] == 202
     body = result["json"]
     assert body["status"] == "queued"
-    assert set(body) == {"meeting_id", "status", "created_at"}
-    stored = settings.uploads_dir / f"{body['meeting_id']}.wav"
+    assert set(body) == {"meeting_id", "status", "created_at", "duplicate"}
+    assert body["duplicate"] is False
+    stored = settings.storage_dir / "meetings" / body["meeting_id"] / "upload" / "original.wav"
     assert stored.read_bytes() == wav_bytes
 
 
@@ -57,22 +58,26 @@ async def test_get_meeting_returns_metadata(client: AsyncClient, wav_bytes: byte
 
 
 async def test_list_is_paginated_newest_first(client: AsyncClient, wav_bytes: bytes) -> None:
-    ids = [(await upload(client, wav_bytes, title=f"m{i}"))["json"]["meeting_id"] for i in range(3)]
+    ids = [
+        (await upload(client, wav_bytes + bytes(i), title=f"m{i}"))["json"]["meeting_id"]
+        for i in range(3)
+    ]
 
     first = (await client.get(URL, params={"limit": 2})).json()
-    second = (await client.get(URL, params={"limit": 2, "offset": 2})).json()
+    second = (await client.get(URL, params={"limit": 2, "cursor": first["next_cursor"]})).json()
 
     assert first["total"] == 3
     assert [m["meeting_id"] for m in first["items"]] == ids[::-1][:2]
     assert [m["meeting_id"] for m in second["items"]] == ids[:1]
-    assert (first["limit"], first["offset"]) == (2, 0)
+    assert first["limit"] == 2
+    assert second["next_cursor"] is None
 
 
 async def test_delete_removes_record_and_file(
     client: AsyncClient, settings: Settings, wav_bytes: bytes
 ) -> None:
     meeting_id = (await upload(client, wav_bytes))["json"]["meeting_id"]
-    stored = settings.uploads_dir / f"{meeting_id}.wav"
+    stored = settings.storage_dir / "meetings" / meeting_id / "upload" / "original.wav"
     assert stored.exists()
 
     response = await client.delete(f"{URL}/{meeting_id}")
@@ -112,7 +117,8 @@ async def test_fake_extension_returns_415_and_leaves_no_files(
 
     assert result["status"] == 415
     assert result["json"]["error"]["code"] == "unsupported_file_type"
-    assert not any(settings.uploads_dir.iterdir())
+    assert not any((settings.storage_dir / "tmp").iterdir())
+    assert not (settings.storage_dir / "meetings").exists()
     assert (await client.get(URL)).json()["total"] == 0
 
 
@@ -177,7 +183,8 @@ async def test_oversized_upload_returns_413(
 
         assert result["status"] == 413
         assert result["json"]["error"]["code"] == "file_too_large"
-        assert not any(settings.uploads_dir.iterdir())
+        assert not any((settings.storage_dir / "tmp").glob("*"))
+        assert not (settings.storage_dir / "meetings").exists()
 
 
 async def test_openapi_documents_error_responses(client: AsyncClient) -> None:

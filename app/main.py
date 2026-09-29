@@ -25,7 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+        settings.storage_dir.mkdir(parents=True, exist_ok=True)
         engine = create_engine(settings.resolved_database_url)
         if settings.auto_migrate:
             await upgrade_to_head(engine)

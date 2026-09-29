@@ -19,6 +19,9 @@ dependencies = [
     "jinja2>=3.1.6",
     "rapidfuzz>=3.14.6",
     "httpx>=0.28.1",
+    "python-docx>=1.2.0",
+    "fpdf2>=2.8",
+    "uharfbuzz>=0.56.2",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +46,12 @@ indic = [
 viz = ["matplotlib>=3.8"]
 # Langfuse tracing of LLM calls (LANGFUSE_ENABLED=true): `uv sync --extra tracing`.
 tracing = ["langfuse>=2,<3"]
+s3 = [
+    "boto3>=1.43.104",
+]
+postgres = [
+    "asyncpg>=0.31.0",
+]
 
 [dependency-groups]
 dev = [
@@ -56,6 +65,11 @@ dev = [
     "jiwer>=3.0",
     "hypothesis>=6.100",
     "matplotlib>=3.8",
+    "moto[s3]>=5.2.3",
+    "testcontainers[postgres]>=4.15.0",
+    "asyncpg>=0.31.0",
+    "boto3>=1.43.104",
+    "pypdf>=6.19.0",
 ]
 
 [build-system]
@@ -100,10 +114,11 @@ addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow'"
 markers = [
     "slow: needs real models / HF_TOKEN; run with `make test-slow`",
     "llm: calls a real LLM provider; skipped without LLM_API_KEY",
+    "postgres: runs against Postgres in Docker (testcontainers); skipped without Docker",
 ]
 
 [[tool.mypy.overrides]]
-module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "jiwer", "jiwer.*", "matplotlib", "matplotlib.*", "langfuse", "langfuse.*"]
+module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "jiwer", "jiwer.*", "matplotlib", "matplotlib.*", "langfuse", "langfuse.*", "boto3", "boto3.*", "botocore.*", "moto", "moto.*", "testcontainers.*", "docx", "docx.*", "fpdf", "fpdf.*", "pypdf"]
 ignore_missing_imports = true
 
 [tool.coverage.run]
