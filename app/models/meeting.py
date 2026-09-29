@@ -30,6 +30,7 @@ class Meeting(Base):
     transcript: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     language_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     speaker_transcript: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    analytics: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     speaker_names: Mapped[dict[str, str] | None] = mapped_column(JSON)
     languages_hint: Mapped[list[str]] = mapped_column(JSON, default=list)
     expected_speakers: Mapped[int | None] = mapped_column(Integer)

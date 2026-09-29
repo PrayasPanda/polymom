@@ -93,6 +93,12 @@ class Settings(BaseSettings):
     utterance_max_seconds: float = Field(default=30.0, gt=0)
     utterance_min_words: int = Field(default=2, ge=1)
 
+    # Speaker analytics
+    interruption_min_overlap_seconds: float = Field(default=0.5, ge=0)
+    bucket_seconds: float = Field(default=60.0, gt=0)
+    gini_balanced_max: float = Field(default=0.2, ge=0, le=1)
+    gini_dominated_min: float = Field(default=0.4, ge=0, le=1)
+
     @field_validator("allowed_extensions", mode="before")
     @classmethod
     def _split_extensions(cls, value: object) -> object:

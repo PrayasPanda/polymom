@@ -168,6 +168,19 @@ class DiarizationNotAvailableError(ConflictError):
     code = "diarization_not_available"
 
 
+class AnalyticsNotAvailableError(ConflictError):
+    """Analytics were requested before the analytics stage ran."""
+
+    code = "analytics_not_available"
+
+
+class ChartsUnavailableError(PolymomError):
+    """Charts need the optional ``viz`` extra (matplotlib)."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    code = "charts_unavailable"
+
+
 def error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": jsonable_encoder(details)}}
 

@@ -1,14 +1,16 @@
-"""Meeting endpoints: upload, fetch, list, delete, process, speakers, transcript."""
+"""Meeting endpoints: upload, fetch, list, delete, process, speakers, transcript, analytics."""
 
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Response, UploadFile, status
 from fastapi.responses import PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import MeetingServiceDep, PipelineDep
 from app.core.exceptions import ValidationError
 from app.models.meeting import Meeting
+from app.schemas.analytics import ConversationAnalyticsResponse
 from app.schemas.asr import TranscriptResponse
 from app.schemas.audio import AudioQuality
 from app.schemas.diarization import SpeakersResponse
@@ -27,6 +29,8 @@ from app.schemas.transcript import (
     SpeakerRenameRequest,
     SpeakerTranscriptResponse,
 )
+from app.services.analytics.charts import ChartName, render_chart
+from app.services.analytics.export import speakers_to_csv
 from app.utils.subtitles import (
     to_srt,
     to_text,
@@ -346,3 +350,78 @@ async def rename_speakers(
     """Map "Person N" labels to names. Labels themselves never change; ``null`` clears a name."""
     names = await service.rename_speakers(meeting_id, body.names)
     return SpeakerNamesResponse(meeting_id=meeting_id, speaker_names=names)
+
+
+_ANALYTICS_NOT_AVAILABLE = error_example(
+    409,
+    "analytics_not_available",
+    "Analytics are not available yet.",
+    "The meeting has not been processed yet",
+)
+
+
+@router.get(
+    "/{meeting_id}/analytics",
+    response_model=ConversationAnalyticsResponse,
+    summary="Speaker-wise conversation statistics and meeting analytics (json, csv)",
+    responses={
+        200: {
+            "content": {
+                "text/csv": {
+                    "example": "speaker,display_name,speaking_time_seconds,...\n"
+                    "Person 1,Ravi,812.3,...\n"
+                }
+            }
+        },
+        **_NOT_FOUND,
+        **_ANALYTICS_NOT_AVAILABLE,
+    },
+)
+async def get_analytics(
+    meeting_id: UUID,
+    service: MeetingServiceDep,
+    format: Annotated[
+        Literal["json", "csv"], Query(description="csv: the per-speaker table.")
+    ] = "json",
+) -> ConversationAnalyticsResponse | Response:
+    """Speaking time, turns, interruptions, WPM, languages and more, per speaker and overall.
+
+    Speaking time comes from diarization turns; overlapping speech counts for every
+    overlapping speaker and is reported separately in ``meeting_stats``.
+    """
+    analytics, names = await service.get_analytics(meeting_id)
+    if format == "csv":
+        return Response(
+            speakers_to_csv(analytics),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{meeting_id}-speakers.csv"'},
+        )
+    return ConversationAnalyticsResponse(
+        meeting_id=meeting_id, speaker_names=names, **analytics.model_dump()
+    )
+
+
+@router.get(
+    "/{meeting_id}/analytics/charts/{chart_name}",
+    response_class=Response,
+    summary="Analytics chart as PNG (speaking-time, timeline)",
+    responses={
+        200: {"content": {"image/png": {}}},
+        **_NOT_FOUND,
+        **_ANALYTICS_NOT_AVAILABLE,
+        **error_example(
+            503,
+            "charts_unavailable",
+            "Charts need the optional 'viz' extra: uv sync --extra viz.",
+            "matplotlib is not installed",
+        ),
+    },
+)
+async def get_analytics_chart(
+    meeting_id: UUID, chart_name: ChartName, service: MeetingServiceDep
+) -> Response:
+    """Rendered with matplotlib; needs the optional ``viz`` extra. Uses display names."""
+    analytics, names = await service.get_analytics(meeting_id)
+    turns = (await service.get_diarization(meeting_id)).turns if chart_name == "timeline" else []
+    png = await run_in_threadpool(render_chart, chart_name, analytics, names, turns)
+    return Response(png, media_type="image/png")
