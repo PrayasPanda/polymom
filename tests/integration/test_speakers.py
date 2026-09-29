@@ -97,6 +97,7 @@ async def test_missing_model_marks_meeting_failed_with_actionable_error(
         storage_dir=tmp_path,
         diarization_backend="pyannote",
         asr_backend="mock",
+        lid_backend="mock",
     )
     async for client in client_factory(settings):
         meeting_id = await _upload(client, make_wav(seconds=3))

@@ -27,9 +27,11 @@ ml = [
     "pyannote.audio>=3.3,<4",
     "numpy>=1.26",
     "faster-whisper>=1.1",
+    "speechbrain>=1.0,<2",
 ]
-# Odia ASR (AI4Bharat IndicConformer via ONNX + transformers remote code; no NeMo).
-# Install together with `ml`: `uv sync --extra ml --extra indic`.
+# Indic-language models, installed together with `ml` (`uv sync --extra ml --extra indic`):
+# Odia ASR (AI4Bharat IndicConformer, ONNX + transformers remote code; no NeMo) and
+# the default spoken-language ID model (facebook/mms-lid-126, transformers).
 indic = [
     "transformers>=4.44,<5",
     "onnxruntime>=1.18",
@@ -89,7 +91,7 @@ addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow'"
 markers = ["slow: needs real models / HF_TOKEN; run with `make test-slow`"]
 
 [[tool.mypy.overrides]]
-module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "transformers", "transformers.*", "jiwer", "jiwer.*"]
+module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "jiwer", "jiwer.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

@@ -13,6 +13,7 @@ from app.schemas.asr import TranscriptResponse
 from app.schemas.audio import AudioQuality
 from app.schemas.diarization import SpeakersResponse
 from app.schemas.error import error_example
+from app.schemas.language import LanguageSummaryResponse
 from app.schemas.meeting import (
     SUPPORTED_LANGUAGES,
     AudioMetadata,
@@ -244,3 +245,23 @@ async def get_transcript(
             headers={"Content-Disposition": f'attachment; filename="{meeting_id}.srt"'},
         )
     return TranscriptResponse(meeting_id=meeting_id, **result.model_dump())
+
+
+@router.get(
+    "/{meeting_id}/languages",
+    response_model=LanguageSummaryResponse,
+    summary="Spoken languages and code-switching",
+    responses={
+        **_NOT_FOUND,
+        **error_example(
+            409,
+            "language_summary_not_available",
+            "Language information is not available.",
+            "Language identification has not run for this meeting",
+        ),
+    },
+)
+async def get_languages(meeting_id: UUID, service: MeetingServiceDep) -> LanguageSummaryResponse:
+    """Per-language and per-speaker time, switch points and code-mixed segment count."""
+    summary = await service.get_language_summary(meeting_id)
+    return LanguageSummaryResponse(meeting_id=meeting_id, **summary.model_dump())

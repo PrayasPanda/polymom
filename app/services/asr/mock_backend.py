@@ -14,6 +14,7 @@ from pathlib import Path
 
 from starlette.concurrency import run_in_threadpool
 
+from app.core.config import Settings
 from app.schemas.asr import ASRResult, TranscriptSegment
 from app.services.asr.base import ASRBackend
 from app.services.asr.postprocess import approximate_words
@@ -51,6 +52,11 @@ def _read(path: Path) -> tuple[float, int]:
 
 class MockASRBackend(ASRBackend):
     name = "mock"
+
+    def __init__(self, settings: Settings, route: str | None = None) -> None:
+        super().__init__(settings)
+        if route:
+            self.name = f"mock-{route}"
 
     @property
     def model_name(self) -> str:

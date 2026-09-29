@@ -116,3 +116,19 @@ def test_discover(tmp_path: Path) -> None:
 
 def test_main_without_samples(tmp_path: Path) -> None:
     assert eval_asr.main([str(tmp_path)]) == 1
+
+
+def test_lid_confusion_and_report() -> None:
+    predicted = [(0.0, 6.0, "en"), (6.0, 10.0, "or")]
+    reference = [(0.0, 5.0, "en"), (5.0, 10.0, "hi")]
+
+    matrix = eval_asr.lid_confusion(predicted, reference)
+    total: dict[str, dict[str, float]] = {}
+    eval_asr.merge_confusion(total, matrix)
+    eval_asr.merge_confusion(total, matrix)
+
+    assert matrix == {"en": {"en": 5.0}, "hi": {"en": 1.0, "or": 4.0}}
+    assert total["hi"]["or"] == 8.0
+    report = eval_asr.confusion_report(matrix)
+    assert report.startswith("LID accuracy 0.500 over 10.0s")
+    assert eval_asr.confusion_report({}) == "LID: no reference languages"

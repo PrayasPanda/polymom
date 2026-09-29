@@ -77,12 +77,30 @@ class Settings(BaseSettings):
     asr_compression_ratio_threshold: float = Field(default=2.4, gt=0)
     asr_no_speech_threshold: float = Field(default=0.6, ge=0, le=1)
 
+    # Spoken language identification and code-switching
+    supported_languages: Annotated[frozenset[str], NoDecode] = frozenset({"en", "hi", "or"})
+    language_routing_enabled: bool = True
+    lid_backend: Literal["mms", "speechbrain", "whisper", "mock"] = "mms"
+    lid_model_id: str = "facebook/mms-lid-126"
+    speechbrain_lid_model_id: str = "speechbrain/lang-id-voxlingua107-ecapa"
+    lid_min_confidence: float = Field(default=0.5, ge=0, le=1)
+    lid_min_window_seconds: float = Field(default=1.5, ge=0)
+    lid_max_window_seconds: float = Field(default=15.0, gt=0)
+
     @field_validator("allowed_extensions", mode="before")
     @classmethod
     def _split_extensions(cls, value: object) -> object:
         """Accept a comma-separated string such as ``"wav,.MP3"``."""
         if isinstance(value, str):
             return frozenset(e.strip().lstrip(".").lower() for e in value.split(",") if e.strip())
+        return value
+
+    @field_validator("supported_languages", mode="before")
+    @classmethod
+    def _split_languages(cls, value: object) -> object:
+        """Accept ``"en,hi,or"``."""
+        if isinstance(value, str):
+            return frozenset(v.strip().lower() for v in value.split(",") if v.strip())
         return value
 
     @field_validator("asr_language_backends", mode="before")

@@ -15,6 +15,8 @@ from app.services.asr.service import build_router
 from app.services.audio.validator import MediaValidator
 from app.services.diarization.base import DiarizationBackend
 from app.services.diarization.service import build_backend
+from app.services.language.base import LanguageIdentifier
+from app.services.language.service import build_identifier
 from app.services.meeting_service import MeetingService
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
@@ -75,17 +77,24 @@ def get_asr_router(settings: SettingsDep) -> ASRRouter:
     return build_router(settings)
 
 
+def get_language_identifier(settings: SettingsDep) -> LanguageIdentifier:
+    """Spoken language ID chosen by ``LID_BACKEND``."""
+    return build_identifier(settings)
+
+
 def get_pipeline(
     request: Request,
     settings: SettingsDep,
     diarization_backend: Annotated[DiarizationBackend, Depends(get_diarization_backend)],
     asr_router: Annotated[ASRRouter, Depends(get_asr_router)],
+    language_identifier: Annotated[LanguageIdentifier, Depends(get_language_identifier)],
 ) -> MoMPipeline:
     return build_pipeline(
         settings,
         repository_factory(request.app.state.sessionmaker),
         diarization_backend,
         asr_router,
+        language_identifier,
     )
 
 

@@ -16,6 +16,11 @@ class Word(BaseModel):
     confidence: float | None = Field(
         default=None, description="0-1 word probability; null when the model gives none."
     )
+    language: str | None = Field(
+        default=None,
+        description="en, hi, or; hi-Latn / or-Latn for romanized Hindi/Odia; null if neutral.",
+    )
+    script: str | None = Field(default=None, description="ISO 15924: Latn, Deva, Orya.")
 
 
 class TranscriptSegment(BaseModel):
@@ -30,6 +35,20 @@ class TranscriptSegment(BaseModel):
     low_confidence: bool = False
     no_speech_prob: float | None = None
     compression_ratio: float | None = None
+    primary_language: str | None = Field(
+        default=None, description="Language of most words in the segment."
+    )
+    languages_present: list[str] = Field(default_factory=list)
+    is_code_mixed: bool = False
+    code_mix_ratio: float = Field(
+        default=0.0, description="Share of language-tagged words not in the primary language."
+    )
+    lid_confidence: float | None = Field(
+        default=None, description="Audio LID confidence of the region this segment came from."
+    )
+    fallback_used: bool = Field(
+        default=False, description="The routed backend failed; Whisper transcribed instead."
+    )
 
 
 class LanguageDuration(BaseModel):

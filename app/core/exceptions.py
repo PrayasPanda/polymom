@@ -143,6 +143,25 @@ class TranscriptNotAvailableError(ConflictError):
     code = "transcript_not_available"
 
 
+class LanguageIdModelLoadError(PipelineError):
+    """A spoken language identification model could not be loaded."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    code = "lid_model_unavailable"
+
+
+class LanguageIdError(PipelineError):
+    """Spoken language identification failed."""
+
+    code = "language_id_failed"
+
+
+class LanguageSummaryNotAvailableError(ConflictError):
+    """Language information was requested before language identification ran."""
+
+    code = "language_summary_not_available"
+
+
 class DiarizationNotAvailableError(ConflictError):
     """Speaker turns were requested before diarization finished."""
 

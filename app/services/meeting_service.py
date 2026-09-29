@@ -9,6 +9,7 @@ from starlette.concurrency import run_in_threadpool
 from app.core.config import Settings
 from app.core.exceptions import (
     DiarizationNotAvailableError,
+    LanguageSummaryNotAvailableError,
     MeetingNotFoundError,
     MeetingStateConflictError,
     PolymomError,
@@ -19,6 +20,7 @@ from app.models.meeting import Meeting
 from app.repositories.meeting_repository import MeetingRepository
 from app.schemas.asr import ASRResult
 from app.schemas.diarization import DiarizationResult
+from app.schemas.language import LanguageSummary
 from app.schemas.meeting import MeetingStatus
 from app.services.audio.validator import AsyncReadable, MediaValidator
 
@@ -114,6 +116,16 @@ class MeetingService:
                 details={"meeting_id": str(meeting_id), "status": meeting.status.value},
             )
         return ASRResult.model_validate(meeting.transcript)
+
+    async def get_language_summary(self, meeting_id: uuid.UUID) -> LanguageSummary:
+        meeting = await self.get(meeting_id)
+        if meeting.language_summary is None:
+            raise LanguageSummaryNotAvailableError(
+                "Language information is not available. It is produced by "
+                "POST /meetings/{id}/process when LANGUAGE_ROUTING_ENABLED=true.",
+                details={"meeting_id": str(meeting_id), "status": meeting.status.value},
+            )
+        return LanguageSummary.model_validate(meeting.language_summary)
 
     async def request_processing(self, meeting_id: uuid.UUID, *, force: bool = False) -> Meeting:
         """Mark a meeting as ``processing`` so the pipeline can be scheduled.
