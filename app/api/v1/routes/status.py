@@ -19,6 +19,7 @@ from app.workers.redis_client import RedisNotConfiguredError, build_redis
 router = APIRouter(prefix="/meetings", tags=["status"])
 
 SSE_PING_SECONDS = 15.0
+TERMINAL_STATUSES = frozenset({"completed", "completed_with_errors", "cancelled", "failed"})
 
 
 async def _resolve_meeting(meeting_id: uuid.UUID, service: MeetingService) -> None:
@@ -82,6 +83,8 @@ async def status_stream(
             snapshot = await read_progress(redis, meeting_id)
             if snapshot is not None:
                 yield {"event": "progress", "data": snapshot.model_dump_json()}
+                if snapshot.status in TERMINAL_STATUSES:
+                    return  # already finished: nothing more will be published
             last_ping = asyncio.get_event_loop().time()
             while True:
                 if await request.is_disconnected():
@@ -91,12 +94,7 @@ async def status_stream(
                     raw = message["data"]
                     data = raw.decode() if isinstance(raw, bytes) else str(raw)
                     yield {"event": "progress", "data": data}
-                    if json.loads(data).get("status") in (
-                        "completed",
-                        "completed_with_errors",
-                        "cancelled",
-                        "failed",
-                    ):
+                    if json.loads(data).get("status") in TERMINAL_STATUSES:
                         return
                 now = asyncio.get_event_loop().time()
                 if now - last_ping > SSE_PING_SECONDS:

@@ -82,6 +82,7 @@ dev = [
     "pypdf>=6.19.0",
     "fakeredis>=2.38.0",
     "locust>=2.46.6",
+    "jsonschema>=4.26.0",
 ]
 
 [build-system]
@@ -122,11 +123,12 @@ files = ["app"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow'"
+addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow and not e2e'"
 markers = [
     "slow: needs real models / HF_TOKEN; run with `make test-slow`",
     "llm: calls a real LLM provider; skipped without LLM_API_KEY",
     "postgres: runs against Postgres in Docker (testcontainers); skipped without Docker",
+    "e2e: needs the docker compose stack (make e2e-up); run with `make e2e`",
     "redis: runs arq workers against Redis in Docker (testcontainers); skipped without Docker",
 ]
 
