@@ -63,6 +63,7 @@ class ResultsRepository(ABC):
         output_ref: str | None = None,
         duration_ms: int | None = None,
         error: str | None = None,
+        fingerprint: str | None = None,
     ) -> StageResult:
         """Insert or replace the result of one stage of a run."""
 
@@ -168,6 +169,7 @@ class SqlAlchemyResultsRepository(ResultsRepository):
         output_ref: str | None = None,
         duration_ms: int | None = None,
         error: str | None = None,
+        fingerprint: str | None = None,
     ) -> StageResult:
         existing = await self.stage_result(run_id, stage_name)
         row = existing or StageResult(run_id=run_id, stage_name=stage_name)
@@ -176,6 +178,7 @@ class SqlAlchemyResultsRepository(ResultsRepository):
         row.output_ref = output_ref
         row.duration_ms = duration_ms
         row.error = error
+        row.fingerprint = fingerprint
         row.created_at = utcnow()
         if existing is None:
             self._session.add(row)

@@ -30,6 +30,9 @@ class Meeting(Base):
     owner_key_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), index=True
     )
+    callback_url: Mapped[str | None] = mapped_column(
+        String(2048), doc="Webhook POSTed with the final status (validated against SSRF)."
+    )
     upload_key: Mapped[str] = mapped_column(String(1024))
     processed_key: Mapped[str | None] = mapped_column(String(1024))
     sha256: Mapped[str | None] = mapped_column(String(64), index=True)

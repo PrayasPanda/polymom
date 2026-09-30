@@ -1,4 +1,4 @@
-"""api_keys, idempotency_records, meetings.owner_key_id; add cancelled status
+"""api_keys, idempotency_records, meeting owner/callback, stage fingerprints; cancelled status
 
 Revision ID: 0011
 Revises: 0010
@@ -70,10 +70,18 @@ def upgrade() -> None:
         else:
             batch.add_column(sa.Column("owner_key_id", sa.Integer(), nullable=True))
         batch.create_index("ix_meetings_owner_key_id", ["owner_key_id"])
+        batch.add_column(sa.Column("callback_url", sa.String(2048), nullable=True))
+    with op.batch_alter_table("stage_results") as batch:
+        batch.add_column(sa.Column("fingerprint", sa.String(64), nullable=True))
+    # MeetingStatus.CANCELLED needs no DDL: status is a non-native enum (VARCHAR(32)).
 
 
 def downgrade() -> None:
+    op.execute("UPDATE meetings SET status = 'failed' WHERE status = 'cancelled'")
+    with op.batch_alter_table("stage_results") as batch:
+        batch.drop_column("fingerprint")
     with op.batch_alter_table("meetings") as batch:
+        batch.drop_column("callback_url")
         batch.drop_index("ix_meetings_owner_key_id")
         batch.drop_column("owner_key_id")
     op.drop_index("ix_idempotency_records_created_at", table_name="idempotency_records")
