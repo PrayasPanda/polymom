@@ -137,24 +137,44 @@ def confusion_report(matrix: dict[str, dict[str, float]]) -> str:
     return "\n".join(lines)
 
 
+def error_rate(references: list[str], hypotheses: list[str], unit: str) -> float:
+    """Corpus-level WER (``unit="word"``) or CER (``"char"``): edits / reference length.
+
+    Same definition as jiwer's corpus WER/CER, computed with rapidfuzz (a base
+    dependency) so evaluation runs in the production image without dev extras.
+    """
+    edits = sum(edit_count(r, h, unit) for r, h in zip(references, hypotheses, strict=True))
+    total = sum(len(r.split()) if unit == "word" else len(r) for r in references)
+    return edits / total if total else 0.0
+
+
+def edit_count(reference: str, hypothesis: str, unit: str) -> int:
+    """Levenshtein edits between word lists (``"word"``) or character strings (``"char"``)."""
+    from rapidfuzz.distance import Levenshtein
+
+    if unit == "word":
+        return int(Levenshtein.distance(reference.split(), hypothesis.split()))
+    return int(Levenshtein.distance(reference, hypothesis))
+
+
 def score(pairs: list[tuple[str, str, str, str]]) -> tuple[list[FileScore], list[LanguageScore]]:
     """``pairs``: (file, language, reference, hypothesis). Corpus-level scores per language."""
-    import jiwer
-
     files: list[FileScore] = []
     grouped: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for name, lang, ref, hyp in pairs:
         r, h = normalize_for_eval(ref), normalize_for_eval(hyp)
         if not r:
             continue
-        files.append(FileScore(name, lang, jiwer.wer(r, h or " "), jiwer.cer(r, h or " "), r, h))
-        grouped[lang].append((r, h or " "))
+        files.append(
+            FileScore(name, lang, error_rate([r], [h], "word"), error_rate([r], [h], "char"), r, h)
+        )
+        grouped[lang].append((r, h))
     languages = [
         LanguageScore(
             language=lang,
             files=len(items),
-            wer=jiwer.wer([r for r, _ in items], [h for _, h in items]),
-            cer=jiwer.cer([r for r, _ in items], [h for _, h in items]),
+            wer=error_rate([r for r, _ in items], [h for _, h in items], "word"),
+            cer=error_rate([r for r, _ in items], [h for _, h in items], "char"),
         )
         for lang, items in sorted(grouped.items())
     ]
