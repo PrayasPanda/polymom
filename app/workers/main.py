@@ -30,6 +30,7 @@ from arq import cron
 from prometheus_client import start_http_server
 
 from app.core.config import Settings, get_settings
+from app.core.exceptions import PipelineError
 from app.core.logging import configure_logging, get_logger
 from app.core.tracing import setup_tracing, span
 from app.db.session import create_engine, create_sessionmaker
@@ -47,6 +48,14 @@ from app.workers.redis_client import RedisNotConfiguredError
 from app.workers.webhook import deliver_webhook
 
 logger = get_logger(__name__)
+
+MAX_HANDOFFS = 20  # a full run needs 3 (cpu -> gpu -> cpu -> llm) plus shutdown resumes
+
+
+class HandoffLoopError(PipelineError):
+    code = "handoff_loop"
+    remediation = "Reprocess the meeting; if it repeats, check that all workers share one config."
+
 
 HEARTBEAT_PREFIX = "polymom:heartbeat:"
 HEARTBEAT_TTL_SECONDS = 3600
@@ -110,6 +119,14 @@ async def run_pipeline(
     pipeline: MoMPipeline = ctx["pipeline_factory"]()
 
     async def handoff(target_run: uuid.UUID, target_queue: str) -> None:
+        hops_key = f"polymom:hops:{target_run}"
+        hops = int(await pool.incr(hops_key))
+        await pool.expire(hops_key, 24 * 3600)
+        if hops > MAX_HANDOFFS:
+            raise HandoffLoopError(
+                f"Run {target_run} was handed off {hops} times; stopping to avoid a loop.",
+                details={"run_id": str(target_run), "hops": hops},
+            )
         await enqueue_run(
             pool,
             mid,

@@ -336,3 +336,21 @@ async def test_webhook_gives_up_after_max_attempts(settings: Settings) -> None:
         transport=httpx.MockTransport(handler),
         sleep=sleep,
     )
+
+
+async def test_handoff_loops_are_stopped(
+    meeting: Meeting, uow_factory: UnitOfWorkFactory, store: LocalArtifactStore, settings: Settings
+) -> None:
+    stages = [CountingStage("pre"), CountingStage("asr", queue="gpu")]
+    ctx = job_ctx(MoMPipeline(stages, uow_factory, store, settings), settings, uow_factory)
+    await jobs.run_pipeline(ctx, str(meeting.id), None, None, None)
+    [(_, args, _)] = ctx["redis"].enqueued
+    await ctx["redis"].set(f"polymom:hops:{args[4]}", jobs.MAX_HANDOFFS)
+
+    result = await jobs.run_pipeline(ctx, str(meeting.id), None, None, None, args[4])
+
+    assert result == "failed"
+    async with uow_factory() as uow:
+        stored = await uow.meetings.get(meeting.id)
+    assert stored is not None
+    assert (stored.error or "").startswith("handoff_loop")

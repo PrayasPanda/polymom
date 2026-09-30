@@ -75,6 +75,20 @@ _STAGE_OUTPUT_SCHEMAS: dict[str, type[BaseModel]] = dict(
 )
 
 
+def _canonical(value: Any) -> Any:
+    """A JSON-stable form of a setting. Sets are sorted: their iteration order depends on
+    the per-process hash seed, and workers on different queues must agree on fingerprints."""
+    if isinstance(value, set | frozenset):
+        return sorted(_canonical(v) for v in value)
+    if isinstance(value, dict):
+        return {str(k): _canonical(v) for k, v in sorted(value.items())}
+    if isinstance(value, list | tuple):
+        return [_canonical(v) for v in value]
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    return str(value)
+
+
 def _reify_stage_output(name: str, output: Any) -> BaseModel | None:
     """Rebuild the Pydantic output of a reused stage (``None`` if the stage has none)."""
     schema = _STAGE_OUTPUT_SCHEMAS.get(name)
@@ -123,11 +137,10 @@ class PipelineStage(ABC):
 
     def fingerprint(self, settings: Settings, upstream: str) -> str:
         """sha256 of the stage name, its config (incl. model names) and the upstream hash."""
-        dumped = settings.model_dump(mode="json")
         payload = {
             "stage": self.name,
             "upstream": upstream,
-            "config": {k: dumped.get(k) for k in self.config_keys},
+            "config": {k: _canonical(getattr(settings, k, None)) for k in self.config_keys},
         }
         raw = json.dumps(payload, sort_keys=True, default=str).encode()
         return hashlib.sha256(raw).hexdigest()

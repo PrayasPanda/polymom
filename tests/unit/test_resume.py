@@ -270,3 +270,27 @@ async def test_chunk_checkpoints_resume_mid_stage(
     ]
     other = ChunkHooks(store, meeting_id, run_id, "diarize", "0" * 64)
     assert await other.load(0) is None  # a different fingerprint never reuses checkpoints
+
+
+def test_fingerprints_are_identical_across_processes() -> None:
+    """Workers are separate processes with different hash seeds; set-valued settings
+    (e.g. SUPPORTED_LANGUAGES) must not change the fingerprint, or runs ping-pong."""
+    import subprocess
+    import sys
+
+    code = (
+        "from app.core.config import Settings;"
+        "from app.pipelines.mom_pipeline import LanguageIdentificationStage as S;"
+        "print(S.fingerprint(S.__new__(S), Settings(_env_file=None), 'x'))"
+    )
+    prints = {
+        subprocess.run(  # noqa: S603
+            [sys.executable, "-c", code],
+            env={**__import__("os").environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        for seed in ("1", "2", "3", "4")
+    }
+    assert len(prints) == 1
