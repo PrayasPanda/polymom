@@ -66,7 +66,11 @@ class Progress(BaseModel):
 
 class ProgressReporter(Protocol):
     async def start(
-        self, run_id: uuid.UUID, stages: list[str], audio_seconds: float | None
+        self,
+        run_id: uuid.UUID,
+        stages: list[str],
+        audio_seconds: float | None,
+        started_at: float | None = None,
     ) -> None: ...
     async def stage(self, name: str, status: str) -> None: ...
     async def chunk(self, name: str, done: int, total: int) -> None: ...
@@ -77,7 +81,11 @@ class NullProgressReporter:
     """Used in inline mode; status comes from the database."""
 
     async def start(
-        self, run_id: uuid.UUID, stages: list[str], audio_seconds: float | None
+        self,
+        run_id: uuid.UUID,
+        stages: list[str],
+        audio_seconds: float | None,
+        started_at: float | None = None,
     ) -> None:
         return None
 
@@ -96,12 +104,20 @@ class RedisProgressReporter:
 
     def __init__(self, redis: Redis, meeting_id: uuid.UUID) -> None:
         self._redis = redis
-        self._started = time.perf_counter()
+        self._started = time.time()
         self._progress = Progress(meeting_id=meeting_id, status=MeetingStatus.PROCESSING)
 
     async def start(
-        self, run_id: uuid.UUID, stages: list[str], audio_seconds: float | None
+        self,
+        run_id: uuid.UUID,
+        stages: list[str],
+        audio_seconds: float | None,
+        started_at: float | None = None,
     ) -> None:
+        # Anchor elapsed time and ETA to the run's start (epoch seconds), so they stay
+        # correct when a later job on another queue continues the same run.
+        if started_at is not None:
+            self._started = started_at
         self._progress.run_id = run_id
         self._progress.audio_seconds = audio_seconds
         self._progress.stages = [StageProgress(name=s) for s in stages]
@@ -142,7 +158,7 @@ class RedisProgressReporter:
         total_weight = sum(STAGE_WEIGHTS.get(sp.name, 0.05) for sp in self._progress.stages) or 1.0
         fraction = min(done / total_weight, 0.99)
         self._progress.percent = round(fraction * 100, 1)
-        elapsed = time.perf_counter() - self._started
+        elapsed = max(time.time() - self._started, 0.0)
         self._progress.elapsed_seconds = round(elapsed, 1)
         self._progress.eta_seconds = (
             round(elapsed / fraction - elapsed, 1) if fraction > 0.02 else None

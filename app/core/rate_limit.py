@@ -34,7 +34,9 @@ class RateLimiter:
         url = settings.redis_url
         use_redis = bool(url) and not str(url).startswith("fakeredis://")
         uri = f"async+{url}" if use_redis else "async+memory://"
-        storage = storage_from_string(uri)
+        # redis-py (already a dependency for arq) instead of limits' default coredis driver.
+        options = {"implementation": "redispy"} if use_redis else {}
+        storage = storage_from_string(uri, **options)
         assert isinstance(storage, Storage)  # noqa: S101 - "async+" URIs give async storage
         self.storage = storage
         self.strategy = MovingWindowRateLimiter(self.storage)

@@ -88,8 +88,10 @@ async def status_stream(
                     return
                 message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
                 if message and message.get("type") == "message":
-                    yield {"event": "progress", "data": message["data"]}
-                    if json.loads(message["data"]).get("status") in (
+                    raw = message["data"]
+                    data = raw.decode() if isinstance(raw, bytes) else str(raw)
+                    yield {"event": "progress", "data": data}
+                    if json.loads(data).get("status") in (
                         "completed",
                         "completed_with_errors",
                         "cancelled",

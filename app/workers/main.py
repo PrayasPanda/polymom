@@ -348,7 +348,8 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - external 
         task = asyncio.create_task(worker.main())
         await stop.wait()
         # Graceful: stop taking jobs, let running ones finish their current stage.
-        await worker.close()
+        with contextlib.suppress(AttributeError):  # arq's close() uses SIGUSR1 (not on Windows)
+            await worker.close()
         await task
 
     try:

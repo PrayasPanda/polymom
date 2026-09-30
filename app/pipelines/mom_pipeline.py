@@ -641,9 +641,11 @@ class MoMPipeline:
                 self._compute_fingerprints(context, meeting.sha256 or meeting.upload_key)
                 upload_key, audio_seconds = meeting.upload_key, meeting.duration_seconds
                 skipped: set[str] = set()
+                reused_label = "skipped"  # outputs copied from an earlier run
                 run = await uow.results.get_run(meeting_id, run_id) if run_id else None
                 if run is not None:
                     skipped = await self._load_completed_stages(uow, run.id, context)
+                    reused_label = "completed"  # finished by an earlier job of this run
                 else:
                     run = await uow.results.create_run(meeting_id, config_snapshot(self._settings))
                     if from_stage is not None:
@@ -652,11 +654,14 @@ class MoMPipeline:
                         )
                 run.status = "processing"
                 current_run_id = run.id
+                run_started = run.started_at.timestamp()
                 await uow.commit()
 
-            await reporter.start(current_run_id, [s.name for s in self.stages], audio_seconds)
+            await reporter.start(
+                current_run_id, [s.name for s in self.stages], audio_seconds, run_started
+            )
             for name in skipped:
-                await reporter.stage(name, "skipped")
+                await reporter.stage(name, reused_label)
             with structlog.contextvars.bound_contextvars(run_id=str(current_run_id)):
                 attempt = 0
                 while True:

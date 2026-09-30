@@ -13,10 +13,14 @@ from collections.abc import Awaitable, Callable
 import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
+from app.core.exceptions import PolymomError, error_body
+from app.core.logging import get_logger
 from app.core.metrics import REQUEST_LATENCY, REQUESTS
+
+logger = get_logger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
@@ -38,6 +42,18 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         started = time.perf_counter()
         try:
             response = await call_next(request)
+        except Exception:
+            # Unhandled errors become a generic 500 here, while request_id is still
+            # bound, so the body and the logged traceback share the same id.
+            logger.exception("request_crashed", path=request.url.path)
+            response = JSONResponse(
+                error_body(
+                    "internal_error",
+                    "An unexpected error occurred.",
+                    remediation=PolymomError.remediation,
+                ),
+                status_code=500,
+            )
         finally:
             structlog.contextvars.unbind_contextvars("request_id", "path")
         elapsed = time.perf_counter() - started

@@ -197,7 +197,7 @@ class ArqJobQueue:
 
     async def queue_depth(self, queue: QueueName) -> int:
         pool = await self._get_pool()
-        depth = await pool.zcard(f"arq:queue:polymom:{queue}")
+        depth = await pool.zcard(f"polymom:{queue}")
         return int(depth)
 
     async def close(self) -> None:
