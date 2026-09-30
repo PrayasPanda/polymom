@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from app.core.exceptions import LLMError
+from app.core.exceptions import LLMConfigurationError, LLMError
 from app.services.llm.base import Completion, LLMClient, Message, schema_json
 
 
@@ -27,10 +27,14 @@ class OpenAIClient(LLMClient):
         s = self.settings
         key = s.llm_api_key.get_secret_value() if s.llm_api_key else ""
         if not key:
-            raise LLMError(f"LLM_API_KEY is required for LLM_PROVIDER={self.provider}.")
+            raise LLMConfigurationError(
+                f"LLM_API_KEY is required for LLM_PROVIDER={self.provider}."
+            )
         if self.azure:
             if not s.azure_openai_endpoint or not s.azure_openai_deployment:
-                raise LLMError("AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT are required.")
+                raise LLMConfigurationError(
+                    "AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT are required."
+                )
             url = (
                 f"{s.azure_openai_endpoint.rstrip('/')}/openai/deployments/"
                 f"{s.azure_openai_deployment}/chat/completions"

@@ -22,7 +22,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings
-from app.core.exceptions import LLMError, LLMOutputError
+from app.core.exceptions import LLMConfigurationError, LLMError, LLMOutputError
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -155,6 +155,11 @@ class LLMClient(ABC):
                     logger.warning("llm_retry", status=response.status_code, delay=delay)
                     await self._sleep(delay)
                     continue
+                if response.status_code in (401, 403):
+                    raise LLMConfigurationError(
+                        f"{self.provider} rejected the credentials (HTTP {response.status_code}).",
+                        details={"body": response.text[:500]},
+                    )
                 if response.status_code >= 400:
                     raise LLMError(
                         f"{self.provider} returned HTTP {response.status_code}.",
