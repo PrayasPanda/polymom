@@ -94,7 +94,11 @@ async def test_unknown_meeting_returns_404_envelope(client: AsyncClient, method:
     response = await client.request(method.upper(), f"{URL}/{meeting_id}")
 
     assert response.status_code == 404
-    assert response.json() == {
+    error = response.json()["error"]
+    assert error.pop("remediation").startswith("Check the id")
+    assert len(error.pop("request_id")) == 32
+    assert response.headers["x-request-id"]
+    assert {"error": error} == {
         "error": {
             "code": "meeting_not_found",
             "message": f"Meeting {meeting_id} not found.",
@@ -128,7 +132,10 @@ async def test_video_without_audio_returns_422(
     result = await upload(client, video_without_audio_bytes, "screen.mp4")
 
     assert result["status"] == 422
-    assert result["json"]["error"] == {
+    error = result["json"]["error"]
+    assert error.pop("remediation")
+    assert error.pop("request_id")
+    assert error == {
         "code": "corrupted_media",
         "message": "The file contains no audio stream.",
         "details": {"reason": "no_audio_stream"},
@@ -176,7 +183,14 @@ async def test_missing_file_returns_422(client: AsyncClient) -> None:
 async def test_oversized_upload_returns_413(
     tmp_path: Path, client_factory: Callable[[Settings], AsyncIterator[AsyncClient]]
 ) -> None:
-    settings = Settings(_env_file=None, app_env="test", storage_dir=tmp_path, max_upload_mb=1)
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        storage_dir=tmp_path,
+        max_upload_mb=1,
+        api_key_required=False,
+        pipeline_execution="inline",
+    )
 
     async for client in client_factory(settings):
         result = await upload(client, make_wav(seconds=40), "big.wav")

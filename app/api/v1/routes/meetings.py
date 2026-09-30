@@ -4,16 +4,31 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Response, UploadFile, status
-from fastapi.responses import PlainTextResponse
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Header,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.api.deps import (
     MeetingServiceDep,
     PipelineDep,
     ResultServiceDep,
+    SettingsDep,
     SummaryRegeneratorDep,
 )
+from app.api.idempotency import remember, replay
 from app.core.exceptions import TranscriptNotAvailableError, ValidationError
+from app.core.rate_limit import rate_limit
 from app.repositories.meeting_repository import MeetingQuery, SortField
 from app.repositories.results_repository import UtteranceQuery
 from app.schemas.analytics import ConversationAnalyticsResponse
@@ -52,6 +67,9 @@ from app.utils.subtitles import (
     utterances_to_text,
     utterances_to_vtt,
 )
+from app.workers.inline import run_inline
+from app.workers.queue import build_queue
+from app.workers.webhook import validate_callback_url
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
@@ -76,6 +94,7 @@ def parse_languages(values: list[str] | None) -> list[str]:
 
 @router.post(
     "",
+    dependencies=[Depends(rate_limit("upload"))],
     response_model=MeetingCreateResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Upload a meeting recording",
@@ -108,19 +127,32 @@ async def create_meeting(
         list[str] | None,
         Form(description="Language hints: en, hi, or. Repeat the field or comma-separate."),
     ] = None,
+    callback_url: Annotated[
+        str | None,
+        Form(max_length=2048, description="Webhook POSTed (HMAC-signed) with the final status."),
+    ] = None,
     allow_duplicate: Annotated[
         bool, Query(description="Store a new meeting even if the same file was uploaded.")
     ] = False,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     *,
+    request: Request,
     response: Response,
-) -> MeetingCreateResponse:
-    """Validate the upload, store it and queue the meeting for processing.
+    settings: SettingsDep,
+) -> MeetingCreateResponse | JSONResponse:
+    """Validate the upload, store it and record the meeting as ``queued``.
 
-    Uploads are idempotent: the SHA-256 of an identical earlier file returns that
-    meeting with ``200`` and ``duplicate: true`` unless ``?allow_duplicate=true``.
+    - Same file twice: the SHA-256 match returns the existing meeting (``200``,
+      ``duplicate: true``) unless ``?allow_duplicate=true``.
+    - Same ``Idempotency-Key`` twice: the first response is replayed as-is.
+    - ``callback_url`` must be public http(s); private and loopback hosts are refused.
     """
-    langs = parse_languages(languages)
     try:
+        if (replayed := await replay(service.uow, request, idempotency_key)) is not None:
+            return replayed
+        langs = parse_languages(languages)
+        if callback_url:
+            validate_callback_url(callback_url, allow_private=settings.webhook_allow_private_hosts)
         meeting, duplicate = await service.create(
             source=file,
             filename=file.filename,
@@ -128,17 +160,20 @@ async def create_meeting(
             expected_speakers=expected_speakers,
             languages=langs,
             allow_duplicate=allow_duplicate,
+            callback_url=callback_url,
         )
     finally:
         await file.close()
-    if duplicate:
-        response.status_code = status.HTTP_200_OK
-    return MeetingCreateResponse(
+    code = status.HTTP_200_OK if duplicate else status.HTTP_202_ACCEPTED
+    response.status_code = code
+    body = MeetingCreateResponse(
         meeting_id=meeting.id,
         status=meeting.status,
         created_at=meeting.created_at,
         duplicate=duplicate,
     )
+    await remember(service.uow, request, idempotency_key, code, body, meeting.id)
+    return body
 
 
 @router.get(
@@ -206,9 +241,10 @@ async def delete_meeting(meeting_id: UUID, service: MeetingServiceDep) -> Respon
 
 @router.post(
     "/{meeting_id}/process",
+    dependencies=[Depends(rate_limit("upload"))],
     response_model=ProcessResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Run the processing pipeline for a meeting",
+    summary="Enqueue the processing pipeline (or resume from a stage)",
     responses={
         **_NOT_FOUND,
         **error_example(
@@ -221,17 +257,71 @@ async def delete_meeting(meeting_id: UUID, service: MeetingServiceDep) -> Respon
 )
 async def process_meeting(
     meeting_id: UUID,
+    request: Request,
     service: MeetingServiceDep,
     pipeline: PipelineDep,
+    settings: SettingsDep,
     background_tasks: BackgroundTasks,
-    force: Annotated[bool, Query(description="Reprocess even if processing or completed.")] = False,
-) -> ProcessResponse:
-    """Queue the pipeline in the background. Poll ``GET /meetings/{id}`` for the status.
+    force: Annotated[bool, Query(description="Reprocess even if completed.")] = False,
+    from_stage: Annotated[
+        str | None,
+        Query(description="Reuse the latest successful run's stages before this one."),
+    ] = None,
+    callback_url: Annotated[
+        str | None, Query(max_length=2048, description="Overrides the upload's callback_url.")
+    ] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> ProcessResponse | JSONResponse:
+    """Enqueue the pipeline on the job queue; workers do the processing.
 
-    Runs in-process via ``BackgroundTasks`` for now; a real job queue replaces it later.
+    Progress: ``GET /meetings/{id}/status`` (snapshot) or ``/status/stream`` (SSE).
+    With ``PIPELINE_EXECUTION=inline`` (tests, local debugging) it runs in-process.
     """
-    meeting = await service.request_processing(meeting_id, force=force)
-    background_tasks.add_task(pipeline.run, meeting.id)
+    if (replayed := await replay(service.uow, request, idempotency_key)) is not None:
+        return replayed
+    if callback_url:
+        validate_callback_url(callback_url, allow_private=settings.webhook_allow_private_hosts)
+    meeting = await service.request_processing(meeting_id, force=force, from_stage=from_stage)
+    callback = callback_url or meeting.callback_url
+    request_id = getattr(request.state, "request_id", None)
+    if settings.pipeline_execution == "inline":
+        background_tasks.add_task(
+            run_inline, pipeline, settings, meeting.id, from_stage=from_stage, callback_url=callback
+        )
+    else:
+        queue = build_queue(settings)
+        try:
+            await queue.enqueue_meeting(
+                meeting.id, from_stage=from_stage, request_id=request_id, callback_url=callback
+            )
+        finally:
+            await queue.close()
+    body = ProcessResponse(meeting_id=meeting.id, status=meeting.status)
+    await remember(service.uow, request, idempotency_key, 202, body, meeting.id)
+    return body
+
+
+@router.post(
+    "/{meeting_id}/cancel",
+    response_model=ProcessResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ask a running pipeline to stop after the current stage",
+    responses={**_NOT_FOUND},
+)
+async def cancel_meeting(
+    meeting_id: UUID,
+    service: MeetingServiceDep,
+    settings: SettingsDep,
+) -> ProcessResponse:
+    """Sets a cancel flag in Redis. The worker checks it between stages and rolls the
+    run to ``cancelled``. In inline mode (no queue) this is a no-op that returns 202."""
+    meeting = await service.get(meeting_id)
+    if settings.pipeline_execution == "queue" and settings.redis_url:
+        queue = build_queue(settings)
+        try:
+            await queue.cancel(meeting_id)
+        finally:
+            await queue.close()
     return ProcessResponse(meeting_id=meeting.id, status=meeting.status)
 
 
@@ -504,6 +594,7 @@ async def get_summary(
 
 @router.post(
     "/{meeting_id}/summary/regenerate",
+    dependencies=[Depends(rate_limit("upload"))],
     response_model=RegenerateSummaryResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Regenerate the summary (optionally another language or model)",
@@ -522,14 +613,28 @@ async def regenerate_summary(
     service: MeetingServiceDep,
     regenerator: SummaryRegeneratorDep,
     background_tasks: BackgroundTasks,
+    request: Request,
+    settings: SettingsDep,
     body: RegenerateSummaryRequest | None = None,
 ) -> RegenerateSummaryResponse:
-    """Re-runs only summarization in the background. Poll ``GET /summary``."""
+    """Re-runs only summarization on the ``llm`` queue. Poll ``GET /summary``."""
     await service.check_summary_regeneration(meeting_id)
     body = body or RegenerateSummaryRequest()
-    background_tasks.add_task(
-        regenerator.run, meeting_id, output_language=body.output_language, model=body.model
-    )
+    if settings.pipeline_execution == "inline":
+        background_tasks.add_task(
+            regenerator.run, meeting_id, output_language=body.output_language, model=body.model
+        )
+    else:
+        queue = build_queue(settings)
+        try:
+            await queue.enqueue_regenerate_summary(
+                meeting_id,
+                output_language=body.output_language,
+                model=body.model,
+                request_id=getattr(request.state, "request_id", None),
+            )
+        finally:
+            await queue.close()
     return RegenerateSummaryResponse(meeting_id=meeting_id)
 
 

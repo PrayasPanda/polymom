@@ -4,7 +4,7 @@ import json
 
 from pydantic import BaseModel
 
-from app.core.exceptions import LLMError
+from app.core.exceptions import LLMConfigurationError
 from app.services.llm.base import Completion, LLMClient, Message, schema_json
 
 ANTHROPIC_VERSION = "2023-06-01"
@@ -22,7 +22,7 @@ class AnthropicClient(LLMClient):
         s = self.settings
         key = s.llm_api_key.get_secret_value() if s.llm_api_key else ""
         if not key:
-            raise LLMError("LLM_API_KEY is required for LLM_PROVIDER=anthropic.")
+            raise LLMConfigurationError("LLM_API_KEY is required for LLM_PROVIDER=anthropic.")
         payload = {
             "model": self.model,
             "max_tokens": s.llm_max_output_tokens,

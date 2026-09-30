@@ -9,6 +9,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.repositories.api_key_repository import ApiKeyRepository, IdempotencyRepository
 from app.repositories.meeting_repository import MeetingRepository, SqlAlchemyMeetingRepository
 from app.repositories.results_repository import ResultsRepository, SqlAlchemyResultsRepository
 from app.repositories.search import SearchRepository, build_search_repository
@@ -20,6 +21,8 @@ class UnitOfWork:
         self.meetings: MeetingRepository = SqlAlchemyMeetingRepository(session)
         self.results: ResultsRepository = SqlAlchemyResultsRepository(session)
         self.search: SearchRepository = build_search_repository(session)
+        self.api_keys = ApiKeyRepository(session)
+        self.idempotency = IdempotencyRepository(session)
 
     async def commit(self) -> None:
         await self.session.commit()

@@ -21,6 +21,7 @@ class MeetingStatus(StrEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     COMPLETED_WITH_ERRORS = "completed_with_errors"
+    CANCELLED = "cancelled"
     FAILED = "failed"
 
 

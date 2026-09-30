@@ -76,7 +76,11 @@ class AudioPreprocessor:
         analysis = await analyze(input_path, settings)
         trim = trim_window(analysis) if settings.trim_silence else None
 
-        args = ["-hide_banner", "-nostats", "-y", "-i", str(input_path)]
+        # -protocol_whitelist limits ffmpeg to local files and pipes so a crafted
+        # media file cannot make it open http:// or concat: subresources (SSRF, LFI).
+        args = ["-hide_banner", "-nostats", "-y"]
+        args += ["-protocol_whitelist", "file,pipe,fd"]
+        args += ["-i", str(input_path)]
         args += ["-map", "0:a:0", "-vn", "-sn", "-dn"]
         args += ["-af", build_filter_chain(settings, trim)]
         args += ["-ac", "1", "-ar", str(settings.target_sample_rate), "-c:a", "pcm_s16le"]

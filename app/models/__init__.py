@@ -1,5 +1,6 @@
 """ORM entities. Importing this package registers every model on ``Base.metadata``."""
 
+from app.models.api_key import ApiKey, IdempotencyRecord
 from app.models.meeting import Meeting
 from app.models.results import (
     ArtifactCleanup,
@@ -11,7 +12,9 @@ from app.models.results import (
 )
 
 __all__ = [
+    "ApiKey",
     "ArtifactCleanup",
+    "IdempotencyRecord",
     "Meeting",
     "ProcessingRun",
     "Speaker",

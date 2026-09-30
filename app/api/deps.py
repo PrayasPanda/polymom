@@ -44,6 +44,9 @@ async def get_uow(factory: UowFactoryDep) -> AsyncIterator[UnitOfWork]:
         yield uow
 
 
+UowDep = Annotated[UnitOfWork, Depends(get_uow)]
+
+
 def get_artifact_store(settings: SettingsDep) -> ArtifactStore:
     """Chosen by ``ARTIFACT_STORE`` (local files under STORAGE_DIR, or S3/MinIO)."""
     return build_artifact_store(settings)
@@ -53,11 +56,13 @@ ArtifactStoreDep = Annotated[ArtifactStore, Depends(get_artifact_store)]
 
 
 def get_meeting_service(
-    uow: Annotated[UnitOfWork, Depends(get_uow)],
+    uow: UowDep,
     settings: SettingsDep,
     store: ArtifactStoreDep,
+    request: Request,
 ) -> MeetingService:
-    return MeetingService(uow, MediaValidator(settings), settings, store)
+    owner_key_id = getattr(request.state, "api_key_id", None)
+    return MeetingService(uow, MediaValidator(settings), settings, store, owner_key_id)
 
 
 MeetingServiceDep = Annotated[MeetingService, Depends(get_meeting_service)]

@@ -1028,12 +1028,165 @@ Search indexes each meeting's latest utterances and summary:
 | `RETENTION_DAYS` | `90` | Age after which raw audio is purged (`0` = never) |
 | `KEEP_RAW_AUDIO` | `false` | `true` keeps raw audio regardless of age |
 
+## Workers, reliability and security
+
+Processing runs on a Redis job queue ([arq](https://arq-docs.helpmanual.io/), async-native like FastAPI). The API only validates, stores and enqueues; it never loads a model.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    C[Client] -->|X-API-Key| API[FastAPI API<br/>auth, rate limits,<br/>idempotency]
+    API -->|enqueue| R[(Redis<br/>queues, progress,<br/>cancel flags, heartbeats)]
+    API --> DB[(Postgres<br/>meetings, runs,<br/>stage results)]
+    API --> S[(Artifact store<br/>local / S3)]
+    R -->|polymom:cpu| W1[cpu worker<br/>preprocess, align,<br/>analytics]
+    R -->|polymom:gpu| W2[gpu worker<br/>diarize, language ID,<br/>ASR]
+    R -->|polymom:llm| W3[llm worker<br/>summarize]
+    W1 -. hand-off .-> R
+    W2 -. hand-off .-> R
+    W1 & W2 & W3 --> DB
+    W1 & W2 & W3 --> S
+    W1 & W2 & W3 -->|progress pub/sub| R
+    R -->|SSE| API
+    W3 -->|signed webhook| CB[callback_url]
+```
+
+Every stage belongs to a queue. A worker runs only its own queue's stages. At the first stage of another queue, it enqueues a **continuation job** for the same run and returns, so a run moves cpu → gpu → cpu → llm. Each queue has its own concurrency (`QUEUE_CONCURRENCY_CPU/GPU/LLM`); keep `QUEUE_CONCURRENCY_GPU=1` per GPU so a GPU is never oversubscribed.
+
+### Running workers
+
+```bash
+# local: API + one worker per queue (needs Redis: docker run -p 6379:6379 redis:7-alpine)
+export REDIS_URL=redis://localhost:6379/0
+make run
+uv run python -m app.workers.main --queue cpu
+uv run python -m app.workers.main --queue gpu
+uv run python -m app.workers.main --queue llm
+
+# or everything, with Postgres and Redis:
+docker compose -f docker/docker-compose.yml up --build
+docker compose -f docker/docker-compose.yml exec api python -m scripts.create_api_key --label me
+```
+
+`PIPELINE_EXECUTION=inline` runs the pipeline inside the API process instead. It exists for tests and local debugging, and production settings refuse it.
+
+### Resumable pipeline
+
+- **Stage checkpoints:** every stage's result is committed to `stage_results` before the next stage starts, together with a **fingerprint**. The fingerprint is the SHA-256 of the input file, the stage's settings (including model names) and the upstream fingerprints. When a run is continued (after a hand-off, a retry, a crash or a restart), completed stages whose fingerprint still matches are skipped. A changed setting reruns that stage and every stage after it.
+- **Chunk checkpoints:** long diarization and ASR write each chunk's result to the artifact store (`meetings/{id}/{run}/checkpoints/{stage}/{fingerprint}/chunk-NNNN.json`). A crash at chunk 7 of 10 resumes at chunk 7.
+- **Partial reruns:** `POST /meetings/{id}/process?from_stage=summarize` starts a new run that reuses the earlier stages' outputs, for example to try a new LLM without redoing ASR.
+- **Cancel:** `POST /meetings/{id}/cancel` sets a flag that is checked between stages and between chunks. The meeting becomes `cancelled`, and completed work is kept.
+- **Idempotency:** a repeated `Idempotency-Key` on upload or process replays the first response (`Idempotent-Replayed: true`). Reusing a key for a different request returns 409.
+
+### Progress and webhooks
+
+- `GET /meetings/{id}/status` returns a snapshot: status, `percent`, `current_stage`, per-stage status and chunk, `elapsed_seconds` and `eta_seconds`. ETA is measured from the run's start and the weighted progress so far.
+- `GET /meetings/{id}/status/stream` is a Server-Sent Events stream of the same snapshots, pushed from Redis pub/sub. It closes when the run finishes.
+- `callback_url` (on upload, or overridden on process) receives `POST {"meeting_id", "status"}` when the run finishes:
+  - it's signed with `X-Polymom-Signature: sha256=HMAC(WEBHOOK_SECRET, "{X-Polymom-Timestamp}.{body}")`;
+  - it's retried with exponential backoff on network errors, 429 and 5xx.
+- **Webhook SSRF protection:** only `http`/`https` URLs are accepted. The host is resolved at validation and again at delivery, and loopback, private, link-local (cloud metadata), reserved and multicast addresses are refused.
+
+```python
+import hashlib, hmac
+
+expected = "sha256=" + hmac.new(secret, f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+assert hmac.compare_digest(expected, request.headers["X-Polymom-Signature"])
+```
+
+### Failure handling
+
+| Failure | What happens |
+| --- | --- |
+| Transient error (LLM 429/5xx, network, stage or ffmpeg timeout) | Retried with exponential backoff (`RETRY_BACKOFF_SECONDS` × 2^n, capped at 10 min) up to `MAX_RETRIES`; the retry resumes at the failed stage |
+| Permanent error (corrupted media, validation, missing credentials, unsupported language) | Not retried; run and meeting `failed` with code, message and remediation |
+| Optional stage fails (summarization) | Meeting `completed_with_errors`; transcript and analytics stay available |
+| Stage exceeds `STAGE_TIMEOUTS` | `stage_timeout` (retryable) |
+| GPU out of memory | CUDA cache freed, stage retried once on CPU (`polymom_gpu_oom_fallbacks_total`); `resource_exhausted` if the CPU fails too |
+| Worker killed / crashes | Heartbeat stops; the reaper (cpu worker, every minute) re-queues runs silent for `STUCK_JOB_SECONDS`; they resume from checkpoints |
+| SIGTERM (deploy, scale-down) | Worker stops at the next chunk or stage boundary, checkpoints, and enqueues a continuation; `stop_grace_period` > `SHUTDOWN_GRACE_SECONDS` |
+| Hand-off loop (bug or config drift between workers) | Stopped after 20 hand-offs with `handoff_loop` |
+| Webhook endpoint down | Retried up to `WEBHOOK_MAX_ATTEMPTS`; never affects the meeting's status |
+| Unhandled exception in the API | Generic `internal_error` 500 with `request_id`; the traceback is only in the logs |
+
+Every error response has the same shape: `{"error": {"code", "message", "remediation", "details", "request_id"}}`. The `X-Request-ID` header is accepted or generated, returned on the response, bound to every log line and passed on to the jobs.
+
+### Security model
+
+- **API keys:** keys are sent in `X-API-Key` and stored as SHA-256 hashes.
+  - Create them with `python -m scripts.create_api_key --label ci`; `--list` and `--revoke <prefix>` are also available.
+  - The plaintext key is printed once.
+- **Tenant isolation (OWASP API1, BOLA):** every meeting records its owning key. Reads, writes, lists, search and duplicate detection are scoped to that key. Another tenant's meeting returns 404, not 403, so its existence isn't revealed.
+- **Rate limits:** per key (or per IP when auth is off), with a moving window stored in Redis and shared by API replicas.
+  - `RATE_LIMIT_DEFAULT` applies everywhere; the stricter `RATE_LIMIT_UPLOAD` applies to upload, process and regenerate.
+  - A 429 carries `Retry-After`.
+  - This uses `limits`, the engine behind slowapi. slowapi's module-level decorators don't fit the app factory, where each app has its own settings.
+- **Uploads:**
+  - size and duration limits (`MAX_UPLOAD_MB`, `MAX_AUDIO_DURATION_MINUTES`, returning 422 `audio_too_long`);
+  - magic-byte checks and sanitized filenames;
+  - ffmpeg and ffprobe run with `-protocol_whitelist file,pipe,fd`, so crafted playlists and containers can't fetch URLs or read other files;
+  - files are stored under keys, outside any served path.
+- **HTTP:** a CORS allowlist (`CORS_ORIGINS`), security headers (`nosniff`, `DENY`, a strict CSP, `no-store`, and HSTS in production), and body-size limits.
+- **Secrets and CI:** secrets come only from the environment. `APP_ENV=production` refuses to start when auth is off, `REDIS_URL` or needed credentials are missing, or CORS is `*`. CI runs `pip-audit` on the locked dependencies and `gitleaks` on the history.
+
+### Observability
+
+- **Prometheus:** metrics at `/api/v1/metrics`, and on `:9101` for each worker:
+  - request count and latency by route template, jobs by status, queue depth;
+  - stage duration and real-time factor histograms, audio minutes processed;
+  - LLM tokens and cost, retries, OOM fallbacks, webhook results.
+- **Health:** `/api/v1/health/live` checks that the process is up. `/api/v1/health/ready` checks the database, Redis and the artifact store, and reports model availability for information only (the API doesn't load models).
+- **Tracing:** with `OTEL_ENABLED=true` and `uv sync --extra otel`, there are OpenTelemetry spans for API requests, jobs and stages, exported over OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- **Dashboards:** `docker compose --profile monitoring up` adds Prometheus (:9090) and Grafana (:3000) with the provisioned *Polymom* dashboard (`docker/grafana/dashboards/polymom.json`).
+
+### Scaling guidance
+
+- **API:** stateless. Run several replicas behind a load balancer; rate limits and idempotency live in Redis and Postgres.
+- **gpu workers:** one per GPU with `QUEUE_CONCURRENCY_GPU=1`. Add GPUs to add throughput. Watch `polymom_queue_depth{queue="gpu"}` and `polymom_stage_real_time_factor`.
+- **cpu workers:** cheap; scale on `queue_depth{queue="cpu"}`.
+- **llm workers:** limited by provider rate limits, not local resources. Raise `QUEUE_CONCURRENCY_LLM` until you see 429 retries.
+- **Storage:** use Postgres and `ARTIFACT_STORE=s3` for more than one host, since checkpoints and processed audio must be visible to every worker.
+
+**Load test** (`scripts/load_test.py`, Locust, mock backends): 50 users for 90 s against one API container on a laptop (Docker Desktop, Windows):
+
+| Endpoint | Requests | Failures | Median | p95 | req/s |
+| --- | --- | --- | --- | --- | --- |
+| `POST /meetings` (upload) | 202 | 0 | 810 ms | 1.2 s | 2.4 |
+| `POST /meetings/{id}/process` | 199 | 0 | 560 ms | 930 ms | 2.4 |
+| `GET /meetings/{id}/status` | 1176 | 0 | 450 ms | 880 ms | 14.2 |
+| `GET /meetings` | 453 | 0 | 970 ms | 1.4 s | 5.5 |
+| **All** | 2030 | **0** | 520 ms | 1.3 s | 24.6 |
+
+All 202 meetings uploaded during the test were processed by the workers. Raw numbers are in `docs/load/results_stats.csv`. The rate limits were raised for this run; with the defaults, the extra uploads get 429.
+
+### Configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `REDIS_URL` | – | Queue, progress, cancel flags, rate limits |
+| `PIPELINE_EXECUTION` | `queue` | `inline` for tests and local debugging only |
+| `QUEUE_CONCURRENCY_CPU` / `_GPU` / `_LLM` | `4` / `1` / `4` | Jobs per worker process |
+| `STAGE_TIMEOUTS` | per stage | e.g. `diarize:7200,transcribe:10800` |
+| `MAX_RETRIES`, `RETRY_BACKOFF_SECONDS` | `3`, `10` | Transient failures only |
+| `STUCK_JOB_SECONDS`, `HEARTBEAT_SECONDS` | `600`, `15` | Stuck-job reaper |
+| `SHUTDOWN_GRACE_SECONDS` | `120` | Time to reach a checkpoint on SIGTERM |
+| `MAX_AUDIO_DURATION_MINUTES` | `240` | Longer recordings get 422 |
+| `WEBHOOK_SECRET`, `WEBHOOK_MAX_ATTEMPTS` | –, `5` | Webhooks are skipped without a secret |
+| `API_KEY_REQUIRED` | `true` | Required in production |
+| `RATE_LIMIT_DEFAULT`, `RATE_LIMIT_UPLOAD` | `120/minute`, `10/minute` | Per API key |
+| `CORS_ORIGINS` | none | Comma-separated allowlist |
+| `OTEL_ENABLED` | `false` | Needs the `otel` extra |
+| `WORKER_METRICS_PORT` | `9101` | `0` disables |
+
 ## Running with Docker
 
 ```bash
 make docker-build   # build polymom:latest
-make docker-up      # docker compose up on port 8000 (reads .env if present)
+make docker-up      # API, cpu/gpu/llm workers, Postgres and Redis on port 8000 (reads .env)
 ```
+
+Compose runs the mock ML backends by default, so the whole stack works without a GPU; set the `*_BACKEND` variables and `INSTALL_ML=true` for real models.
 
 ```bash
 make docker-build-ml                                   # torch (CPU), pyannote, faster-whisper, Odia ASR
@@ -1044,7 +1197,7 @@ INSTALL_ML=true docker compose -f docker/docker-compose.yml up --build
 
 By default the image stays light, without ML. `INSTALL_ML=true` adds torch, pyannote and faster-whisper, and `INSTALL_INDIC=true` adds the Odia ASR runtime; `TORCH_VARIANT` swaps in CUDA wheels of the same torch version. Downloaded models are cached in the `model-cache` volume (`HF_HOME=/app/.cache/huggingface`), so they survive restarts.
 
-The image uses a multi-stage build, runs as a non-root `app` user, installs `ffmpeg` and `libmagic`, and defines a `HEALTHCHECK` against `/api/v1/health`. The SQLite database and uploads live in the `storage` volume.
+The image uses a multi-stage build, runs as a non-root `app` user, installs `ffmpeg` and `libmagic`, and defines a `HEALTHCHECK` against `/api/v1/health`. Postgres, Redis, artifacts and model downloads each have their own volume.
 
 ## Roadmap
 
@@ -1060,8 +1213,8 @@ The image uses a multi-stage build, runs as a non-root `app` user, installs `ffm
 | 8 | Speaker statistics ✅ | Talk time, turns, interruptions, WPM, languages, questions per speaker; balance, timeline, CSV, charts |
 | 9 | **LLM summarization** ✅ | Grounded summary, decisions, action items; OpenAI/Azure/Anthropic/Ollama; map-reduce, verifier, injection flags, eval |
 | 10 | **Storage & retrieval** ✅ | Run history, normalized results, artifact store (local/S3), consolidated result + JSON Schema, docx/pdf/md/json exports, search, retention |
-| 11 | Background workers & persistence | Job queue, durable DB, retries |
-| 12 | Hardening & deployment | Auth, rate limiting, observability, GPU image, release |
+| 11 | **Workers & hardening** ✅ | arq queues per resource, resumable/checkpointed runs, cancel, SSE progress, signed webhooks, API keys + tenant isolation, rate limits, metrics, tracing |
+| 12 | Tests, Docker & final docs | Test hardening, production images, deployment guide, release |
 
 ## License
 

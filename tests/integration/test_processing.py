@@ -73,6 +73,8 @@ async def test_failed_processing_records_typed_error(
     settings = Settings(
         _env_file=None,
         app_env="test",
+        api_key_required=False,
+        pipeline_execution="inline",
         storage_dir=tmp_path,
         ffmpeg_path="no-such-ffmpeg-xyz",
         diarization_backend="mock",

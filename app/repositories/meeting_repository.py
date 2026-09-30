@@ -33,6 +33,7 @@ class MeetingQuery:
     order: Literal["asc", "desc"] = "desc"
     cursor: str | None = None
     limit: int = 20
+    owner_key_id: int | None = None
 
 
 @dataclass
@@ -65,8 +66,10 @@ class MeetingRepository(ABC):
     async def get(self, meeting_id: uuid.UUID) -> Meeting | None: ...
 
     @abstractmethod
-    async def get_by_sha256(self, sha256: str) -> Meeting | None:
-        """Oldest meeting with this upload hash."""
+    async def get_by_sha256(
+        self, sha256: str, *, owner_key_id: int | None = None
+    ) -> Meeting | None:
+        """Oldest meeting with this upload hash owned by the caller."""
 
     @abstractmethod
     async def page(self, query: MeetingQuery) -> MeetingPage: ...
@@ -93,10 +96,13 @@ class SqlAlchemyMeetingRepository(MeetingRepository):
     async def get(self, meeting_id: uuid.UUID) -> Meeting | None:
         return await self._session.get(Meeting, meeting_id)
 
-    async def get_by_sha256(self, sha256: str) -> Meeting | None:
-        return await self._session.scalar(
-            select(Meeting).where(Meeting.sha256 == sha256).order_by(Meeting.created_at).limit(1)
-        )
+    async def get_by_sha256(
+        self, sha256: str, *, owner_key_id: int | None = None
+    ) -> Meeting | None:
+        stmt = select(Meeting).where(Meeting.sha256 == sha256)
+        if owner_key_id is not None:
+            stmt = stmt.where(Meeting.owner_key_id == owner_key_id)
+        return await self._session.scalar(stmt.order_by(Meeting.created_at).limit(1))
 
     async def page(self, query: MeetingQuery) -> MeetingPage:
         filters: list[ColumnElement[bool]] = []
@@ -112,6 +118,8 @@ class SqlAlchemyMeetingRepository(MeetingRepository):
             filters.append(Meeting.num_speakers >= query.min_speakers)
         if query.max_speakers is not None:
             filters.append(Meeting.num_speakers <= query.max_speakers)
+        if query.owner_key_id is not None:
+            filters.append(Meeting.owner_key_id == query.owner_key_id)
         total = await self._session.scalar(
             select(func.count()).select_from(Meeting).where(*filters)
         )

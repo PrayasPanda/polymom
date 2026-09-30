@@ -52,17 +52,32 @@ def upload_key(meeting_id: uuid.UUID, extension: str) -> str:
 
 
 class MeetingService:
+    """Services scope every read and write to the caller's ``owner_key_id``.
+
+    A meeting whose ``owner_key_id`` does not match the caller is reported as
+    ``meeting_not_found`` (never leak its existence to another tenant).
+    ``owner_key_id=None`` means unscoped, used by workers and admin scripts.
+    """
+
     def __init__(
         self,
         uow: UnitOfWork,
         validator: MediaValidator,
         settings: Settings,
         store: ArtifactStore,
+        owner_key_id: int | None = None,
     ) -> None:
         self.uow = uow
         self.store = store
+        self.owner_key_id = owner_key_id
         self._validator = validator
         self._settings = settings
+
+    def _check_owner(self, meeting: Meeting) -> None:
+        if self.owner_key_id is not None and meeting.owner_key_id != self.owner_key_id:
+            raise MeetingNotFoundError(
+                f"Meeting {meeting.id} not found.", details={"meeting_id": str(meeting.id)}
+            )
 
     # --- upload ---
 
@@ -75,6 +90,7 @@ class MeetingService:
         expected_speakers: int | None,
         languages: list[str],
         allow_duplicate: bool = False,
+        callback_url: str | None = None,
     ) -> tuple[Meeting, bool]:
         """Validate and store an upload, then record it as ``queued``.
 
@@ -92,7 +108,9 @@ class MeetingService:
                 raise
             try:
                 if not allow_duplicate:
-                    existing = await self.uow.meetings.get_by_sha256(media.sha256)
+                    existing = await self.uow.meetings.get_by_sha256(
+                        media.sha256, owner_key_id=self.owner_key_id
+                    )
                     if existing is not None:
                         logger.info("upload_duplicate", existing=str(existing.id))
                         return existing, True
@@ -110,6 +128,8 @@ class MeetingService:
                 id=meeting_id,
                 title=title,
                 original_filename=media.original_filename,
+                owner_key_id=self.owner_key_id,
+                callback_url=callback_url,
                 upload_key=key,
                 sha256=media.sha256,
                 mime_type=media.mime_type,
@@ -138,9 +158,11 @@ class MeetingService:
             raise MeetingNotFoundError(
                 f"Meeting {meeting_id} not found.", details={"meeting_id": str(meeting_id)}
             )
+        self._check_owner(meeting)
         return meeting
 
     async def page(self, query: MeetingQuery) -> MeetingPage:
+        query.owner_key_id = self.owner_key_id
         return await self.uow.meetings.page(query)
 
     async def default_run(self, meeting_id: uuid.UUID) -> ProcessingRun | None:
@@ -356,19 +378,23 @@ class MeetingService:
 
     # --- lifecycle ---
 
-    async def request_processing(self, meeting_id: uuid.UUID, *, force: bool = False) -> Meeting:
+    async def request_processing(
+        self, meeting_id: uuid.UUID, *, force: bool = False, from_stage: str | None = None
+    ) -> Meeting:
         """Mark a meeting as ``processing`` so the pipeline can be scheduled.
 
-        Setting the status here, before the background task starts, makes a
-        second request see ``processing`` and get a 409 instead of double-running.
+        Setting the status here, before the job starts, makes a second request see
+        ``processing`` and get a 409 instead of double-running. ``from_stage`` on a
+        finished meeting is an explicit rerun, so it does not need ``force``.
         """
         meeting = await self.get(meeting_id)
-        busy = (
-            MeetingStatus.PROCESSING,
-            MeetingStatus.COMPLETED,
-            MeetingStatus.COMPLETED_WITH_ERRORS,
-        )
-        if meeting.status in busy and not force:
+        if meeting.status == MeetingStatus.PROCESSING and not force:
+            raise MeetingStateConflictError(
+                "Meeting is already processing. Cancel it first, or use ?force=true.",
+                details=self._details(meeting),
+            )
+        finished = (MeetingStatus.COMPLETED, MeetingStatus.COMPLETED_WITH_ERRORS)
+        if meeting.status in finished and not force and from_stage is None:
             raise MeetingStateConflictError(
                 f"Meeting is already {meeting.status.value}. Use ?force=true to reprocess.",
                 details=self._details(meeting),

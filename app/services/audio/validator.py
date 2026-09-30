@@ -18,6 +18,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.config import Settings
 from app.core.exceptions import (
+    AudioTooLongError,
     CorruptedMediaError,
     EmptyFileError,
     FileTooLargeError,
@@ -152,6 +153,8 @@ class MediaValidator:
         cmd = [
             self._settings.ffprobe_path,
             *("-v", "error", "-print_format", "json", "-show_format", "-show_streams"),
+            # Prevent SSRF / LFI via crafted containers that reference external URLs.
+            *("-protocol_whitelist", "file,pipe,fd"),
             str(path),
         ]
         try:
@@ -184,6 +187,19 @@ class MediaValidator:
             ) from exc
 
         return self._audio_metadata(info)
+
+    def _check_duration(self, metadata: AudioMetadata) -> None:
+        limit_seconds = self._settings.max_audio_duration_minutes * 60
+        duration = metadata.duration_seconds or 0.0
+        if duration > limit_seconds:
+            raise AudioTooLongError(
+                f"Audio is {duration / 60:.1f} minutes; the limit is "
+                f"{self._settings.max_audio_duration_minutes:g} minutes.",
+                details={
+                    "duration_seconds": round(duration, 1),
+                    "max_audio_duration_minutes": self._settings.max_audio_duration_minutes,
+                },
+            )
 
     @staticmethod
     def _audio_metadata(info: dict[str, Any]) -> AudioMetadata:
@@ -223,6 +239,7 @@ class MediaValidator:
                 raise EmptyFileError("The uploaded file is empty.")
             mime = self.check_magic(head, ext)
             metadata = await self.probe(partial)
+            self._check_duration(metadata)
             partial.replace(final)
         except BaseException:
             partial.unlink(missing_ok=True)

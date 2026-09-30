@@ -104,6 +104,8 @@ async def test_asr_failure_keeps_earlier_stage_outputs(
     settings = Settings(
         _env_file=None,
         app_env="test",
+        api_key_required=False,
+        pipeline_execution="inline",
         storage_dir=tmp_path,
         diarization_backend="mock",
         asr_backend="real",

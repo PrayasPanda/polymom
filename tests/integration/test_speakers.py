@@ -94,6 +94,8 @@ async def test_missing_model_marks_meeting_failed_with_actionable_error(
     settings = Settings(
         _env_file=None,
         app_env="test",
+        api_key_required=False,
+        pipeline_execution="inline",
         storage_dir=tmp_path,
         diarization_backend="pyannote",
         asr_backend="mock",

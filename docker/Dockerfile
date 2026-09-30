@@ -23,8 +23,8 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    EXTRAS=""; \
-    if [ "$INSTALL_ML" = "true" ]; then EXTRAS="--extra ml"; fi; \
+    EXTRAS="--extra postgres --extra s3"; \
+    if [ "$INSTALL_ML" = "true" ]; then EXTRAS="$EXTRAS --extra ml"; fi; \
     if [ "$INSTALL_INDIC" = "true" ]; then EXTRAS="$EXTRAS --extra indic"; fi; \
     uv sync --frozen --no-dev --no-install-project $EXTRAS
 # Swap the locked CPU torch wheels for a CUDA build of the same version.
@@ -38,8 +38,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY app ./app
 # For CUDA builds keep the swapped torch wheels and their nvidia-* dependencies.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    FLAGS=""; \
-    if [ "$INSTALL_INDIC" = "true" ]; then FLAGS="--extra indic"; fi; \
+    FLAGS="--extra postgres --extra s3"; \
+    if [ "$INSTALL_INDIC" = "true" ]; then FLAGS="$FLAGS --extra indic"; fi; \
     if [ "$INSTALL_ML" = "true" ]; then FLAGS="$FLAGS --extra ml"; \
         if [ "$TORCH_VARIANT" != "cpu" ]; then \
             FLAGS="$FLAGS --inexact --no-install-package torch --no-install-package torchaudio"; \
@@ -61,6 +61,8 @@ ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=app:app app ./app
+# Operational scripts (API keys, retention cleanup) run with `docker compose exec`.
+COPY --chown=app:app scripts ./scripts
 RUN mkdir -p /app/storage /app/.cache/huggingface /app/.cache/torch \
     && chown -R app:app /app/storage /app/.cache
 USER app

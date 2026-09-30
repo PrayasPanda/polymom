@@ -69,6 +69,9 @@ class StageResult(Base):
     status: Mapped[str] = mapped_column(String(16))
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     output: Mapped[Any | None] = mapped_column(JSONDocument)
+    fingerprint: Mapped[str | None] = mapped_column(
+        String(64), doc="sha256 of (input artifact, stage config, upstream fingerprints)."
+    )
     output_ref: Mapped[str | None] = mapped_column(
         String(1024), doc="Artifact key when the output is too large to store inline."
     )
