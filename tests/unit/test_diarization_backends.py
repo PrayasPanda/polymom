@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from app.core.config import Settings
-from app.core.exceptions import DiarizationError, DiarizationModelLoadError
+from app.core.exceptions import DiarizationModelLoadError, ResourceExhaustedError
 from app.services.diarization import pyannote_backend
 from app.services.diarization.mock_backend import MockDiarizationBackend, speaker_embedding
 from app.services.diarization.postprocess import RawDiarization
@@ -271,12 +271,14 @@ def test_ml_extras_missing(monkeypatch: pytest.MonkeyPatch) -> None:
         pyannote_backend.load_pipeline(hf_settings())
 
 
-async def test_inference_failure(fake_ml: dict[str, Any], tmp_path: Path) -> None:
-    fake_ml["pipeline"] = FakePipeline(fail=True)
+async def test_cuda_oom_falls_back_to_cpu_then_reports_exhaustion(
+    fake_ml: dict[str, Any], tmp_path: Path
+) -> None:
+    fake_ml["pipeline"] = FakePipeline(fail=True)  # raises "CUDA out of memory" on GPU and CPU
 
-    with pytest.raises(DiarizationError, match="CUDA out of memory") as exc:
+    with pytest.raises(ResourceExhaustedError, match="GPU and CPU") as exc:
         await PyannoteDiarizationBackend(hf_settings()).diarize(tmp_path / "a.wav")
-    assert exc.value.code == "diarization_failed"
+    assert exc.value.code == "resource_exhausted"
 
 
 def test_to_raw_without_embeddings() -> None:

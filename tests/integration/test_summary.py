@@ -74,10 +74,10 @@ async def test_llm_failure_keeps_transcript_and_analytics(
 
         meeting = (await client.get(f"{URL}/{meeting_id}")).json()
         assert meeting["status"] == "completed_with_errors"
-        assert meeting["error"].startswith("summarize: llm_error: LLM_API_KEY is required")
+        assert meeting["error"].startswith("summarize: llm_not_configured: LLM_API_KEY is required")
         summary = await client.get(f"{URL}/{meeting_id}/summary")
         assert summary.status_code == 409
-        assert summary.json()["error"]["details"]["summary_error"].startswith("llm_error")
+        assert summary.json()["error"]["details"]["summary_error"].startswith("llm_not_configured")
         assert (await client.get(f"{URL}/{meeting_id}/transcript")).status_code == 200
         assert (await client.get(f"{URL}/{meeting_id}/analytics")).status_code == 200
 
