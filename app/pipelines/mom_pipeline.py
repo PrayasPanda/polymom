@@ -7,27 +7,32 @@ Stages marked ``optional`` (summarization) may fail without failing the meeting:
 earlier outputs are kept and the status becomes ``completed_with_errors``.
 """
 
+import asyncio
+import hashlib
 import json
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import structlog
 from pydantic import BaseModel
 
 from app.core.config import Settings
-from app.core.exceptions import PolymomError, ValidationError
+from app.core.exceptions import PolymomError, StageTimeoutError, ValidationError
 from app.core.logging import get_logger
+from app.core.tracing import span
 from app.db.base import utcnow
 from app.repositories.artifacts import ArtifactStore, run_key
 from app.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
 
 if TYPE_CHECKING:
+    from app.pipelines.checkpoints import ChunkHooks
     from app.workers.progress import ProgressReporter
 
 
@@ -93,6 +98,12 @@ class PipelineContext:
     processed_path: Path | None = None
     outputs: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, int] = field(default_factory=dict)
+    fingerprints: dict[str, str] = field(default_factory=dict)
+    hooks_for: "Callable[[str], ChunkHooks | None] | None" = None
+    """Chunk checkpoint/stop hooks for long stages (diarize, transcribe)."""
+
+    def hooks(self, stage: str) -> "ChunkHooks | None":
+        return self.hooks_for(stage) if self.hooks_for else None
 
 
 class PipelineStage(ABC):
@@ -105,6 +116,21 @@ class PipelineStage(ABC):
     name: ClassVar[str]
     optional: ClassVar[bool] = False
     """An optional stage's failure is recorded but does not fail the meeting."""
+    queue: ClassVar[str] = "cpu"
+    """Worker queue that runs this stage: cpu, gpu or llm."""
+    config_keys: ClassVar[tuple[str, ...]] = ()
+    """Settings that change this stage's output; part of its fingerprint."""
+
+    def fingerprint(self, settings: Settings, upstream: str) -> str:
+        """sha256 of the stage name, its config (incl. model names) and the upstream hash."""
+        dumped = settings.model_dump(mode="json")
+        payload = {
+            "stage": self.name,
+            "upstream": upstream,
+            "config": {k: dumped.get(k) for k in self.config_keys},
+        }
+        raw = json.dumps(payload, sort_keys=True, default=str).encode()
+        return hashlib.sha256(raw).hexdigest()
 
     @abstractmethod
     async def run(self, context: PipelineContext) -> None: ...
@@ -120,12 +146,25 @@ class PipelineStage(ABC):
 
     async def persist(self, context: PipelineContext, writer: "RunWriter") -> None:
         await writer.save_stage(
-            self.name, self.output(context), duration_ms=context.timings_ms.get(self.name)
+            self.name,
+            self.output(context),
+            duration_ms=context.timings_ms.get(self.name),
+            fingerprint=writer.fingerprint,
         )
 
 
 class PreprocessStage(PipelineStage):
     name = "preprocess"
+    config_keys = (
+        "target_sample_rate",
+        "target_loudness_lufs",
+        "enable_highpass",
+        "highpass_cutoff_hz",
+        "enable_denoise",
+        "trim_silence",
+        "silence_threshold_db",
+        "silence_min_duration_seconds",
+    )
 
     def __init__(self, preprocessor: AudioPreprocessor) -> None:
         self._preprocessor = preprocessor
@@ -139,11 +178,29 @@ class PreprocessStage(PipelineStage):
         result: PreprocessResult = context.outputs[self.name]
         return result.model_dump(mode="json", exclude={"processed_path"})
 
+    async def persist(self, context: PipelineContext, writer: "RunWriter") -> None:
+        """Store the processed audio right away so a worker on another host can continue."""
+        await super().persist(context, writer)
+        if context.processed_path is not None and context.processed_path.is_file():
+            key = run_key(writer.meeting_id, writer.run_id, "processed.wav")
+            await writer.store.put_file(key, context.processed_path, "audio/wav")
+
 
 class DiarizationStage(PipelineStage):
     """Who spoke when, on the preprocessed audio. Requires :class:`PreprocessStage`."""
 
     name = "diarize"
+    queue = "gpu"
+    config_keys = (
+        "diarization_backend",
+        "diarization_model",
+        "merge_gap_seconds",
+        "min_turn_seconds",
+        "diarization_chunk_threshold_seconds",
+        "speaker_similarity_threshold",
+        "chunk_length_seconds",
+        "chunk_overlap_seconds",
+    )
 
     def __init__(self, service: DiarizationService) -> None:
         self._service = service
@@ -152,7 +209,10 @@ class DiarizationStage(PipelineStage):
         if context.processed_path is None:
             raise RuntimeError("DiarizationStage requires PreprocessStage to run first")
         context.outputs[self.name] = await self._service.diarize(
-            context.meeting_id, context.processed_path, num_speakers=context.expected_speakers
+            context.meeting_id,
+            context.processed_path,
+            num_speakers=context.expected_speakers,
+            hooks=context.hooks(self.name),
         )
 
     def model_version(self, context: PipelineContext) -> str | None:
@@ -174,6 +234,15 @@ class LanguageIdentificationStage(PipelineStage):
     """
 
     name = "identify_languages"
+    queue = "gpu"
+    config_keys = (
+        "lid_backend",
+        "lid_model_id",
+        "lid_min_confidence",
+        "lid_min_window_seconds",
+        "lid_max_window_seconds",
+        "supported_languages",
+    )
 
     def __init__(self, service: LanguageIdService) -> None:
         self._service = service
@@ -206,6 +275,22 @@ class TranscriptionStage(PipelineStage):
     """
 
     name = "transcribe"
+    queue = "gpu"
+    config_keys = (
+        "asr_backend",
+        "whisper_model_size",
+        "whisper_compute_type",
+        "odia_model_id",
+        "odia_decoding",
+        "asr_language_backends",
+        "asr_beam_size",
+        "asr_vad_filter",
+        "asr_low_confidence_threshold",
+        "asr_compression_ratio_threshold",
+        "asr_no_speech_threshold",
+        "chunk_length_seconds",
+        "chunk_overlap_seconds",
+    )
 
     def __init__(self, service: TranscriptionService) -> None:
         self._service = service
@@ -223,7 +308,10 @@ class TranscriptionStage(PipelineStage):
             )
         else:
             result = await self._service.transcribe(
-                context.meeting_id, context.processed_path, context.languages_hint
+                context.meeting_id,
+                context.processed_path,
+                context.languages_hint,
+                hooks=context.hooks(self.name),
             )
         context.outputs[self.name] = result
 
@@ -241,6 +329,7 @@ class TranscriptionStage(PipelineStage):
                 LanguageIdentificationStage.name,
                 language_id.summary,
                 duration_ms=context.timings_ms.get(LanguageIdentificationStage.name),
+                fingerprint=context.fingerprints.get(LanguageIdentificationStage.name),
             )
 
 
@@ -251,6 +340,12 @@ class AlignmentStage(PipelineStage):
     """
 
     name = "align"
+    config_keys = (
+        "align_max_gap_seconds",
+        "align_merge_gap_seconds",
+        "utterance_max_seconds",
+        "utterance_min_words",
+    )
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -286,6 +381,12 @@ class AnalyticsStage(PipelineStage):
     """Speaker-wise and meeting-level conversation statistics. Requires :class:`AlignmentStage`."""
 
     name = "analytics"
+    config_keys = (
+        "interruption_min_overlap_seconds",
+        "bucket_seconds",
+        "gini_balanced_max",
+        "gini_dominated_min",
+    )
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -323,6 +424,16 @@ class SummarizationStage(PipelineStage):
 
     name = "summarize"
     optional = True
+    queue = "llm"
+    config_keys = (
+        "llm_provider",
+        "llm_model",
+        "llm_temperature",
+        "summary_output_language",
+        "summary_single_pass_tokens",
+        "summary_chunk_tokens",
+        "evidence_match_threshold",
+    )
 
     def __init__(self, settings: Settings, llm: LLMClient | None = None) -> None:
         self._settings = settings
@@ -367,7 +478,9 @@ async def save_summary(
     writer: "RunWriter", summary: MeetingSummary, duration_ms: int | None
 ) -> None:
     """Summaries live in their own table; the stage row only records status and timing."""
-    await writer.save_stage(SummarizationStage.name, None, duration_ms=duration_ms)
+    await writer.save_stage(
+        SummarizationStage.name, None, duration_ms=duration_ms, fingerprint=writer.fingerprint
+    )
     await writer.uow.results.add_summary(writer.meeting_id, writer.run_id, summary)
     await writer.uow.search.index_summary(writer.meeting_id, writer.run_id, summary)
 
@@ -376,6 +489,29 @@ def _error_message(exc: Exception, stage: str) -> str:
     if isinstance(exc, PolymomError):
         return f"{exc.code}: {exc.message}"
     return f"internal_error: Unexpected failure in stage '{stage}'."
+
+
+@dataclass
+class _Outcome:
+    """How a pass over the stages ended: finished, handed off to another queue, or interrupted."""
+
+    kind: Literal["finished", "handoff", "interrupted"]
+    status: MeetingStatus | None = None
+    error: str | None = None
+    queue: str | None = None
+
+
+class TransientStageError(Exception):
+    """A required stage failed with a retryable error; the job queue should retry.
+
+    Completed stages are already committed, so the retry resumes at this stage.
+    """
+
+    def __init__(self, stage: str, cause: PolymomError) -> None:
+        super().__init__(f"{stage}: {cause.code}: {cause.message}")
+        self.stage = stage
+        self.cause = cause
+        self.run_id: uuid.UUID | None = None
 
 
 def config_snapshot(settings: Settings) -> dict[str, Any]:
@@ -396,6 +532,7 @@ class RunWriter:
     meeting_id: uuid.UUID
     run_id: uuid.UUID
     inline_max_bytes: int
+    fingerprint: str | None = None
 
     async def save_stage(
         self,
@@ -405,6 +542,7 @@ class RunWriter:
         status: str = "completed",
         duration_ms: int | None = None,
         error: str | None = None,
+        fingerprint: str | None = None,
     ) -> None:
         data = output.model_dump(mode="json") if isinstance(output, BaseModel) else output
         ref = None
@@ -422,6 +560,7 @@ class RunWriter:
             output_ref=ref,
             duration_ms=duration_ms,
             error=error,
+            fingerprint=fingerprint,
         )
 
 
@@ -456,18 +595,30 @@ class MoMPipeline:
         self,
         meeting_id: uuid.UUID,
         *,
+        run_id: uuid.UUID | None = None,
         from_stage: str | None = None,
         cancel_check: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
         progress: "ProgressReporter | None" = None,
+        queue: str | None = None,
+        handoff: Callable[[uuid.UUID, str], Awaitable[None]] | None = None,
+        shutdown_check: Callable[[], bool] | None = None,
     ) -> MeetingStatus | None:
-        """Process one meeting. Never raises for stage failures; returns the final status.
+        """Process one meeting, or continue an existing run.
 
-        - ``from_stage``: reuse the latest successful run's outputs before this stage
-          (e.g. only rerun summarization). A new run is still recorded, with the
-          reused stages copied in and marked ``skipped``.
-        - ``cancel_check``: awaited between stages; a truthy result cancels the run
-          and marks the meeting ``cancelled``.
-        - ``progress``: pushes stage/chunk updates to Redis (:mod:`app.workers.progress`).
+        - ``run_id``: continue that run (a hand-off, a retry after a crash, or a
+          re-queue by the stuck-job reaper). Stages already completed in the run are
+          skipped when their stored fingerprint still matches; the rest run.
+        - ``from_stage``: new run that reuses the latest successful run's outputs
+          for every stage before this one (e.g. rerun only summarization).
+        - ``queue`` + ``handoff``: this worker only runs stages of its own queue
+          (cpu, gpu or llm); at the first stage of another queue it calls
+          ``handoff(run_id, that_queue)`` and returns ``PROCESSING``.
+        - ``cancel_check`` / ``shutdown_check``: checked between stages and chunks.
+          Cancel marks the meeting ``cancelled``; shutdown leaves the run
+          ``processing`` so the job can be retried and resume where it stopped.
+
+        Never raises for stage failures; returns the meeting status (``None`` if the
+        meeting does not exist).
         """
         from app.workers.progress import NullProgressReporter
 
@@ -480,9 +631,6 @@ class MoMPipeline:
                     return None
                 meeting.status = MeetingStatus.PROCESSING
                 meeting.error = None
-                run = await uow.results.create_run(meeting_id, config_snapshot(self._settings))
-                run_id, upload_key = run.id, meeting.upload_key
-                audio_seconds = meeting.duration_seconds
                 context = PipelineContext(
                     meeting_id=meeting_id,
                     input_path=Path(),
@@ -490,24 +638,123 @@ class MoMPipeline:
                     languages_hint=list(meeting.languages_hint or []),
                     meeting_date=meeting.created_at.date() if meeting.created_at else None,
                 )
+                self._compute_fingerprints(context, meeting.sha256 or meeting.upload_key)
+                upload_key, audio_seconds = meeting.upload_key, meeting.duration_seconds
                 skipped: set[str] = set()
-                if from_stage is not None:
-                    skipped = await self._seed_from_previous_run(
-                        uow, meeting_id, run_id, from_stage, context
-                    )
+                run = await uow.results.get_run(meeting_id, run_id) if run_id else None
+                if run is not None:
+                    skipped = await self._load_completed_stages(uow, run.id, context)
+                else:
+                    run = await uow.results.create_run(meeting_id, config_snapshot(self._settings))
+                    if from_stage is not None:
+                        skipped = await self._seed_from_previous_run(
+                            uow, meeting_id, run.id, from_stage, context
+                        )
+                run.status = "processing"
+                current_run_id = run.id
                 await uow.commit()
 
-            await reporter.start(run_id, [s.name for s in self.stages], audio_seconds)
+            await reporter.start(current_run_id, [s.name for s in self.stages], audio_seconds)
             for name in skipped:
                 await reporter.stage(name, "skipped")
-            with structlog.contextvars.bound_contextvars(run_id=str(run_id)):
-                status, error, versions = await self._run_stages(
-                    context, upload_key, run_id, skipped, cancel_check, reporter
+            with structlog.contextvars.bound_contextvars(run_id=str(current_run_id)):
+                attempt = 0
+                while True:
+                    try:
+                        outcome = await self._run_stages(
+                            context,
+                            upload_key,
+                            current_run_id,
+                            skipped,
+                            cancel_check,
+                            reporter,
+                            queue,
+                            handoff,
+                            shutdown_check,
+                        )
+                        break
+                    except TransientStageError as transient:
+                        from app.core.metrics import STAGE_RETRIES
+
+                        STAGE_RETRIES.labels(transient.stage).inc()
+                        transient.run_id = current_run_id
+                        attempt += 1
+                        if queue is not None:
+                            raise  # the job queue retries with backoff (see app.workers.main)
+                        if attempt > self._settings.max_retries:
+                            outcome = _Outcome(
+                                "finished",
+                                MeetingStatus.FAILED,
+                                f"{transient.cause.code}: {transient.cause.message}",
+                            )
+                            break
+                        logger.warning("stage_retry_inline", stage=transient.stage, attempt=attempt)
+                        await asyncio.sleep(
+                            self._settings.retry_backoff_seconds * 2 ** (attempt - 1)
+                        )
+                        async with self._uow() as uow:
+                            skipped = await self._load_completed_stages(
+                                uow, current_run_id, context
+                            )
+                if outcome.kind != "finished":
+                    self._cleanup_work_file(context)
+                    logger.info("pipeline_paused", reason=outcome.kind, next_queue=outcome.queue)
+                    return MeetingStatus.PROCESSING
+                assert outcome.status is not None  # noqa: S101 - finished always has a status
+                await self._finish(context, current_run_id, outcome.status, outcome.error)
+                self._cleanup_work_file(context)
+            await reporter.finish(outcome.status, outcome.error)
+            return outcome.status
+
+    def _compute_fingerprints(self, context: PipelineContext, root: str) -> None:
+        upstream = hashlib.sha256(
+            json.dumps(
+                {
+                    "input": root,
+                    "languages_hint": context.languages_hint,
+                    "expected_speakers": context.expected_speakers,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        for stage in self.stages:
+            upstream = stage.fingerprint(self._settings, upstream)
+            context.fingerprints[stage.name] = upstream
+
+    async def _load_completed_stages(
+        self, uow: UnitOfWork, run_id: uuid.UUID, context: PipelineContext
+    ) -> set[str]:
+        """Rehydrate stages this run already completed, if their fingerprint still matches.
+
+        A mismatch (settings changed since the crash) makes that stage and every
+        later one run again: fingerprints chain, so downstream hashes differ too.
+        """
+        done: set[str] = set()
+        for stage in self.stages:
+            row = await uow.results.stage_result(run_id, stage.name)
+            if (
+                row is None
+                or row.status not in ("completed", "skipped")
+                or row.fingerprint != context.fingerprints.get(stage.name)
+            ):
+                break
+            output = await load_stage_output(uow.results, self._store, run_id, stage.name)
+            if row.status == "completed" and output is None and stage.name != "summarize":
+                break
+            reified: Any = _reify_stage_output(stage.name, output)
+            if stage.name == LanguageIdentificationStage.name and reified is not None:
+                assert isinstance(reified, LanguageSummary)  # noqa: S101
+                reified = LanguageIdResult(
+                    regions=reified.regions, summary=reified, processing_time_ms=0
                 )
-                processed_key = await self._store_processed_audio(context, run_id)
-                await self._finish(context, run_id, status, error, versions, processed_key)
-            await reporter.finish(status, error)
-            return status
+            if reified is not None:
+                context.outputs[stage.name] = reified
+            if row.duration_ms is not None:
+                context.timings_ms[stage.name] = row.duration_ms
+            done.add(stage.name)
+        if done:
+            logger.info("pipeline_resumed", completed=sorted(done))
+        return done
 
     async def _seed_from_previous_run(
         self,
@@ -517,12 +764,7 @@ class MoMPipeline:
         from_stage: str,
         context: PipelineContext,
     ) -> set[str]:
-        """Copy every stage before ``from_stage`` from the latest successful run.
-
-        Returns the set of stage names that were skipped. Their outputs are reified
-        into ``context.outputs`` (Pydantic where the stage's own class defines it)
-        so later stages can read them exactly as they would from a fresh run.
-        """
+        """Copy every stage before ``from_stage`` from the latest successful run."""
         stage_names = [s.name for s in self.stages]
         if from_stage not in stage_names:
             raise ValidationError(
@@ -536,17 +778,27 @@ class MoMPipeline:
                 details={"meeting_id": str(meeting_id)},
             )
         writer = self._writer(uow, meeting_id, run_id)
-        stop = stage_names.index(from_stage)
         skipped: set[str] = set()
-        for name in stage_names[:stop]:
+        for name in stage_names[: stage_names.index(from_stage)]:
             output = await load_stage_output(uow.results, self._store, prior.id, name)
             if output is None:
                 continue
-            reified = _reify_stage_output(name, output)
+            reified: Any = _reify_stage_output(name, output)
+            if name == LanguageIdentificationStage.name and isinstance(reified, LanguageSummary):
+                reified = LanguageIdResult(
+                    regions=reified.regions, summary=reified, processing_time_ms=0
+                )
             if reified is not None:
                 context.outputs[name] = reified
-            await writer.save_stage(name, output, status="skipped")
+            await writer.save_stage(
+                name, output, status="skipped", fingerprint=context.fingerprints.get(name)
+            )
             skipped.add(name)
+        prior_audio = run_key(meeting_id, prior.id, "processed.wav")
+        if PreprocessStage.name in skipped and await self._store.exists(prior_audio):
+            await self._store.put(
+                run_key(meeting_id, run_id, "processed.wav"), await self._store.get(prior_audio)
+            )
         return skipped
 
     async def _run_stages(
@@ -557,45 +809,84 @@ class MoMPipeline:
         skipped: set[str],
         cancel_check: Callable[[uuid.UUID], Awaitable[bool]] | None,
         reporter: "ProgressReporter",
-    ) -> tuple[MeetingStatus, str | None, dict[str, str]]:
+        queue: str | None,
+        handoff: Callable[[uuid.UUID, str], Awaitable[None]] | None,
+        shutdown_check: Callable[[], bool] | None,
+    ) -> "_Outcome":
         from app.core.exceptions import JobCancelledError
         from app.core.metrics import AUDIO_MINUTES, STAGE_DURATION, STAGE_RTF
+        from app.pipelines.checkpoints import ChunkHooks, StopReason, StopRequested
 
+        async def should_stop() -> StopReason | None:
+            if shutdown_check is not None and shutdown_check():
+                return "shutdown"
+            if cancel_check is not None and await cancel_check(context.meeting_id):
+                return "cancelled"
+            return None
+
+        def hooks_for(stage: str) -> ChunkHooks:
+            return ChunkHooks(
+                self._store,
+                context.meeting_id,
+                run_id,
+                stage,
+                context.fingerprints.get(stage, "nofingerprint"),
+                reporter,
+                should_stop,
+            )
+
+        context.hooks_for = hooks_for
+        remaining = [s for s in self.stages if s.name not in skipped]
         logger.info(
             "pipeline_started",
-            stages=[s.name for s in self.stages],
+            stages=[s.name for s in remaining],
             skipped=sorted(skipped) or None,
+            queue=queue,
         )
         errors: list[str] = []
-        versions: dict[str, str] = {}
-        remaining = [s for s in self.stages if s.name not in skipped]
-        if not remaining:
-            return MeetingStatus.COMPLETED, None, versions
-        current = remaining[0].name
+        current = remaining[0].name if remaining else ""
+        current_queue = remaining[0].queue if remaining else "cpu"
         audio_seconds = 0.0
         try:
-            async with self._store.local_path(upload_key) as input_path:
-                context.input_path = input_path
+            if not remaining:
+                return _Outcome("finished", MeetingStatus.COMPLETED)
+            async with self._inputs(context, upload_key, run_id, skipped):
                 for stage in remaining:
-                    if cancel_check is not None and await cancel_check(context.meeting_id):
-                        raise JobCancelledError(
-                            f"Pipeline cancelled before stage '{stage.name}'.",
-                            details={"cancelled_before": stage.name},
-                        )
-                    current = stage.name
+                    if queue is not None and handoff is not None and stage.queue != queue:
+                        await handoff(run_id, stage.queue)
+                        return _Outcome("handoff", queue=stage.queue)
+                    if reason := await should_stop():
+                        raise StopRequested(reason)
+                    current, current_queue = stage.name, stage.queue
                     await reporter.stage(stage.name, "running")
                     started = time.perf_counter()
                     try:
-                        await stage.run(context)
-                    except Exception as exc:
-                        message = _error_message(exc, stage.name)
+                        with span(f"stage.{stage.name}", meeting_id=context.meeting_id):
+                            await asyncio.wait_for(
+                                stage.run(context),
+                                timeout=self._settings.stage_timeout(stage.name),
+                            )
+                    except StopRequested:
+                        raise
+                    except Exception as caught:
+                        failure: Exception = caught
+                        if isinstance(caught, TimeoutError):
+                            failure = StageTimeoutError(
+                                f"Stage '{stage.name}' exceeded its time limit.",
+                                details={
+                                    "timeout_seconds": self._settings.stage_timeout(stage.name)
+                                },
+                            )
+                        message = _error_message(failure, stage.name)
                         await self._save_failed_stage(context, run_id, stage.name, message)
                         await reporter.stage(stage.name, "failed")
                         STAGE_DURATION.labels(stage.name, "failed").observe(
                             time.perf_counter() - started
                         )
                         if not stage.optional:
-                            raise
+                            if isinstance(failure, PolymomError) and failure.retryable:
+                                raise TransientStageError(stage.name, failure) from caught
+                            raise failure from None
                         errors.append(f"{stage.name}: {message}")
                         logger.warning("optional_stage_failed", stage=stage.name, error=message)
                         continue
@@ -608,40 +899,69 @@ class MoMPipeline:
                         if audio_seconds > 0:
                             STAGE_RTF.labels(stage.name).observe(elapsed / audio_seconds)
                     async with self._uow() as uow:
-                        await stage.persist(context, self._writer(uow, context.meeting_id, run_id))
+                        writer = self._writer(uow, context.meeting_id, run_id)
+                        writer.fingerprint = context.fingerprints.get(stage.name)
+                        await stage.persist(context, writer)
                         await uow.commit()
-                    if version := stage.model_version(context):
-                        versions[stage.name] = version
                     await reporter.stage(stage.name, "completed")
                     logger.info(
                         "stage_completed",
                         stage=stage.name,
                         duration_ms=context.timings_ms[stage.name],
                     )
-        except JobCancelledError as exc:
-            await self._save_failed_stage(context, run_id, current, f"{exc.code}: {exc.message}")
-            return MeetingStatus.CANCELLED, f"{exc.code}: {exc.message}", versions
+        except StopRequested as stop:
+            if stop.reason == "shutdown":
+                logger.info("pipeline_interrupted_for_shutdown", stage=current)
+                if handoff is not None:
+                    # Resume on another (or the restarted) worker of the same queue;
+                    # chunks finished so far are read back from their checkpoints.
+                    await handoff(run_id, current_queue)
+                return _Outcome("interrupted", queue=current_queue)
+            cancelled = JobCancelledError(
+                f"Processing was cancelled during stage '{current}'.",
+                details={"stage": current},
+            )
+            cancel_message = f"{cancelled.code}: {cancelled.message}"
+            await self._save_failed_stage(context, run_id, current, cancel_message)
+            return _Outcome("finished", MeetingStatus.CANCELLED, cancel_message)
+        except TransientStageError:
+            raise
         except FileNotFoundError:
             logger.warning("upload_missing", key=upload_key)
-            return (
+            return _Outcome(
+                "finished",
                 MeetingStatus.FAILED,
                 "upload_missing: The uploaded file is no longer stored.",
-                versions,
             )
         except PolymomError as exc:
             logger.warning("stage_failed", stage=current, code=exc.code, error=exc.message)
-            return MeetingStatus.FAILED, f"{exc.code}: {exc.message}", versions
+            return _Outcome("finished", MeetingStatus.FAILED, f"{exc.code}: {exc.message}")
         except Exception:
             logger.exception("stage_crashed", stage=current)
-            return (
+            return _Outcome(
+                "finished",
                 MeetingStatus.FAILED,
                 f"internal_error: Unexpected failure in stage '{current}'.",
-                versions,
             )
         if audio_seconds > 0:
             AUDIO_MINUTES.inc(audio_seconds / 60)
         status = MeetingStatus.COMPLETED_WITH_ERRORS if errors else MeetingStatus.COMPLETED
-        return status, "; ".join(errors) or None, versions
+        return _Outcome("finished", status, "; ".join(errors) or None)
+
+    @asynccontextmanager
+    async def _inputs(
+        self, context: PipelineContext, upload_key: str, run_id: uuid.UUID, skipped: set[str]
+    ) -> AsyncIterator[None]:
+        """Make the upload (and, after preprocessing, the processed WAV) available locally."""
+        async with self._store.local_path(upload_key) as input_path:
+            context.input_path = input_path
+            if PreprocessStage.name in skipped and context.processed_path is None:
+                key = run_key(context.meeting_id, run_id, "processed.wav")
+                async with self._store.local_path(key) as processed:
+                    context.processed_path = processed
+                    yield
+                return
+            yield
 
     async def _save_failed_stage(
         self, context: PipelineContext, run_id: uuid.UUID, stage: str, message: str
@@ -654,20 +974,20 @@ class MoMPipeline:
         except Exception:  # pragma: no cover - never mask the stage error
             logger.exception("stage_failure_not_recorded", stage=stage)
 
-    async def _store_processed_audio(
-        self, context: PipelineContext, run_id: uuid.UUID
-    ) -> str | None:
+    async def fail_run(self, meeting_id: uuid.UUID, run_id: uuid.UUID, error: str) -> None:
+        """Mark a run and its meeting failed (the job queue ran out of retries)."""
+        await self._finish(
+            PipelineContext(meeting_id=meeting_id, input_path=Path()),
+            run_id,
+            MeetingStatus.FAILED,
+            error,
+        )
+
+    def _cleanup_work_file(self, context: PipelineContext) -> None:
+        """Remove the local processed WAV; the artifact store keeps the durable copy."""
         path = context.processed_path
-        if path is None or not path.is_file():
-            return None
-        key = run_key(context.meeting_id, run_id, "processed.wav")
-        try:
-            await self._store.put_file(key, path, "audio/wav")
-        except Exception:  # pragma: no cover - results matter more than the audio copy
-            logger.exception("processed_audio_upload_failed")
-            return None
-        path.unlink(missing_ok=True)
-        return key
+        if path is not None and path.parent == self._settings.processed_dir:
+            path.unlink(missing_ok=True)
 
     async def _finish(
         self,
@@ -675,9 +995,15 @@ class MoMPipeline:
         run_id: uuid.UUID,
         status: MeetingStatus,
         error: str | None,
-        versions: dict[str, str],
-        processed_key: str | None,
     ) -> None:
+        versions = {
+            stage.name: version
+            for stage in self.stages
+            if stage.name in context.outputs and (version := stage.model_version(context))
+        }
+        processed_key = run_key(context.meeting_id, run_id, "processed.wav")
+        if not await self._store.exists(processed_key):
+            processed_key = ""
         async with self._uow() as uow:
             meeting = await uow.meetings.get(context.meeting_id)
             run = await uow.results.get_run(context.meeting_id, run_id)
@@ -697,9 +1023,12 @@ class MoMPipeline:
             run.status = status.value
             run.error = error
             run.finished_at = utcnow()
-            run.timings_ms = dict(context.timings_ms)
-            run.model_versions = versions
+            run.timings_ms = {**(run.timings_ms or {}), **context.timings_ms}
+            run.model_versions = {**(run.model_versions or {}), **versions}
             await uow.commit()
+        from app.core.metrics import JOBS
+
+        JOBS.labels(status.value).inc()
         logger.info("pipeline_finished", status=status.value, timings_ms=context.timings_ms)
 
 

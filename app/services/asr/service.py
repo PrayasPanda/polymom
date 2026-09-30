@@ -7,6 +7,7 @@ import wave
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from starlette.concurrency import run_in_threadpool
 
@@ -31,6 +32,9 @@ from app.services.asr.router import ASRRouter
 from app.services.asr.whisper_backend import WhisperBackend
 from app.services.audio.chunker import split_wav
 from app.services.language.text_tagger import tag_segment
+
+if TYPE_CHECKING:
+    from app.pipelines.checkpoints import ChunkHooks
 
 logger = get_logger(__name__)
 
@@ -69,7 +73,11 @@ class TranscriptionService:
         self._settings = settings
 
     async def transcribe(
-        self, meeting_id: uuid.UUID, audio_path: Path, language_hints: Sequence[str] = ()
+        self,
+        meeting_id: uuid.UUID,
+        audio_path: Path,
+        language_hints: Sequence[str] = (),
+        hooks: "ChunkHooks | None" = None,
     ) -> ASRResult:
         started = time.perf_counter()
         language = choose_language(language_hints)
@@ -77,7 +85,9 @@ class TranscriptionService:
 
         duration = await run_in_threadpool(_wav_duration, audio_path)
         if duration > self._settings.chunk_length_seconds:
-            segments = await self._transcribe_chunked(meeting_id, audio_path, backend, language)
+            segments = await self._transcribe_chunked(
+                meeting_id, audio_path, backend, language, hooks
+            )
         else:
             segments = (await backend.transcribe(audio_path, language)).segments
 
@@ -150,7 +160,12 @@ class TranscriptionService:
         return result
 
     async def _transcribe_chunked(
-        self, meeting_id: uuid.UUID, audio_path: Path, backend: ASRBackend, language: str | None
+        self,
+        meeting_id: uuid.UUID,
+        audio_path: Path,
+        backend: ASRBackend,
+        language: str | None,
+        hooks: "ChunkHooks | None" = None,
     ) -> list[TranscriptSegment]:
         settings = self._settings
         chunk_dir = audio_path.parent / f"{meeting_id}_asr_chunks"
@@ -163,16 +178,24 @@ class TranscriptionService:
                 overlap_seconds=settings.chunk_overlap_seconds,
             )
             logger.info("transcription_chunked", meeting_id=str(meeting_id), chunks=len(chunks))
-            transcripts = [
-                ChunkTranscript(
-                    start=chunk.start_seconds,
-                    end=chunk.end_seconds,
-                    segments=(
+            transcripts = []
+            for index, chunk in enumerate(chunks):
+                cached = await hooks.load(index) if hooks else None
+                if cached is not None:
+                    segments = [TranscriptSegment.model_validate(s) for s in cached]
+                else:
+                    segments = (
                         await backend.transcribe(chunk.path, language, offset=chunk.start_seconds)
-                    ).segments,
+                    ).segments
+                    if hooks:
+                        await hooks.save(index, [s.model_dump(mode="json") for s in segments])
+                transcripts.append(
+                    ChunkTranscript(
+                        start=chunk.start_seconds, end=chunk.end_seconds, segments=segments
+                    )
                 )
-                for chunk in chunks
-            ]
+                if hooks:
+                    await hooks.after_chunk(index, len(chunks))
         finally:
             await run_in_threadpool(shutil.rmtree, chunk_dir, True)
         return merge_chunks(transcripts)
