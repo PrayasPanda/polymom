@@ -17,7 +17,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from app.api.deps import (
     MeetingServiceDep,
@@ -27,7 +27,11 @@ from app.api.deps import (
     SummaryRegeneratorDep,
 )
 from app.api.idempotency import remember, replay
-from app.core.exceptions import TranscriptNotAvailableError, ValidationError
+from app.core.exceptions import (
+    AudioNotAvailableError,
+    TranscriptNotAvailableError,
+    ValidationError,
+)
 from app.core.rate_limit import rate_limit
 from app.repositories.meeting_repository import MeetingQuery, SortField
 from app.repositories.results_repository import UtteranceQuery
@@ -237,6 +241,32 @@ async def get_meeting(meeting_id: UUID, service: MeetingServiceDep) -> MeetingRe
 async def delete_meeting(meeting_id: UUID, service: MeetingServiceDep) -> Response:
     await service.delete(meeting_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{meeting_id}/audio",
+    response_class=StreamingResponse,
+    summary="Playback audio: the processed 16 kHz WAV, else the original upload",
+    responses={
+        200: {"content": {"audio/wav": {}, "application/octet-stream": {}}},
+        **_NOT_FOUND,
+        **error_example(
+            409, "audio_not_available", "Audio is no longer stored.", "Raw audio was purged"
+        ),
+    },
+)
+async def get_audio(meeting_id: UUID, service: MeetingServiceDep) -> StreamingResponse:
+    """Used by the web UI player; raw audio may be purged by the retention policy."""
+    meeting = await service.get(meeting_id)
+    if meeting.processed_key and await service.store.exists(meeting.processed_key):
+        return StreamingResponse(
+            service.store.stream(meeting.processed_key), media_type="audio/wav"
+        )
+    if meeting.raw_audio_purged_at is None and await service.store.exists(meeting.upload_key):
+        return StreamingResponse(
+            service.store.stream(meeting.upload_key), media_type=meeting.mime_type
+        )
+    raise AudioNotAvailableError("Audio is no longer stored.", {"meeting_id": str(meeting_id)})
 
 
 @router.post(

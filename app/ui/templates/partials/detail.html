@@ -1,0 +1,142 @@
+{% set m = result.meeting %}
+{% set t = result.transcript %}
+{% set a = result.analytics %}
+{% set s = result.summary %}
+<article data-meeting-id="{{ m.meeting_id }}">
+  <header class="card">
+    <h1>{{ m.title or (s.title if s else None) or m.original_filename }}</h1>
+    <p>
+      <span class="badge s-{{ m.status }}">{{ m.status | replace("_", " ") }}</span>
+      · {{ m.duration_seconds | mmss }}
+      {% if m.num_speakers is not none %} · {{ m.num_speakers }} speakers{% endif %}
+      {% if m.detected_languages %} · {{ m.detected_languages | join(", ") }}{% endif %}
+    </p>
+    {% if m.error %}<p class="error" role="alert">{{ m.error }}</p>{% endif %}
+    {% for w in result.warnings %}<p class="warn">{{ w }}</p>{% endfor %}
+    <div class="actions" role="group" aria-label="Export and manage">
+      {% for f in ["pdf", "docx", "md", "json"] %}
+      <button type="button" data-action="export" data-format="{{ f }}">Export {{ f | upper }}</button>
+      {% endfor %}
+      <button type="button" data-action="reprocess">Reprocess</button>
+      <button type="button" class="danger" data-action="delete">Delete</button>
+    </div>
+    <audio id="player" controls preload="none" aria-label="Meeting audio"></audio>
+  </header>
+
+  {% if s %}
+  <section class="card" aria-labelledby="mom-h">
+    <h2 id="mom-h">Minutes of meeting</h2>
+    <p>{{ s.executive_summary }}</p>
+    {% if s.agenda_topics %}<p class="muted">Agenda: {{ s.agenda_topics | join(" · ") }}</p>{% endif %}
+
+    <h3>Decisions</h3>
+    {% if s.decisions %}
+    <ul class="items">
+      {% for d in s.decisions %}
+      <li{% if d.status == "superseded" %} class="superseded"{% endif %}>
+        <strong>{{ d.decision }}</strong>
+        <span class="muted small">— {{ names.get(d.made_by, d.made_by) }} · {{ d.confidence }} confidence{% if d.status == "superseded" %} · superseded{% endif %}</span>
+        {% for e in d.evidence[:1] %}<button type="button" class="quote" data-seek="{{ e.start or 0 }}">“{{ e.quote }}” <span class="muted">{{ e.start | mmss }}</span></button>{% endfor %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">No decisions recorded.</p>{% endif %}
+
+    <h3>Action items</h3>
+    {% if s.action_items %}
+    <table class="list">
+      <thead><tr><th scope="col">Task</th><th scope="col">Owner</th><th scope="col">Due</th><th scope="col">Priority</th><th scope="col">Evidence</th></tr></thead>
+      <tbody>
+      {% for ai in s.action_items %}
+      <tr>
+        <td>{{ ai.task }}</td>
+        <td>{{ names.get(ai.owner, ai.owner) }}</td>
+        <td>{{ ai.due_date.iso or ai.due_date.raw if ai.due_date else "–" }}</td>
+        <td><span class="badge p-{{ ai.priority }}">{{ ai.priority }}</span></td>
+        <td>{% for e in ai.evidence[:1] %}<button type="button" class="quote" data-seek="{{ e.start or 0 }}">{{ e.start | mmss }}</button>{% endfor %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="muted">No action items.</p>{% endif %}
+
+    {% if s.open_questions %}
+    <h3>Open questions</h3>
+    <ul>{% for q in s.open_questions %}<li>{{ q.question }} <span class="muted small">— {{ names.get(q.raised_by, q.raised_by) }}</span></li>{% endfor %}</ul>
+    {% endif %}
+    <p class="muted small">Grounding: {{ s.verification_report.evidence_passed }}/{{ s.verification_report.evidence_checked }} quotes verified · {{ s.model_info.provider }}/{{ s.model_info.model }} · prompt {{ s.model_info.prompt_version }}</p>
+  </section>
+  {% endif %}
+
+  {% if a %}
+  <section class="card" aria-labelledby="an-h">
+    <h2 id="an-h">Speaker analytics</h2>
+    <p class="muted small">Participation: {{ a.meeting_stats.participation_balance }} (Gini {{ a.meeting_stats.gini_coefficient }}) · overlap {{ a.meeting_stats.overlap_percent }}% · silence {{ a.meeting_stats.silence_percent }}% · {{ a.meeting_stats.num_language_switches }} language switches</p>
+    {% set maxpct = (a.speakers | map(attribute="speaking_time_percent_of_speech") | max) or 1 %}
+    <svg class="chart" viewBox="0 0 600 {{ a.speakers | length * 30 + 10 }}" role="img" aria-label="Speaking time per speaker">
+      {% for sp in a.speakers %}
+      <g transform="translate(0 {{ loop.index0 * 30 + 5 }})">
+        <text x="0" y="16" class="lbl">{{ names.get(sp.speaker, sp.speaker) | truncate(18, True, "…") }}</text>
+        <rect x="150" y="2" height="20" width="{{ 380 * sp.speaking_time_percent_of_speech / maxpct }}" class="fill spk-{{ colours.get(sp.speaker, 0) }}"></rect>
+        <text x="{{ 155 + 380 * sp.speaking_time_percent_of_speech / maxpct }}" y="16" class="val">{{ sp.speaking_time_percent_of_speech }}%</text>
+      </g>
+      {% endfor %}
+    </svg>
+    {% if t %}
+    <h3>Timeline</h3>
+    <svg class="chart" viewBox="0 0 600 {{ result.speakers | length * 22 + 10 }}" role="img" aria-label="Who spoke when">
+      {% for spk in result.speakers %}
+      <text x="0" y="{{ loop.index0 * 22 + 20 }}" class="lbl">{{ names[spk.label] | truncate(18, True, "…") }}</text>
+      {% endfor %}
+      {% for u in t.utterances if u.speaker in rows %}
+      <rect x="{{ 150 + 440 * u.start / duration }}" y="{{ rows[u.speaker] * 22 + 6 }}" width="{{ [440 * u.duration / duration, 1] | max }}" height="16" class="fill spk-{{ colours[u.speaker] }}"><title>{{ names[u.speaker] }} {{ u.start | mmss }}–{{ u.end | mmss }}</title></rect>
+      {% endfor %}
+    </svg>
+    {% endif %}
+    <table class="list">
+      <thead><tr><th scope="col">Speaker</th><th scope="col">Talk time</th><th scope="col">Turns</th><th scope="col">Words</th><th scope="col">WPM</th><th scope="col">Interruptions</th><th scope="col">Questions</th></tr></thead>
+      <tbody>
+      {% for sp in a.speakers %}
+      <tr><td><span class="dot spk-{{ colours.get(sp.speaker, 0) }}"></span>{{ names.get(sp.speaker, sp.speaker) }}</td>
+        <td>{{ sp.speaking_time_seconds | mmss }}</td><td>{{ sp.num_turns }}</td><td>{{ sp.word_count }}</td>
+        <td>{{ sp.words_per_minute }}</td><td>{{ sp.interruptions_made }}</td><td>{{ sp.questions_asked }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
+
+  {% if result.speakers %}
+  <section class="card" aria-labelledby="sp-h">
+    <h2 id="sp-h">Speakers</h2>
+    <form id="rename-form" class="rename">
+      {% for spk in result.speakers %}
+      <div>
+        <label for="name-{{ loop.index }}"><span class="dot spk-{{ colours[spk.label] }}"></span>{{ spk.label }}</label>
+        <input id="name-{{ loop.index }}" name="{{ spk.label }}" value="{{ spk.display_name or '' }}" placeholder="Display name" maxlength="100">
+      </div>
+      {% endfor %}
+      <button type="submit">Save names</button>
+    </form>
+  </section>
+  {% endif %}
+
+  {% if t %}
+  <section class="card" aria-labelledby="tr-h">
+    <h2 id="tr-h">Transcript</h2>
+    <p class="muted small">Select a line to play from that point.</p>
+    <ol class="transcript" id="transcript">
+      {% for u in t.utterances %}
+      <li class="spk-border-{{ colours.get(u.speaker, 0) }}" data-start="{{ u.start }}" data-end="{{ u.end }}">
+        <button type="button" class="line" data-seek="{{ u.start }}">
+          <span class="ts">{{ u.start | mmss }}</span>
+          <span class="who spk-text-{{ colours.get(u.speaker, 0) }}">{{ names.get(u.speaker, u.speaker) }}</span>
+          {% if u.primary_language %}<span class="lang" title="{{ 'code-mixed: ' ~ (u.languages_present | join('+')) if u.is_code_mixed else u.primary_language }}">{{ u.languages_present | join("+") if u.is_code_mixed else u.primary_language }}</span>{% endif %}
+          <span class="text" lang="{{ u.primary_language or 'und' }}">{{ u.text }}</span>
+        </button>
+      </li>
+      {% endfor %}
+    </ol>
+  </section>
+  {% endif %}
+</article>

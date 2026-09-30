@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="htmx-config" content='{"includeIndicatorStyles": false, "allowEval": false}'>
+  <title>{% block title %}Polymom{% endblock %} · Minutes of Meeting</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="topbar">
+    <a class="brand" href="/">Polymom <span class="muted">v{{ settings.app_version }}</span></a>
+    <form id="key-form" class="keyform" autocomplete="off">
+      <label for="api-key">API key</label>
+      <input id="api-key" name="api-key" type="password" placeholder="pm_..." spellcheck="false">
+      <button type="submit">Save</button>
+    </form>
+    <button id="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false">◐</button>
+  </header>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  <main id="main">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="muted">
+    <a href="/docs">API docs</a> · <a href="/api/v1/schema/meeting-result">Result schema</a>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,22 @@
+<div {% if polling %}hx-get="/ui/partials/meetings" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+{% if not items %}
+  <p class="muted">No meetings yet. Upload one above.</p>
+{% else %}
+  <table class="list">
+    <caption class="visually-hidden">{{ total }} meetings, newest first</caption>
+    <thead><tr><th scope="col">Title</th><th scope="col">Status</th><th scope="col">Duration</th><th scope="col">Speakers</th><th scope="col">Languages</th><th scope="col">Uploaded</th></tr></thead>
+    <tbody>
+    {% for m in items %}
+      <tr>
+        <td><a href="/meetings/{{ m.meeting_id }}">{{ m.title or m.original_filename }}</a></td>
+        <td><span class="badge s-{{ m.status }}">{{ m.status | replace("_", " ") }}</span></td>
+        <td>{{ m.duration_seconds | mmss }}</td>
+        <td>{{ m.num_speakers if m.num_speakers is not none else "–" }}</td>
+        <td>{{ (m.detected_languages or m.languages_hint) | join(", ") or "–" }}</td>
+        <td><time datetime="{{ m.created_at.isoformat() }}">{{ m.created_at.strftime("%Y-%m-%d %H:%M") }}</time></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+</div>

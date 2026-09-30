@@ -1,0 +1,9 @@
+<section class="card" hx-get="/ui/partials/meetings/{{ meeting.id }}" hx-trigger="every 2s" hx-target="#detail">
+  <h1>{{ meeting.title or meeting.original_filename }}</h1>
+  <p><span class="badge s-{{ meeting.status }}">{{ meeting.status }}</span>
+    {% if progress.current_stage %} · stage <strong>{{ progress.current_stage }}</strong>{% endif %}
+    {% if progress.eta_seconds %} · about {{ progress.eta_seconds | mmss }} left{% endif %}</p>
+  <progress max="100" value="{{ progress.percent }}" aria-label="Processing progress">{{ progress.percent | round | int }}%</progress>
+  <p class="muted small">{{ progress.percent | round(1) }}% · elapsed {{ progress.elapsed_seconds | mmss }}</p>
+  <button type="button" class="danger" data-action="cancel" data-meeting="{{ meeting.id }}">Cancel</button>
+</section>
