@@ -1,7 +1,7 @@
 # API + Postgres + Redis + one worker per resource queue.
 #
 #   docker compose -f docker/docker-compose.yml up --build
-#   docker compose -f docker/docker-compose.yml exec api python scripts/create_api_key.py --label me
+#   docker compose -f docker/docker-compose.yml exec api python -m scripts.create_api_key --label me
 #   docker compose -f docker/docker-compose.yml --profile monitoring up    # + Prometheus, Grafana
 #   docker compose -f docker/docker-compose.yml --profile minio up         # + S3-compatible store
 #
@@ -30,6 +30,8 @@ x-app: &app
     ASR_BACKEND: ${ASR_BACKEND:-mock}
     LID_BACKEND: ${LID_BACKEND:-mock}
     LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+    RATE_LIMIT_DEFAULT: ${RATE_LIMIT_DEFAULT:-120/minute}
+    RATE_LIMIT_UPLOAD: ${RATE_LIMIT_UPLOAD:-10/minute}
   volumes:
     - storage:/app/storage
     - model-cache:/app/.cache

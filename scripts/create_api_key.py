@@ -1,8 +1,8 @@
 """Create an API key. The plaintext is printed once and never stored.
 
-uv run python scripts/create_api_key.py --label ci --owner alice
-uv run python scripts/create_api_key.py --list
-uv run python scripts/create_api_key.py --revoke pk_abc123...
+uv run python -m scripts.create_api_key --label ci --owner alice
+uv run python -m scripts.create_api_key --list
+uv run python -m scripts.create_api_key --revoke pk_abc123...
 """
 
 import argparse

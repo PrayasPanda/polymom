@@ -65,7 +65,7 @@ class ValidationError(PolymomError):
 class AuthenticationError(PolymomError):
     status_code = status.HTTP_401_UNAUTHORIZED
     code = "unauthorized"
-    remediation = "Send a valid API key in the X-API-Key header (scripts/create_api_key.py)."
+    remediation = "Send a valid API key in the X-API-Key header (python -m scripts.create_api_key)."
 
 
 class RateLimitedError(PolymomError):
