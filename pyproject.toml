@@ -27,7 +27,6 @@ dependencies = [
     "prometheus-client>=0.26.0",
     "limits>=5.8.0",
     "sse-starlette>=3.5.0",
-    "slowapi>=0.1.10",
 ]
 
 [project.optional-dependencies]
@@ -131,7 +130,7 @@ markers = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "jiwer", "jiwer.*", "matplotlib", "matplotlib.*", "langfuse", "langfuse.*", "boto3", "boto3.*", "botocore.*", "moto", "moto.*", "testcontainers.*", "docx", "docx.*", "fpdf", "fpdf.*", "pypdf"]
+module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "jiwer", "jiwer.*", "matplotlib", "matplotlib.*", "langfuse", "langfuse.*", "boto3", "boto3.*", "botocore.*", "moto", "moto.*", "testcontainers.*", "docx", "docx.*", "fpdf", "fpdf.*", "pypdf", "opentelemetry", "opentelemetry.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

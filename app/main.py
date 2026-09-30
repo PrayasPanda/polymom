@@ -6,14 +6,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi.errors import RateLimitExceeded
 
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import error_body, register_exception_handlers
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
-from app.core.rate_limit import build_limiter, rate_limit_handler
+from app.core.rate_limit import RateLimiter
+from app.core.tracing import setup_tracing
 from app.db.migrate import upgrade_to_head
 from app.db.session import create_engine, create_sessionmaker
 
@@ -62,9 +62,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             expose_headers=["X-Request-ID", "Retry-After"],
         )
 
-    limiter = build_limiter(settings)
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+    app.state.rate_limiter = RateLimiter(settings)
     register_exception_handlers(app)
 
     @app.middleware("http")
@@ -85,6 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await call_next(request)
 
     app.include_router(api_router, prefix="/api/v1")
+    setup_tracing(settings, app)
     return app
 
 
