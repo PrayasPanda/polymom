@@ -1,0 +1,6257 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "polymom",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health",
+        "description": "Kept for existing clients; new deployments prefer /health/live and /health/ready.",
+        "operationId": "health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/health/live": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Liveness: the process is up",
+        "operationId": "live_api_v1_health_live_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Live Api V1 Health Live Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/health/ready": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Readiness: DB, Redis (if configured), and artifact store are usable",
+        "operationId": "ready_api_v1_health_ready_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings": {
+      "post": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Upload a meeting recording",
+        "description": "Validate the upload, store it and record the meeting as ``queued``.\n\n- Same file twice: the SHA-256 match returns the existing meeting (``200``,\n  ``duplicate: true``) unless ``?allow_duplicate=true``.\n- Same ``Idempotency-Key`` twice: the first response is replayed as-is.\n- ``callback_url`` must be public http(s); private and loopback hosts are refused.",
+        "operationId": "create_meeting_api_v1_meetings_post",
+        "parameters": [
+          {
+            "name": "allow_duplicate",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Store a new meeting even if the same file was uploaded.",
+              "default": false,
+              "title": "Allow Duplicate"
+            },
+            "description": "Store a new meeting even if the same file was uploaded."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_meeting_api_v1_meetings_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeetingCreateResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Too large",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "file_too_large",
+                    "message": "File exceeds the 200 MB upload limit."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Extension not allowed, or content does not match the extension",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "unsupported_file_type",
+                    "message": "File content does not match its extension."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Empty, corrupted or audio-less file, or invalid form fields",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "corrupted_media",
+                    "message": "The file contains no audio stream."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "List meetings with filters, sorting and cursor pagination",
+        "description": "Keyset (cursor) pagination: stable while new meetings arrive, fast on large tables.",
+        "operationId": "list_meetings_api_v1_meetings_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/MeetingStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "language",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Spoken language detected in the meeting: en, hi, or.",
+              "title": "Language"
+            },
+            "description": "Spoken language detected in the meeting: en, hi, or."
+          },
+          {
+            "name": "created_from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO 8601, inclusive.",
+              "title": "Created From"
+            },
+            "description": "ISO 8601, inclusive."
+          },
+          {
+            "name": "created_to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO 8601, inclusive.",
+              "title": "Created To"
+            },
+            "description": "ISO 8601, inclusive."
+          },
+          {
+            "name": "min_speakers",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Speakers"
+            }
+          },
+          {
+            "name": "max_speakers",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Speakers"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "created_at",
+                "duration_seconds"
+              ],
+              "type": "string",
+              "default": "created_at",
+              "title": "Sort"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string",
+              "default": "desc",
+              "title": "Order"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "next_cursor from the previous page.",
+              "title": "Cursor"
+            },
+            "description": "next_cursor from the previous page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeetingList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Bad cursor or filter",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "validation_error",
+                    "message": "Invalid cursor."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Get a meeting",
+        "operationId": "get_meeting_api_v1_meetings__meeting_id__get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeetingRead"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Delete a meeting and its stored file",
+        "operationId": "delete_meeting_api_v1_meetings__meeting_id__delete",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/audio": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Playback audio: the processed 16 kHz WAV, else the original upload",
+        "description": "Used by the web UI player; raw audio may be purged by the retention policy.",
+        "operationId": "get_audio_api_v1_meetings__meeting_id__audio_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "audio/wav": {},
+              "application/octet-stream": {}
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Raw audio was purged",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "audio_not_available",
+                    "message": "Audio is no longer stored."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/process": {
+      "post": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Enqueue the processing pipeline (or resume from a stage)",
+        "description": "Enqueue the pipeline on the job queue; workers do the processing.\n\nProgress: ``GET /meetings/{id}/status`` (snapshot) or ``/status/stream`` (SSE).\nWith ``PIPELINE_EXECUTION=inline`` (tests, local debugging) it runs in-process.",
+        "operationId": "process_meeting_api_v1_meetings__meeting_id__process_post",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Reprocess even if completed.",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "Reprocess even if completed."
+          },
+          {
+            "name": "from_stage",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Reuse the latest successful run's stages before this one.",
+              "title": "From Stage"
+            },
+            "description": "Reuse the latest successful run's stages before this one."
+          },
+          {
+            "name": "callback_url",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 2048
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Overrides the upload's callback_url.",
+              "title": "Callback Url"
+            },
+            "description": "Overrides the upload's callback_url."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Meeting is already processing or completed",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_state_conflict",
+                    "message": "Meeting is already completed. Use ?force=true to reprocess."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/cancel": {
+      "post": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Ask a running pipeline to stop after the current stage",
+        "description": "Sets a cancel flag in Redis. The worker checks it between stages and rolls the\nrun to ``cancelled``. In inline mode (no queue) this is a no-op that returns 202.",
+        "operationId": "cancel_meeting_api_v1_meetings__meeting_id__cancel_post",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/speakers": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Speaker turns from diarization",
+        "description": "Turns sorted by start, labelled Person 1..N by order of first appearance.",
+        "operationId": "get_speakers_api_v1_meetings__meeting_id__speakers_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeakersResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The meeting has not been diarized yet",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "diarization_not_available",
+                    "message": "Speaker diarization is not available yet."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Set display names for speakers",
+        "description": "Map \"Person N\" labels to names. Labels themselves never change; ``null`` clears a name.",
+        "operationId": "rename_speakers_api_v1_meetings__meeting_id__speakers_patch",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeakerRenameRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeakerNamesResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unknown label",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "validation_error",
+                    "message": "Unknown speaker label(s)."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/transcript": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Speaker-attributed transcript (json, txt, srt, vtt, md); raw ASR with ?view=raw",
+        "description": "Chronological, speaker-attributed transcript in native script (NFC).\n\nDisplay names from ``PATCH /speakers`` are applied in every format.",
+        "operationId": "get_transcript_api_v1_meetings__meeting_id__transcript_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "txt",
+                "srt",
+                "vtt",
+                "md"
+              ],
+              "type": "string",
+              "description": "Response format.",
+              "default": "json",
+              "title": "Format"
+            },
+            "description": "Response format."
+          },
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "speaker",
+                "raw"
+              ],
+              "type": "string",
+              "description": "speaker: utterances per speaker (default); raw: ASR segments.",
+              "default": "speaker",
+              "title": "View"
+            },
+            "description": "speaker: utterances per speaker (default); raw: ASR segments."
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SpeakerTranscriptResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TranscriptResponse"
+                    }
+                  ],
+                  "title": "Response Get Transcript Api V1 Meetings  Meeting Id  Transcript Get"
+                }
+              },
+              "text/plain": {
+                "example": "[00:00:00 - 00:00:07] Person 1: आज की मीटिंग का एजेंडा बजट है।\n"
+              },
+              "application/x-subrip": {
+                "example": "1\n00:00:00,520 --> 00:00:07,100\nPerson 1: आज की मीटिंग ...\n"
+              },
+              "text/vtt": {
+                "example": "WEBVTT\n\n00:00:00.520 --> 00:00:07.100\n<v Ravi>आज की मीटिंग ...\n"
+              },
+              "text/markdown": {
+                "example": "# Transcript\n\n**Ravi** · 00:00:00\n\n..."
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The meeting has not been transcribed yet",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "transcript_not_available",
+                    "message": "The transcript is not available yet."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/languages": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Spoken languages and code-switching",
+        "description": "Per-language and per-speaker time, switch points and code-mixed segment count.",
+        "operationId": "get_languages_api_v1_meetings__meeting_id__languages_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LanguageSummaryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Language identification has not run for this meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "language_summary_not_available",
+                    "message": "Language information is not available."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/analytics": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Speaker-wise conversation statistics and meeting analytics (json, csv)",
+        "description": "Speaking time, turns, interruptions, WPM, languages and more, per speaker and overall.\n\nSpeaking time comes from diarization turns; overlapping speech counts for every\noverlapping speaker and is reported separately in ``meeting_stats``.",
+        "operationId": "get_analytics_api_v1_meetings__meeting_id__analytics_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "type": "string",
+              "description": "csv: the per-speaker table.",
+              "default": "json",
+              "title": "Format"
+            },
+            "description": "csv: the per-speaker table."
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationAnalyticsResponse"
+                }
+              },
+              "text/csv": {
+                "example": "speaker,display_name,speaking_time_seconds,...\nPerson 1,Ravi,812.3,...\n"
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The meeting has not been processed yet",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "analytics_not_available",
+                    "message": "Analytics are not available yet."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/analytics/charts/{chart_name}": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Analytics chart as PNG (speaking-time, timeline)",
+        "description": "Rendered with matplotlib (optional ``viz`` extra), cached in the artifact store.",
+        "operationId": "get_analytics_chart_api_v1_meetings__meeting_id__analytics_charts__chart_name__get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "chart_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "speaking-time",
+                "timeline"
+              ],
+              "type": "string",
+              "title": "Chart Name"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "image/png": {}
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The meeting has not been processed yet",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "analytics_not_available",
+                    "message": "Analytics are not available yet."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "matplotlib is not installed",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "charts_unavailable",
+                    "message": "Charts need the optional 'viz' extra: uv sync --extra viz."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/summary": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Minutes of meeting: summary, decisions, action items (json, md)",
+        "description": "Every item cites transcript evidence that passed verification.\n\nJSON uses speaker labels plus ``speaker_names``; Markdown shows display names.",
+        "operationId": "get_summary_api_v1_meetings__meeting_id__summary_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "md"
+              ],
+              "type": "string",
+              "description": "Response format.",
+              "default": "json",
+              "title": "Format"
+            },
+            "description": "Response format."
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeetingSummaryResponse"
+                }
+              },
+              "text/markdown": {
+                "example": "# Budget review\n\n## Decisions\n..."
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not processed yet, or summarization failed (see details.summary_error)",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "summary_not_available",
+                    "message": "The summary is not available yet."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/summary/regenerate": {
+      "post": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Regenerate the summary (optionally another language or model)",
+        "description": "Re-runs only summarization on the ``llm`` queue. Poll ``GET /summary``.",
+        "operationId": "regenerate_summary_api_v1_meetings__meeting_id__summary_regenerate_post",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RegenerateSummaryRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegenerateSummaryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not processed yet, or still processing",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "transcript_not_available",
+                    "message": "The speaker-attributed transcript is not available yet."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/result": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Consolidated minutes-of-meeting result (schema: /api/v1/schema/meeting-result)",
+        "description": "Metadata, audio quality, languages, speakers (with display names), transcript,\nanalytics, summary, verification report, warnings and processing info in one document.",
+        "operationId": "get_result_api_v1_meetings__meeting_id__result_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "A run from /runs; default: the latest successful run.",
+              "title": "Run Id"
+            },
+            "description": "A run from /runs; default: the latest successful run."
+          },
+          {
+            "name": "include",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Comma-separated: transcript, analytics, summary. Default: all.",
+              "title": "Include"
+            },
+            "description": "Comma-separated: transcript, analytics, summary. Default: all."
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeetingResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting or run",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "run_not_found",
+                    "message": "Run ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/export": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Minutes of meeting as docx, pdf, md or json",
+        "description": "Formal MoM document; cached per run and format until names or the summary change.",
+        "operationId": "export_meeting_api_v1_meetings__meeting_id__export_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "docx",
+                "pdf",
+                "md",
+                "json"
+              ],
+              "type": "string",
+              "description": "docx, pdf, md or json.",
+              "default": "pdf",
+              "title": "Format"
+            },
+            "description": "docx, pdf, md or json."
+          },
+          {
+            "name": "run_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "A run from /runs; default: the latest successful run.",
+              "title": "Run Id"
+            },
+            "description": "A run from /runs; default: the latest successful run."
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document": {},
+              "application/pdf": {},
+              "text/markdown": {},
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "Unknown meeting or run",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "run_not_found",
+                    "message": "Run ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/utterances": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Query utterances by speaker, language, time range and text",
+        "operationId": "list_utterances_api_v1_meetings__meeting_id__utterances_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "speaker",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Label, e.g. \"Person 2\".",
+              "title": "Speaker"
+            },
+            "description": "Label, e.g. \"Person 2\"."
+          },
+          {
+            "name": "language",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Primary language: en, hi, or.",
+              "title": "Language"
+            },
+            "description": "Primary language: en, hi, or."
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Seconds; overlapping from.",
+              "title": "Start"
+            },
+            "description": "Seconds; overlapping from."
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Seconds; overlapping until.",
+              "title": "End"
+            },
+            "description": "Seconds; overlapping until."
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 200
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive substring.",
+              "title": "Q"
+            },
+            "description": "Case-insensitive substring."
+          },
+          {
+            "name": "run_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "A run from /runs; default: the latest successful run.",
+              "title": "Run Id"
+            },
+            "description": "A run from /runs; default: the latest successful run."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UtterancePage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting or run",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "run_not_found",
+                    "message": "Run ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/runs": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "Processing history, newest first",
+        "operationId": "list_runs_api_v1_meetings__meeting_id__runs_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunList"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "meeting_not_found",
+                    "message": "Meeting ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "meetings"
+        ],
+        "summary": "The consolidated result of one specific run",
+        "operationId": "get_run_api_v1_meetings__meeting_id__runs__run_id__get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeetingResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown meeting or run",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": {
+                    "code": "run_not_found",
+                    "message": "Run ... not found."
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/status": {
+      "get": {
+        "tags": [
+          "status"
+        ],
+        "summary": "Live progress: percent, current stage, ETA (Redis when the queue runs)",
+        "description": "Snapshot from Redis, falling back to the last run in the DB (inline mode).",
+        "operationId": "get_status_api_v1_meetings__meeting_id__status_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Status Api V1 Meetings  Meeting Id  Status Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/meetings/{meeting_id}/status/stream": {
+      "get": {
+        "tags": [
+          "status"
+        ],
+        "summary": "Server-Sent Events stream of progress updates (pushed via Redis pub/sub)",
+        "operationId": "status_stream_api_v1_meetings__meeting_id__status_stream_get",
+        "parameters": [
+          {
+            "name": "meeting_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Meeting Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/search": {
+      "get": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Full-text search across meetings",
+        "description": "Utterances and summaries of each meeting's latest results, in English, Hindi and Odia.",
+        "operationId": "search_api_v1_search_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "Words in any script.",
+              "title": "Q"
+            },
+            "description": "Words in any script."
+          },
+          {
+            "name": "meeting_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Limit to one meeting.",
+              "title": "Meeting Id"
+            },
+            "description": "Limit to one meeting."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResults"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/schema/meeting-result": {
+      "get": {
+        "tags": [
+          "search"
+        ],
+        "summary": "JSON Schema of the consolidated MeetingResult",
+        "description": "For integrators: validate ``GET /meetings/{id}/result`` responses or generate clients.",
+        "operationId": "meeting_result_schema_api_v1_schema_meeting_result_get",
+        "parameters": [
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Meeting Result Schema Api V1 Schema Meeting Result Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ActionItem": {
+        "properties": {
+          "task": {
+            "type": "string",
+            "title": "Task"
+          },
+          "owner": {
+            "type": "string",
+            "title": "Owner",
+            "description": "Speaker label or \"Unassigned\". Never a guessed name."
+          },
+          "due_date": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DueDate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ],
+            "title": "Priority",
+            "default": "medium"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Evidence"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ],
+            "title": "Confidence",
+            "default": "medium"
+          }
+        },
+        "type": "object",
+        "required": [
+          "task",
+          "owner",
+          "evidence"
+        ],
+        "title": "ActionItem"
+      },
+      "AlignedWord": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence",
+            "description": "0-1 word probability; null when the model gives none."
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language",
+            "description": "en, hi, or; hi-Latn / or-Latn for romanized Hindi/Odia; null if neutral."
+          },
+          "script": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script",
+            "description": "ISO 15924: Latn, Deva, Orya."
+          },
+          "speaker": {
+            "type": "string",
+            "title": "Speaker"
+          },
+          "overlapping_speakers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Overlapping Speakers",
+            "description": "Other speakers talking during this word."
+          },
+          "alignment_precision": {
+            "type": "string",
+            "enum": [
+              "word",
+              "segment"
+            ],
+            "title": "Alignment Precision",
+            "default": "word"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "start",
+          "end",
+          "speaker"
+        ],
+        "title": "AlignedWord"
+      },
+      "AlignmentStats": {
+        "properties": {
+          "total_words": {
+            "type": "integer",
+            "title": "Total Words"
+          },
+          "percent_assigned": {
+            "type": "number",
+            "title": "Percent Assigned"
+          },
+          "percent_unknown": {
+            "type": "number",
+            "title": "Percent Unknown"
+          },
+          "percent_segment_level": {
+            "type": "number",
+            "title": "Percent Segment Level"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total_words",
+          "percent_assigned",
+          "percent_unknown",
+          "percent_segment_level"
+        ],
+        "title": "AlignmentStats"
+      },
+      "AudioMetadata": {
+        "properties": {
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "codec": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Codec"
+          },
+          "sample_rate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sample Rate"
+          },
+          "channels": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channels"
+          },
+          "format_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Format Name"
+          },
+          "bit_rate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bit Rate"
+          }
+        },
+        "type": "object",
+        "title": "AudioMetadata",
+        "description": "Stream details reported by ffprobe for the first audio stream."
+      },
+      "AudioQuality": {
+        "properties": {
+          "sample_rate": {
+            "type": "integer",
+            "title": "Sample Rate"
+          },
+          "channels": {
+            "type": "integer",
+            "title": "Channels"
+          },
+          "duration_seconds": {
+            "type": "number",
+            "title": "Duration Seconds",
+            "description": "Duration of the processed audio."
+          },
+          "loudness_lufs": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loudness Lufs",
+            "description": "Integrated loudness (EBU R128)."
+          },
+          "rms_db": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rms Db"
+          },
+          "peak_db": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peak Db"
+          },
+          "silence_ratio": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Silence Ratio"
+          },
+          "leading_silence_seconds": {
+            "type": "number",
+            "title": "Leading Silence Seconds"
+          },
+          "trailing_silence_seconds": {
+            "type": "number",
+            "title": "Trailing Silence Seconds"
+          },
+          "trimmed_seconds": {
+            "type": "number",
+            "title": "Trimmed Seconds",
+            "description": "Silence removed when TRIM_SILENCE is on."
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/AudioWarning"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "processing_time_ms": {
+            "type": "integer",
+            "title": "Processing Time Ms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sample_rate",
+          "channels",
+          "duration_seconds",
+          "loudness_lufs",
+          "rms_db",
+          "peak_db",
+          "silence_ratio",
+          "leading_silence_seconds",
+          "trailing_silence_seconds",
+          "trimmed_seconds",
+          "warnings",
+          "processing_time_ms"
+        ],
+        "title": "AudioQuality",
+        "description": "Preprocessing outcome persisted on the meeting and returned by the API.\n\nLevel metrics (``loudness_lufs``, ``rms_db``, ``peak_db``) describe the\noriginal recording, before normalization, so they reflect capture quality.\n``None`` means the level was not measurable (e.g. digital silence)."
+      },
+      "AudioWarning": {
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/AudioWarningCode"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "AudioWarning",
+        "description": "A quality concern that does not stop processing."
+      },
+      "AudioWarningCode": {
+        "type": "string",
+        "enum": [
+          "low_volume",
+          "clipping",
+          "too_short",
+          "mostly_silent"
+        ],
+        "title": "AudioWarningCode"
+      },
+      "Body_create_meeting_api_v1_meetings_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "description": "Audio or video recording."
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "expected_speakers": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 20.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Speakers",
+            "description": "Expected number of speakers (1-20)."
+          },
+          "languages": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Languages",
+            "description": "Language hints: en, hi, or. Repeat the field or comma-separate."
+          },
+          "callback_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2048
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Callback Url",
+            "description": "Webhook POSTed (HMAC-signed) with the final status."
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_create_meeting_api_v1_meetings_post"
+      },
+      "ConversationAnalytics": {
+        "properties": {
+          "meeting_stats": {
+            "$ref": "#/components/schemas/MeetingStats"
+          },
+          "speakers": {
+            "items": {
+              "$ref": "#/components/schemas/SpeakerStats"
+            },
+            "type": "array",
+            "title": "Speakers",
+            "description": "Most speaking time first."
+          },
+          "timeline": {
+            "items": {
+              "$ref": "#/components/schemas/TimelineBucket"
+            },
+            "type": "array",
+            "title": "Timeline"
+          },
+          "metric_definitions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Metric Definitions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_stats",
+          "speakers",
+          "timeline"
+        ],
+        "title": "ConversationAnalytics"
+      },
+      "ConversationAnalyticsResponse": {
+        "properties": {
+          "meeting_stats": {
+            "$ref": "#/components/schemas/MeetingStats"
+          },
+          "speakers": {
+            "items": {
+              "$ref": "#/components/schemas/SpeakerStats"
+            },
+            "type": "array",
+            "title": "Speakers",
+            "description": "Most speaking time first."
+          },
+          "timeline": {
+            "items": {
+              "$ref": "#/components/schemas/TimelineBucket"
+            },
+            "type": "array",
+            "title": "Timeline"
+          },
+          "metric_definitions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Metric Definitions"
+          },
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "speaker_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Speaker Names"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_stats",
+          "speakers",
+          "timeline",
+          "meeting_id"
+        ],
+        "title": "ConversationAnalyticsResponse",
+        "examples": [
+          {
+            "meeting_id": "3f8b6f0e-2c1d-4d6a-9d3e-6c2b1a0f9e7d",
+            "meeting_stats": {
+              "dominant_speaker": "Person 1",
+              "meeting_duration_seconds": 1800.0,
+              "participation_balance": "moderately dominated",
+              "total_speech_seconds": 1620.4
+            },
+            "speaker_names": {
+              "Person 1": "Ravi"
+            },
+            "speakers": [
+              {
+                "speaker": "Person 1",
+                "speaker_name": "Ravi",
+                "speaking_time_seconds": 812.3,
+                "words_per_minute": 131.5
+              }
+            ]
+          }
+        ]
+      },
+      "Decision": {
+        "properties": {
+          "decision": {
+            "type": "string",
+            "title": "Decision"
+          },
+          "topic": {
+            "type": "string",
+            "title": "Topic",
+            "description": "Short noun phrase; used to detect supersession.",
+            "default": ""
+          },
+          "made_by": {
+            "type": "string",
+            "title": "Made By",
+            "description": "Speaker label or \"group\"."
+          },
+          "rationale": {
+            "type": "string",
+            "title": "Rationale",
+            "default": ""
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Evidence"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ],
+            "title": "Confidence",
+            "default": "medium"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "superseded"
+            ],
+            "title": "Status",
+            "default": "active"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          }
+        },
+        "type": "object",
+        "required": [
+          "decision",
+          "made_by",
+          "evidence"
+        ],
+        "title": "Decision"
+      },
+      "DueDate": {
+        "properties": {
+          "raw": {
+            "type": "string",
+            "title": "Raw",
+            "description": "As stated, e.g. \"kal\", \"agle hafte\", \"by EOD Friday\"."
+          },
+          "iso": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Iso",
+            "description": "YYYY-MM-DD only if unambiguous from the meeting date."
+          }
+        },
+        "type": "object",
+        "required": [
+          "raw"
+        ],
+        "title": "DueDate"
+      },
+      "ErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorDetail"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse"
+      },
+      "Evidence": {
+        "properties": {
+          "utterance_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Utterance Ids",
+            "description": "Ids from the [uN] line prefixes."
+          },
+          "speaker": {
+            "type": "string",
+            "title": "Speaker",
+            "description": "Label of the speaker quoted, e.g. \"Person 2\"."
+          },
+          "quote": {
+            "type": "string",
+            "title": "Quote",
+            "description": "Short verbatim quote in the original script and language."
+          },
+          "start": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start",
+            "description": "Filled from the transcript."
+          },
+          "end": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End"
+          }
+        },
+        "type": "object",
+        "required": [
+          "utterance_ids",
+          "speaker",
+          "quote"
+        ],
+        "title": "Evidence"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "app_name": {
+            "type": "string",
+            "title": "App Name"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          },
+          "env": {
+            "type": "string",
+            "title": "Env"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "app_name",
+          "version",
+          "env"
+        ],
+        "title": "HealthResponse"
+      },
+      "InjectionFlag": {
+        "properties": {
+          "utterance_id": {
+            "type": "integer",
+            "title": "Utterance Id"
+          },
+          "speaker": {
+            "type": "string",
+            "title": "Speaker"
+          },
+          "pattern": {
+            "type": "string",
+            "title": "Pattern"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          }
+        },
+        "type": "object",
+        "required": [
+          "utterance_id",
+          "speaker",
+          "pattern",
+          "text"
+        ],
+        "title": "InjectionFlag"
+      },
+      "KeyPoint": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "speakers_involved": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Speakers Involved"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Evidence"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "description",
+          "evidence"
+        ],
+        "title": "KeyPoint"
+      },
+      "LLMUsageTotals": {
+        "properties": {
+          "calls": {
+            "type": "integer",
+            "title": "Calls",
+            "default": 0
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "title": "Prompt Tokens",
+            "default": 0
+          },
+          "completion_tokens": {
+            "type": "integer",
+            "title": "Completion Tokens",
+            "default": 0
+          },
+          "cost_usd": {
+            "type": "number",
+            "title": "Cost Usd",
+            "default": 0.0
+          },
+          "latency_ms": {
+            "type": "integer",
+            "title": "Latency Ms",
+            "default": 0
+          },
+          "repair_attempts": {
+            "type": "integer",
+            "title": "Repair Attempts",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "LLMUsageTotals"
+      },
+      "LanguageDuration": {
+        "properties": {
+          "language": {
+            "type": "string",
+            "title": "Language"
+          },
+          "duration_seconds": {
+            "type": "number",
+            "title": "Duration Seconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "language",
+          "duration_seconds"
+        ],
+        "title": "LanguageDuration"
+      },
+      "LanguageRegion": {
+        "properties": {
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "language": {
+            "type": "string",
+            "title": "Language"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker"
+          },
+          "confidence": {
+            "type": "number",
+            "title": "Confidence"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "language",
+          "confidence"
+        ],
+        "title": "LanguageRegion",
+        "description": "A stretch of audio assigned to one language (and speaker) after smoothing."
+      },
+      "LanguageShare": {
+        "properties": {
+          "language": {
+            "type": "string",
+            "title": "Language"
+          },
+          "duration_seconds": {
+            "type": "number",
+            "title": "Duration Seconds"
+          },
+          "percentage": {
+            "type": "number",
+            "title": "Percentage"
+          }
+        },
+        "type": "object",
+        "required": [
+          "language",
+          "duration_seconds",
+          "percentage"
+        ],
+        "title": "LanguageShare"
+      },
+      "LanguageSummary": {
+        "properties": {
+          "languages": {
+            "items": {
+              "$ref": "#/components/schemas/LanguageShare"
+            },
+            "type": "array",
+            "title": "Languages",
+            "description": "Longest first."
+          },
+          "speakers": {
+            "items": {
+              "$ref": "#/components/schemas/SpeakerLanguages"
+            },
+            "type": "array",
+            "title": "Speakers"
+          },
+          "num_switches": {
+            "type": "integer",
+            "title": "Num Switches"
+          },
+          "switch_points": {
+            "items": {
+              "$ref": "#/components/schemas/SwitchPoint"
+            },
+            "type": "array",
+            "title": "Switch Points"
+          },
+          "code_mixed_segments": {
+            "type": "integer",
+            "title": "Code Mixed Segments",
+            "description": "Transcript segments mixing languages at the word level.",
+            "default": 0
+          },
+          "regions": {
+            "items": {
+              "$ref": "#/components/schemas/LanguageRegion"
+            },
+            "type": "array",
+            "title": "Regions"
+          },
+          "lid_model": {
+            "type": "string",
+            "title": "Lid Model"
+          },
+          "candidate_languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Candidate Languages",
+            "description": "Languages LID could choose from."
+          }
+        },
+        "type": "object",
+        "required": [
+          "languages",
+          "speakers",
+          "num_switches",
+          "switch_points",
+          "regions",
+          "lid_model",
+          "candidate_languages"
+        ],
+        "title": "LanguageSummary"
+      },
+      "LanguageSummaryResponse": {
+        "properties": {
+          "languages": {
+            "items": {
+              "$ref": "#/components/schemas/LanguageShare"
+            },
+            "type": "array",
+            "title": "Languages",
+            "description": "Longest first."
+          },
+          "speakers": {
+            "items": {
+              "$ref": "#/components/schemas/SpeakerLanguages"
+            },
+            "type": "array",
+            "title": "Speakers"
+          },
+          "num_switches": {
+            "type": "integer",
+            "title": "Num Switches"
+          },
+          "switch_points": {
+            "items": {
+              "$ref": "#/components/schemas/SwitchPoint"
+            },
+            "type": "array",
+            "title": "Switch Points"
+          },
+          "code_mixed_segments": {
+            "type": "integer",
+            "title": "Code Mixed Segments",
+            "description": "Transcript segments mixing languages at the word level.",
+            "default": 0
+          },
+          "regions": {
+            "items": {
+              "$ref": "#/components/schemas/LanguageRegion"
+            },
+            "type": "array",
+            "title": "Regions"
+          },
+          "lid_model": {
+            "type": "string",
+            "title": "Lid Model"
+          },
+          "candidate_languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Candidate Languages",
+            "description": "Languages LID could choose from."
+          },
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "languages",
+          "speakers",
+          "num_switches",
+          "switch_points",
+          "regions",
+          "lid_model",
+          "candidate_languages",
+          "meeting_id"
+        ],
+        "title": "LanguageSummaryResponse",
+        "examples": [
+          {
+            "candidate_languages": [
+              "en",
+              "hi",
+              "or"
+            ],
+            "code_mixed_segments": 12,
+            "languages": [
+              {
+                "duration_seconds": 312.4,
+                "language": "hi",
+                "percentage": 62.5
+              },
+              {
+                "duration_seconds": 120.0,
+                "language": "or",
+                "percentage": 24.0
+              },
+              {
+                "duration_seconds": 67.5,
+                "language": "en",
+                "percentage": 13.5
+              }
+            ],
+            "lid_model": "facebook/mms-lid-126",
+            "meeting_id": "3f8b6f0e-2c1d-4d6a-9d3e-6c2b1a0f9e7d",
+            "num_switches": 7,
+            "regions": [
+              {
+                "confidence": 0.93,
+                "end": 95.2,
+                "language": "hi",
+                "speaker": "Person 1",
+                "start": 0.0
+              }
+            ],
+            "speakers": [
+              {
+                "dominant_language": "hi",
+                "languages": [
+                  {
+                    "duration_seconds": 250.0,
+                    "language": "hi",
+                    "percentage": 80.0
+                  }
+                ],
+                "speaker": "Person 1"
+              }
+            ],
+            "switch_points": [
+              {
+                "from_language": "hi",
+                "speaker": "Person 2",
+                "timestamp": 95.2,
+                "to_language": "or"
+              }
+            ]
+          }
+        ]
+      },
+      "MeetingCreateResponse": {
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MeetingStatus"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "duplicate": {
+            "type": "boolean",
+            "title": "Duplicate",
+            "description": "True when an identical file was already uploaded.",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_id",
+          "status",
+          "created_at"
+        ],
+        "title": "MeetingCreateResponse",
+        "examples": [
+          {
+            "created_at": "2026-09-28T10:15:00Z",
+            "meeting_id": "3f8b6f0e-2c1d-4d6a-9d3e-6c2b1a0f9e7d",
+            "status": "queued"
+          }
+        ]
+      },
+      "MeetingList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MeetingRead"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Meetings matching the filters, ignoring pagination."
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor",
+            "description": "Pass as ?cursor= for the next page; null on the last page."
+          }
+        },
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "limit"
+        ],
+        "title": "MeetingList"
+      },
+      "MeetingRead": {
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "original_filename": {
+            "type": "string",
+            "title": "Original Filename"
+          },
+          "mime_type": {
+            "type": "string",
+            "title": "Mime Type"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "title": "Size Bytes"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "audio_metadata": {
+            "$ref": "#/components/schemas/AudioMetadata"
+          },
+          "audio_quality": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AudioQuality"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Preprocessing results; set once the preprocess stage ran."
+          },
+          "languages_hint": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "en",
+                "hi",
+                "or"
+              ]
+            },
+            "type": "array",
+            "title": "Languages Hint"
+          },
+          "expected_speakers": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Speakers"
+          },
+          "detected_languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Detected Languages",
+            "description": "Spoken languages found by the latest run."
+          },
+          "num_speakers": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Num Speakers"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256",
+            "description": "SHA-256 of the uploaded file."
+          },
+          "raw_audio_purged_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Audio Purged At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MeetingStatus"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_id",
+          "title",
+          "original_filename",
+          "mime_type",
+          "size_bytes",
+          "duration_seconds",
+          "audio_metadata",
+          "languages_hint",
+          "expected_speakers",
+          "status",
+          "error",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "MeetingRead",
+        "examples": [
+          {
+            "audio_metadata": {
+              "bit_rate": 128000,
+              "channels": 2,
+              "codec": "aac",
+              "duration_seconds": 312.4,
+              "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+              "sample_rate": 44100
+            },
+            "created_at": "2026-09-28T10:15:00Z",
+            "duration_seconds": 312.4,
+            "expected_speakers": 4,
+            "languages_hint": [
+              "en",
+              "hi"
+            ],
+            "meeting_id": "3f8b6f0e-2c1d-4d6a-9d3e-6c2b1a0f9e7d",
+            "mime_type": "audio/mp4",
+            "original_filename": "standup.m4a",
+            "size_bytes": 1843200,
+            "status": "queued",
+            "title": "Weekly sync",
+            "updated_at": "2026-09-28T10:15:00Z"
+          }
+        ]
+      },
+      "MeetingResult": {
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version",
+            "default": "1.0.0"
+          },
+          "meeting": {
+            "$ref": "#/components/schemas/MeetingRead"
+          },
+          "processing": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProcessingInfo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null if the meeting never ran."
+          },
+          "audio_quality": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AudioQuality"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "languages": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LanguageSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "speakers": {
+            "items": {
+              "$ref": "#/components/schemas/SpeakerInfo"
+            },
+            "type": "array",
+            "title": "Speakers"
+          },
+          "transcript": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpeakerTranscript"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Omitted unless included (see ?include=)."
+          },
+          "analytics": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConversationAnalytics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MeetingSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verification_report": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VerificationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "description": "Audio quality, alignment and processing warnings, human-readable."
+          },
+          "included": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "transcript",
+                "analytics",
+                "summary"
+              ]
+            },
+            "type": "array",
+            "title": "Included",
+            "description": "Which optional sections were requested."
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting",
+          "processing",
+          "included"
+        ],
+        "title": "MeetingResult"
+      },
+      "MeetingStats": {
+        "properties": {
+          "meeting_duration_seconds": {
+            "type": "number",
+            "title": "Meeting Duration Seconds"
+          },
+          "total_speech_seconds": {
+            "type": "number",
+            "title": "Total Speech Seconds"
+          },
+          "total_silence_seconds": {
+            "type": "number",
+            "title": "Total Silence Seconds"
+          },
+          "silence_percent": {
+            "type": "number",
+            "title": "Silence Percent"
+          },
+          "num_speakers": {
+            "type": "integer",
+            "title": "Num Speakers"
+          },
+          "total_utterances": {
+            "type": "integer",
+            "title": "Total Utterances"
+          },
+          "total_words": {
+            "type": "integer",
+            "title": "Total Words"
+          },
+          "total_turn_switches": {
+            "type": "integer",
+            "title": "Total Turn Switches"
+          },
+          "overlap_seconds": {
+            "type": "number",
+            "title": "Overlap Seconds"
+          },
+          "overlap_percent": {
+            "type": "number",
+            "title": "Overlap Percent"
+          },
+          "overlap_double_counted_seconds": {
+            "type": "number",
+            "title": "Overlap Double Counted Seconds"
+          },
+          "gini_coefficient": {
+            "type": "number",
+            "title": "Gini Coefficient"
+          },
+          "participation_balance": {
+            "type": "string",
+            "enum": [
+              "balanced",
+              "moderately dominated",
+              "dominated",
+              "not applicable"
+            ],
+            "title": "Participation Balance"
+          },
+          "dominant_speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dominant Speaker"
+          },
+          "least_active_speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Least Active Speaker"
+          },
+          "language_distribution": {
+            "items": {
+              "$ref": "#/components/schemas/LanguageShare"
+            },
+            "type": "array",
+            "title": "Language Distribution"
+          },
+          "num_language_switches": {
+            "type": "integer",
+            "title": "Num Language Switches"
+          },
+          "longest_monologue": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Monologue"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_duration_seconds",
+          "total_speech_seconds",
+          "total_silence_seconds",
+          "silence_percent",
+          "num_speakers",
+          "total_utterances",
+          "total_words",
+          "total_turn_switches",
+          "overlap_seconds",
+          "overlap_percent",
+          "overlap_double_counted_seconds",
+          "gini_coefficient",
+          "participation_balance",
+          "dominant_speaker",
+          "least_active_speaker",
+          "language_distribution",
+          "num_language_switches",
+          "longest_monologue"
+        ],
+        "title": "MeetingStats"
+      },
+      "MeetingStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "processing",
+          "completed",
+          "completed_with_errors",
+          "cancelled",
+          "failed"
+        ],
+        "title": "MeetingStatus"
+      },
+      "MeetingSummary": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "executive_summary": {
+            "type": "string",
+            "title": "Executive Summary"
+          },
+          "agenda_topics": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Agenda Topics"
+          },
+          "key_points": {
+            "items": {
+              "$ref": "#/components/schemas/KeyPoint"
+            },
+            "type": "array",
+            "title": "Key Points"
+          },
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/Decision"
+            },
+            "type": "array",
+            "title": "Decisions"
+          },
+          "action_items": {
+            "items": {
+              "$ref": "#/components/schemas/ActionItem"
+            },
+            "type": "array",
+            "title": "Action Items"
+          },
+          "open_questions": {
+            "items": {
+              "$ref": "#/components/schemas/OpenQuestion"
+            },
+            "type": "array",
+            "title": "Open Questions"
+          },
+          "overall_sentiment": {
+            "type": "string",
+            "enum": [
+              "positive",
+              "neutral",
+              "negative",
+              "mixed"
+            ],
+            "title": "Overall Sentiment"
+          },
+          "output_language": {
+            "type": "string",
+            "title": "Output Language"
+          },
+          "source_languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Languages"
+          },
+          "model_info": {
+            "$ref": "#/components/schemas/ModelInfo"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Generated At"
+          },
+          "verification_report": {
+            "$ref": "#/components/schemas/VerificationReport"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "executive_summary",
+          "agenda_topics",
+          "key_points",
+          "decisions",
+          "action_items",
+          "open_questions",
+          "overall_sentiment",
+          "output_language",
+          "source_languages",
+          "model_info",
+          "generated_at",
+          "verification_report"
+        ],
+        "title": "MeetingSummary"
+      },
+      "MeetingSummaryResponse": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "executive_summary": {
+            "type": "string",
+            "title": "Executive Summary"
+          },
+          "agenda_topics": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Agenda Topics"
+          },
+          "key_points": {
+            "items": {
+              "$ref": "#/components/schemas/KeyPoint"
+            },
+            "type": "array",
+            "title": "Key Points"
+          },
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/Decision"
+            },
+            "type": "array",
+            "title": "Decisions"
+          },
+          "action_items": {
+            "items": {
+              "$ref": "#/components/schemas/ActionItem"
+            },
+            "type": "array",
+            "title": "Action Items"
+          },
+          "open_questions": {
+            "items": {
+              "$ref": "#/components/schemas/OpenQuestion"
+            },
+            "type": "array",
+            "title": "Open Questions"
+          },
+          "overall_sentiment": {
+            "type": "string",
+            "enum": [
+              "positive",
+              "neutral",
+              "negative",
+              "mixed"
+            ],
+            "title": "Overall Sentiment"
+          },
+          "output_language": {
+            "type": "string",
+            "title": "Output Language"
+          },
+          "source_languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Languages"
+          },
+          "model_info": {
+            "$ref": "#/components/schemas/ModelInfo"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Generated At"
+          },
+          "verification_report": {
+            "$ref": "#/components/schemas/VerificationReport"
+          },
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "speaker_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Speaker Names"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "executive_summary",
+          "agenda_topics",
+          "key_points",
+          "decisions",
+          "action_items",
+          "open_questions",
+          "overall_sentiment",
+          "output_language",
+          "source_languages",
+          "model_info",
+          "generated_at",
+          "verification_report",
+          "meeting_id"
+        ],
+        "title": "MeetingSummaryResponse"
+      },
+      "ModelInfo": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "prompt_version": {
+            "type": "string",
+            "title": "Prompt Version"
+          },
+          "strategy": {
+            "type": "string",
+            "enum": [
+              "single_pass",
+              "map_reduce"
+            ],
+            "title": "Strategy"
+          },
+          "num_chunks": {
+            "type": "integer",
+            "title": "Num Chunks"
+          },
+          "temperature": {
+            "type": "number",
+            "title": "Temperature"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/LLMUsageTotals"
+          }
+        },
+        "type": "object",
+        "required": [
+          "provider",
+          "model",
+          "prompt_version",
+          "strategy",
+          "num_chunks",
+          "temperature",
+          "usage"
+        ],
+        "title": "ModelInfo"
+      },
+      "Monologue": {
+        "properties": {
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "speaker": {
+            "type": "string",
+            "title": "Speaker"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "duration",
+          "speaker"
+        ],
+        "title": "Monologue"
+      },
+      "OpenQuestion": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "title": "Question"
+          },
+          "raised_by": {
+            "type": "string",
+            "title": "Raised By"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Evidence"
+          }
+        },
+        "type": "object",
+        "required": [
+          "question",
+          "raised_by",
+          "evidence"
+        ],
+        "title": "OpenQuestion"
+      },
+      "OverlapRegion": {
+        "properties": {
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "speakers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Speakers"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "speakers"
+        ],
+        "title": "OverlapRegion",
+        "description": "A span where two or more speakers talk at once."
+      },
+      "ProcessResponse": {
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MeetingStatus"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_id",
+          "status"
+        ],
+        "title": "ProcessResponse",
+        "examples": [
+          {
+            "meeting_id": "3f8b6f0e-2c1d-4d6a-9d3e-6c2b1a0f9e7d",
+            "status": "processing"
+          }
+        ]
+      },
+      "ProcessingInfo": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "model_versions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Model Versions"
+          },
+          "timings_ms": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Timings Ms"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/StageInfo"
+            },
+            "type": "array",
+            "title": "Stages"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "started_at",
+          "finished_at",
+          "model_versions",
+          "timings_ms",
+          "stages"
+        ],
+        "title": "ProcessingInfo"
+      },
+      "RegenerateSummaryRequest": {
+        "properties": {
+          "output_language": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "en",
+                  "hi",
+                  "or"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Language"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Overrides LLM_MODEL."
+          }
+        },
+        "type": "object",
+        "title": "RegenerateSummaryRequest"
+      },
+      "RegenerateSummaryResponse": {
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "status": {
+            "type": "string",
+            "const": "queued",
+            "title": "Status",
+            "default": "queued"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_id"
+        ],
+        "title": "RegenerateSummaryResponse"
+      },
+      "RunList": {
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RunSummary"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_id",
+          "items"
+        ],
+        "title": "RunList"
+      },
+      "RunSummary": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "model_versions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Model Versions"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "description": "The run served when no run_id is given."
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "started_at",
+          "finished_at",
+          "model_versions",
+          "error",
+          "is_default"
+        ],
+        "title": "RunSummary"
+      },
+      "SearchHit": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "utterance",
+              "summary"
+            ],
+            "title": "Kind"
+          },
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "meeting_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Meeting Title"
+          },
+          "run_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Run Id"
+          },
+          "utterance_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Utterance Id"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker"
+          },
+          "speaker_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker Name"
+          },
+          "start": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "meeting_id",
+          "meeting_title",
+          "run_id",
+          "utterance_id",
+          "speaker",
+          "speaker_name",
+          "start",
+          "text"
+        ],
+        "title": "SearchHit"
+      },
+      "SearchResults": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SearchHit"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "query",
+          "items"
+        ],
+        "title": "SearchResults"
+      },
+      "SpeakerInfo": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Stable diarization label, e.g. \"Person 1\"."
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "stats": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpeakerStats"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "From the latest analytics."
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "SpeakerInfo"
+      },
+      "SpeakerLanguages": {
+        "properties": {
+          "speaker": {
+            "type": "string",
+            "title": "Speaker"
+          },
+          "dominant_language": {
+            "type": "string",
+            "title": "Dominant Language"
+          },
+          "languages": {
+            "items": {
+              "$ref": "#/components/schemas/LanguageShare"
+            },
+            "type": "array",
+            "title": "Languages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "speaker",
+          "dominant_language",
+          "languages"
+        ],
+        "title": "SpeakerLanguages"
+      },
+      "SpeakerNamesResponse": {
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "speaker_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Speaker Names"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_id",
+          "speaker_names"
+        ],
+        "title": "SpeakerNamesResponse"
+      },
+      "SpeakerRenameRequest": {
+        "properties": {
+          "names": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Names",
+            "description": "{\"Person 1\": \"Ravi\"}; null removes a display name.",
+            "examples": [
+              {
+                "Person 1": "Ravi",
+                "Person 2": "Sunita"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "names"
+        ],
+        "title": "SpeakerRenameRequest"
+      },
+      "SpeakerStats": {
+        "properties": {
+          "speaker": {
+            "type": "string",
+            "title": "Speaker",
+            "description": "Diarization label, e.g. \"Person 1\"."
+          },
+          "speaker_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker Name"
+          },
+          "speaking_time_seconds": {
+            "type": "number",
+            "title": "Speaking Time Seconds"
+          },
+          "speaking_time_percent_of_speech": {
+            "type": "number",
+            "title": "Speaking Time Percent Of Speech"
+          },
+          "speaking_time_percent_of_meeting": {
+            "type": "number",
+            "title": "Speaking Time Percent Of Meeting"
+          },
+          "num_segments": {
+            "type": "integer",
+            "title": "Num Segments"
+          },
+          "segment_share_percent": {
+            "type": "number",
+            "title": "Segment Share Percent"
+          },
+          "num_turns": {
+            "type": "integer",
+            "title": "Num Turns"
+          },
+          "avg_utterance_seconds": {
+            "type": "number",
+            "title": "Avg Utterance Seconds"
+          },
+          "median_utterance_seconds": {
+            "type": "number",
+            "title": "Median Utterance Seconds"
+          },
+          "longest_utterance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TimeSpan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "word_count": {
+            "type": "integer",
+            "title": "Word Count"
+          },
+          "words_per_minute": {
+            "type": "number",
+            "title": "Words Per Minute"
+          },
+          "first_spoke_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Spoke At"
+          },
+          "last_spoke_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Spoke At"
+          },
+          "interruptions_made": {
+            "type": "integer",
+            "title": "Interruptions Made"
+          },
+          "interruptions_received": {
+            "type": "integer",
+            "title": "Interruptions Received"
+          },
+          "overlap_seconds": {
+            "type": "number",
+            "title": "Overlap Seconds"
+          },
+          "language_breakdown": {
+            "items": {
+              "$ref": "#/components/schemas/LanguageShare"
+            },
+            "type": "array",
+            "title": "Language Breakdown"
+          },
+          "questions_asked": {
+            "type": "integer",
+            "title": "Questions Asked"
+          }
+        },
+        "type": "object",
+        "required": [
+          "speaker",
+          "speaking_time_seconds",
+          "speaking_time_percent_of_speech",
+          "speaking_time_percent_of_meeting",
+          "num_segments",
+          "segment_share_percent",
+          "num_turns",
+          "avg_utterance_seconds",
+          "median_utterance_seconds",
+          "longest_utterance",
+          "word_count",
+          "words_per_minute",
+          "first_spoke_at",
+          "last_spoke_at",
+          "interruptions_made",
+          "interruptions_received",
+          "overlap_seconds",
+          "language_breakdown",
+          "questions_asked"
+        ],
+        "title": "SpeakerStats"
+      },
+      "SpeakerTranscript": {
+        "properties": {
+          "utterances": {
+            "items": {
+              "$ref": "#/components/schemas/Utterance"
+            },
+            "type": "array",
+            "title": "Utterances",
+            "description": "Sorted by start, ties broken by speaker."
+          },
+          "speakers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Speakers"
+          },
+          "total_duration": {
+            "type": "number",
+            "title": "Total Duration"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "alignment_stats": {
+            "$ref": "#/components/schemas/AlignmentStats"
+          }
+        },
+        "type": "object",
+        "required": [
+          "utterances",
+          "speakers",
+          "total_duration",
+          "warnings",
+          "alignment_stats"
+        ],
+        "title": "SpeakerTranscript"
+      },
+      "SpeakerTranscriptResponse": {
+        "properties": {
+          "utterances": {
+            "items": {
+              "$ref": "#/components/schemas/Utterance"
+            },
+            "type": "array",
+            "title": "Utterances",
+            "description": "Sorted by start, ties broken by speaker."
+          },
+          "speakers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Speakers"
+          },
+          "total_duration": {
+            "type": "number",
+            "title": "Total Duration"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "alignment_stats": {
+            "$ref": "#/components/schemas/AlignmentStats"
+          },
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "speaker_names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Speaker Names"
+          }
+        },
+        "type": "object",
+        "required": [
+          "utterances",
+          "speakers",
+          "total_duration",
+          "warnings",
+          "alignment_stats",
+          "meeting_id"
+        ],
+        "title": "SpeakerTranscriptResponse"
+      },
+      "SpeakerTurn": {
+        "properties": {
+          "speaker_label": {
+            "type": "string",
+            "title": "Speaker Label",
+            "description": "Stable meeting-wide label, e.g. \"Person 1\"."
+          },
+          "raw_label": {
+            "type": "string",
+            "title": "Raw Label",
+            "description": "Label emitted by the model, e.g. \"SPEAKER_00\"."
+          },
+          "start": {
+            "type": "number",
+            "title": "Start",
+            "description": "Seconds from the start of the processed audio."
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "is_overlap": {
+            "type": "boolean",
+            "title": "Is Overlap",
+            "description": "True if another speaker talks during this turn."
+          }
+        },
+        "type": "object",
+        "required": [
+          "speaker_label",
+          "raw_label",
+          "start",
+          "end",
+          "duration",
+          "is_overlap"
+        ],
+        "title": "SpeakerTurn",
+        "description": "A continuous stretch of speech by one speaker."
+      },
+      "SpeakersResponse": {
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "num_speakers": {
+            "type": "integer",
+            "title": "Num Speakers"
+          },
+          "speakers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Speakers"
+          },
+          "turns": {
+            "items": {
+              "$ref": "#/components/schemas/SpeakerTurn"
+            },
+            "type": "array",
+            "title": "Turns"
+          },
+          "overlap_regions": {
+            "items": {
+              "$ref": "#/components/schemas/OverlapRegion"
+            },
+            "type": "array",
+            "title": "Overlap Regions"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_id",
+          "num_speakers",
+          "speakers",
+          "turns",
+          "overlap_regions",
+          "model_name"
+        ],
+        "title": "SpeakersResponse",
+        "examples": [
+          {
+            "meeting_id": "3f8b6f0e-2c1d-4d6a-9d3e-6c2b1a0f9e7d",
+            "model_name": "pyannote/speaker-diarization-3.1",
+            "num_speakers": 2,
+            "overlap_regions": [
+              {
+                "end": 7.84,
+                "speakers": [
+                  "Person 1",
+                  "Person 2"
+                ],
+                "start": 7.61
+              }
+            ],
+            "speakers": [
+              "Person 1",
+              "Person 2"
+            ],
+            "turns": [
+              {
+                "duration": 7.32,
+                "end": 7.84,
+                "is_overlap": false,
+                "raw_label": "SPEAKER_01",
+                "speaker_label": "Person 1",
+                "start": 0.52
+              },
+              {
+                "duration": 7.59,
+                "end": 15.2,
+                "is_overlap": true,
+                "raw_label": "SPEAKER_00",
+                "speaker_label": "Person 2",
+                "start": 7.61
+              }
+            ]
+          }
+        ]
+      },
+      "StageInfo": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "completed",
+                  "failed",
+                  "skipped"
+                ]
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Status"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "status",
+          "duration_ms"
+        ],
+        "title": "StageInfo"
+      },
+      "SwitchPoint": {
+        "properties": {
+          "timestamp": {
+            "type": "number",
+            "title": "Timestamp"
+          },
+          "from_language": {
+            "type": "string",
+            "title": "From Language"
+          },
+          "to_language": {
+            "type": "string",
+            "title": "To Language"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker",
+            "description": "Who is speaking right after the switch."
+          }
+        },
+        "type": "object",
+        "required": [
+          "timestamp",
+          "from_language",
+          "to_language",
+          "speaker"
+        ],
+        "title": "SwitchPoint"
+      },
+      "TimeSpan": {
+        "properties": {
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "duration"
+        ],
+        "title": "TimeSpan"
+      },
+      "TimelineBucket": {
+        "properties": {
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "speakers": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Speakers",
+            "description": "Speaking seconds per speaker label."
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "speakers"
+        ],
+        "title": "TimelineBucket"
+      },
+      "TranscriptResponse": {
+        "properties": {
+          "segments": {
+            "items": {
+              "$ref": "#/components/schemas/TranscriptSegment"
+            },
+            "type": "array",
+            "title": "Segments",
+            "description": "Sorted by start time."
+          },
+          "detected_languages": {
+            "items": {
+              "$ref": "#/components/schemas/LanguageDuration"
+            },
+            "type": "array",
+            "title": "Detected Languages",
+            "description": "Speech time per language, longest first."
+          },
+          "model_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Model Names"
+          },
+          "processing_time_ms": {
+            "type": "integer",
+            "title": "Processing Time Ms"
+          },
+          "requested_language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Language",
+            "description": "Language forced from the upload hint, if any."
+          },
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "segments",
+          "detected_languages",
+          "model_names",
+          "processing_time_ms",
+          "meeting_id"
+        ],
+        "title": "TranscriptResponse",
+        "examples": [
+          {
+            "detected_languages": [
+              {
+                "duration_seconds": 3.38,
+                "language": "hi"
+              }
+            ],
+            "meeting_id": "3f8b6f0e-2c1d-4d6a-9d3e-6c2b1a0f9e7d",
+            "model_names": [
+              "faster-whisper/large-v3"
+            ],
+            "processing_time_ms": 5120,
+            "requested_language": "hi",
+            "segments": [
+              {
+                "avg_confidence": 0.91,
+                "backend": "whisper",
+                "compression_ratio": 1.1,
+                "end": 3.9,
+                "id": 0,
+                "language": "hi",
+                "low_confidence": false,
+                "no_speech_prob": 0.01,
+                "start": 0.52,
+                "text": "आज की मीटिंग का एजेंडा बजट है।",
+                "words": [
+                  {
+                    "confidence": 0.97,
+                    "end": 0.8,
+                    "start": 0.52,
+                    "text": "आज"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "TranscriptSegment": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language",
+            "description": "ISO 639-1 code, e.g. en, hi, or."
+          },
+          "words": {
+            "items": {
+              "$ref": "#/components/schemas/Word"
+            },
+            "type": "array",
+            "title": "Words"
+          },
+          "avg_confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Confidence"
+          },
+          "backend": {
+            "type": "string",
+            "title": "Backend",
+            "description": "ASR backend that produced this segment."
+          },
+          "low_confidence": {
+            "type": "boolean",
+            "title": "Low Confidence",
+            "default": false
+          },
+          "no_speech_prob": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Speech Prob"
+          },
+          "compression_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compression Ratio"
+          },
+          "primary_language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Primary Language",
+            "description": "Language of most words in the segment."
+          },
+          "languages_present": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Languages Present"
+          },
+          "is_code_mixed": {
+            "type": "boolean",
+            "title": "Is Code Mixed",
+            "default": false
+          },
+          "code_mix_ratio": {
+            "type": "number",
+            "title": "Code Mix Ratio",
+            "description": "Share of language-tagged words not in the primary language.",
+            "default": 0.0
+          },
+          "lid_confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lid Confidence",
+            "description": "Audio LID confidence of the region this segment came from."
+          },
+          "fallback_used": {
+            "type": "boolean",
+            "title": "Fallback Used",
+            "description": "The routed backend failed; Whisper transcribed instead.",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "start",
+          "end",
+          "text",
+          "language",
+          "words",
+          "avg_confidence",
+          "backend"
+        ],
+        "title": "TranscriptSegment"
+      },
+      "Utterance": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "speaker": {
+            "type": "string",
+            "title": "Speaker",
+            "description": "Diarization label, e.g. \"Person 1\"; never renumbered."
+          },
+          "speaker_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker Name",
+            "description": "Display name set via PATCH /speakers (output only)."
+          },
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "words": {
+            "items": {
+              "$ref": "#/components/schemas/AlignedWord"
+            },
+            "type": "array",
+            "title": "Words"
+          },
+          "primary_language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Primary Language"
+          },
+          "languages_present": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Languages Present"
+          },
+          "is_code_mixed": {
+            "type": "boolean",
+            "title": "Is Code Mixed"
+          },
+          "avg_confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Confidence"
+          },
+          "has_overlap": {
+            "type": "boolean",
+            "title": "Has Overlap"
+          },
+          "overlapping_speakers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Overlapping Speakers"
+          },
+          "alignment_precision": {
+            "type": "string",
+            "enum": [
+              "word",
+              "segment"
+            ],
+            "title": "Alignment Precision",
+            "description": "segment = word times estimated from segment/turn durations."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "speaker",
+          "start",
+          "end",
+          "duration",
+          "text",
+          "words",
+          "primary_language",
+          "languages_present",
+          "is_code_mixed",
+          "avg_confidence",
+          "has_overlap",
+          "overlapping_speakers",
+          "alignment_precision"
+        ],
+        "title": "Utterance"
+      },
+      "UtterancePage": {
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Meeting Id"
+          },
+          "run_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Run Id"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/UtteranceRow"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meeting_id",
+          "run_id",
+          "items",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "UtterancePage"
+      },
+      "UtteranceRow": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "speaker": {
+            "type": "string",
+            "title": "Speaker"
+          },
+          "speaker_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker Name"
+          },
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "primary_language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Primary Language"
+          },
+          "is_code_mixed": {
+            "type": "boolean",
+            "title": "Is Code Mixed"
+          },
+          "has_overlap": {
+            "type": "boolean",
+            "title": "Has Overlap"
+          },
+          "alignment_precision": {
+            "type": "string",
+            "title": "Alignment Precision"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "speaker",
+          "speaker_name",
+          "start",
+          "end",
+          "text",
+          "primary_language",
+          "is_code_mixed",
+          "has_overlap",
+          "alignment_precision"
+        ],
+        "title": "UtteranceRow"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "VerificationIssue": {
+        "properties": {
+          "item_type": {
+            "type": "string",
+            "enum": [
+              "key_point",
+              "decision",
+              "action_item",
+              "open_question"
+            ],
+            "title": "Item Type"
+          },
+          "item": {
+            "type": "string",
+            "title": "Item"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "dropped",
+              "downgraded",
+              "evidence_removed",
+              "owner_reset"
+            ],
+            "title": "Action"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "item_type",
+          "item",
+          "action",
+          "reason"
+        ],
+        "title": "VerificationIssue"
+      },
+      "VerificationReport": {
+        "properties": {
+          "checked": {
+            "type": "integer",
+            "title": "Checked",
+            "description": "Items checked."
+          },
+          "passed": {
+            "type": "integer",
+            "title": "Passed",
+            "description": "Items kept without changes."
+          },
+          "dropped": {
+            "type": "integer",
+            "title": "Dropped"
+          },
+          "downgraded": {
+            "type": "integer",
+            "title": "Downgraded"
+          },
+          "evidence_checked": {
+            "type": "integer",
+            "title": "Evidence Checked"
+          },
+          "evidence_passed": {
+            "type": "integer",
+            "title": "Evidence Passed"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/VerificationIssue"
+            },
+            "type": "array",
+            "title": "Issues"
+          },
+          "injection_flags": {
+            "items": {
+              "$ref": "#/components/schemas/InjectionFlag"
+            },
+            "type": "array",
+            "title": "Injection Flags"
+          }
+        },
+        "type": "object",
+        "required": [
+          "checked",
+          "passed",
+          "dropped",
+          "downgraded",
+          "evidence_checked",
+          "evidence_passed"
+        ],
+        "title": "VerificationReport"
+      },
+      "Word": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "start": {
+            "type": "number",
+            "title": "Start"
+          },
+          "end": {
+            "type": "number",
+            "title": "End"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence",
+            "description": "0-1 word probability; null when the model gives none."
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language",
+            "description": "en, hi, or; hi-Latn / or-Latn for romanized Hindi/Odia; null if neutral."
+          },
+          "script": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script",
+            "description": "ISO 15924: Latn, Deva, Orya."
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "start",
+          "end"
+        ],
+        "title": "Word"
+      }
+    }
+  }
+}

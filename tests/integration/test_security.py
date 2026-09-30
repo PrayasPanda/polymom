@@ -71,6 +71,8 @@ async def test_api_keys_and_tenant_isolation(
             ("GET", f"{URL}/{meeting_id}/status"),
             ("GET", f"{URL}/{meeting_id}/result"),
             ("GET", f"{URL}/{meeting_id}/export"),
+            ("GET", f"{URL}/{meeting_id}/audio"),
+            ("GET", f"/ui/partials/meetings/{meeting_id}"),
             ("POST", f"{URL}/{meeting_id}/process"),
             ("POST", f"{URL}/{meeting_id}/cancel"),
             ("DELETE", f"{URL}/{meeting_id}"),

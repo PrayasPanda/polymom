@@ -25,3 +25,21 @@ def test_env_example_documents_every_setting() -> None:
     fields = {name.upper() for name in Settings.model_fields}
     assert fields - documented == set()
     assert {k for k in documented - fields if not k.startswith("OTEL_EXPORTER")} == set()
+
+
+def test_package_version_matches_pyproject() -> None:
+    import tomllib
+
+    from app import __version__
+
+    pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text("utf-8"))
+    assert pyproject["project"]["version"] == __version__ == "1.0.0"
+
+
+def test_empty_secrets_count_as_missing() -> None:
+    from app.api.v1.routes.health import model_availability
+
+    settings = Settings(_env_file=None, llm_provider="openai", llm_api_key="", hf_token="")
+    availability = model_availability(settings)
+    assert availability["llm"] is False
+    assert availability["diarization"] is False

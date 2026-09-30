@@ -35,7 +35,9 @@ ACTIVE = {MeetingStatus.QUEUED, MeetingStatus.PROCESSING}
 
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 router = APIRouter(include_in_schema=False)
-partials = APIRouter(prefix="/ui/partials", dependencies=[Depends(resolve_api_key)])
+partials = APIRouter(
+    prefix="/ui/partials", dependencies=[Depends(resolve_api_key)], include_in_schema=False
+)
 
 
 def _render(request: Request, name: str, **context: Any) -> HTMLResponse:
