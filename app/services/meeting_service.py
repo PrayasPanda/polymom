@@ -52,17 +52,32 @@ def upload_key(meeting_id: uuid.UUID, extension: str) -> str:
 
 
 class MeetingService:
+    """Services scope every read and write to the caller's ``owner_key_id``.
+
+    A meeting whose ``owner_key_id`` does not match the caller is reported as
+    ``meeting_not_found`` (never leak its existence to another tenant).
+    ``owner_key_id=None`` means unscoped, used by workers and admin scripts.
+    """
+
     def __init__(
         self,
         uow: UnitOfWork,
         validator: MediaValidator,
         settings: Settings,
         store: ArtifactStore,
+        owner_key_id: int | None = None,
     ) -> None:
         self.uow = uow
         self.store = store
+        self.owner_key_id = owner_key_id
         self._validator = validator
         self._settings = settings
+
+    def _check_owner(self, meeting: Meeting) -> None:
+        if self.owner_key_id is not None and meeting.owner_key_id != self.owner_key_id:
+            raise MeetingNotFoundError(
+                f"Meeting {meeting.id} not found.", details={"meeting_id": str(meeting.id)}
+            )
 
     # --- upload ---
 
@@ -92,7 +107,9 @@ class MeetingService:
                 raise
             try:
                 if not allow_duplicate:
-                    existing = await self.uow.meetings.get_by_sha256(media.sha256)
+                    existing = await self.uow.meetings.get_by_sha256(
+                        media.sha256, owner_key_id=self.owner_key_id
+                    )
                     if existing is not None:
                         logger.info("upload_duplicate", existing=str(existing.id))
                         return existing, True
@@ -110,6 +127,7 @@ class MeetingService:
                 id=meeting_id,
                 title=title,
                 original_filename=media.original_filename,
+                owner_key_id=self.owner_key_id,
                 upload_key=key,
                 sha256=media.sha256,
                 mime_type=media.mime_type,
@@ -138,9 +156,11 @@ class MeetingService:
             raise MeetingNotFoundError(
                 f"Meeting {meeting_id} not found.", details={"meeting_id": str(meeting_id)}
             )
+        self._check_owner(meeting)
         return meeting
 
     async def page(self, query: MeetingQuery) -> MeetingPage:
+        query.owner_key_id = self.owner_key_id
         return await self.uow.meetings.page(query)
 
     async def default_run(self, meeting_id: uuid.UUID) -> ProcessingRun | None:

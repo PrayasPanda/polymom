@@ -4,12 +4,16 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
 
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import error_body, register_exception_handlers
 from app.core.logging import configure_logging, get_logger
+from app.core.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
+from app.core.rate_limit import build_limiter, rate_limit_handler
 from app.db.migrate import upgrade_to_head
 from app.db.session import create_engine, create_sessionmaker
 
@@ -32,7 +36,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
         logger.info(
-            "startup", app=settings.app_name, version=settings.app_version, env=settings.app_env
+            "startup",
+            app=settings.app_name,
+            version=settings.app_version,
+            env=settings.app_env,
+            pipeline_execution=settings.pipeline_execution,
         )
         yield
         await engine.dispose()
@@ -40,6 +48,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=lifespan)
     app.dependency_overrides[get_settings] = lambda: settings
+
+    # Correlation-id middleware runs outermost so every log and error carries request_id.
+    app.add_middleware(RequestContextMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware, hsts=settings.app_env == "production")
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-API-Key", "Idempotency-Key"],
+            expose_headers=["X-Request-ID", "Retry-After"],
+        )
+
+    limiter = build_limiter(settings)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
     register_exception_handlers(app)
 
     @app.middleware("http")
