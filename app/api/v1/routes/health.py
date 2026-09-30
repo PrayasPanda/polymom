@@ -93,12 +93,15 @@ def model_availability(settings: Settings) -> dict[str, Any]:
         except (ImportError, ValueError):
             return False
 
+    def present(secret: Any) -> bool:  # an empty env var yields SecretStr("")
+        return secret is not None and bool(secret.get_secret_value())
+
     backends = {
         "diarization": settings.diarization_backend == "mock"
-        or (installed("pyannote.audio") and settings.hf_token is not None),
+        or (installed("pyannote.audio") and present(settings.hf_token)),
         "asr": settings.asr_backend == "mock" or installed("faster_whisper"),
         "language_id": settings.lid_backend == "mock" or installed("transformers"),
-        "llm": settings.llm_provider in ("mock", "ollama") or settings.llm_api_key is not None,
+        "llm": settings.llm_provider in ("mock", "ollama") or present(settings.llm_api_key),
     }
     return {"ok": all(backends.values()), **backends}
 

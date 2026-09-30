@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
+from app.api.v1.routes.health import model_availability
 from app.core.config import Settings, get_settings
 from app.core.exceptions import error_body, register_exception_handlers
 from app.core.logging import configure_logging, get_logger
@@ -44,6 +45,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             env=settings.app_env,
             pipeline_execution=settings.pipeline_execution,
         )
+        missing = [k for k, ok in model_availability(settings).items() if k != "ok" and not ok]
+        if missing:
+            # The API never loads models, so it runs; jobs that need these backends fail.
+            logger.warning(
+                "ml_backends_unavailable",
+                backends=missing,
+                hint="Install the ml/indic extras and set HF_TOKEN / LLM_API_KEY, "
+                "or use DIARIZATION_BACKEND/ASR_BACKEND/LID_BACKEND=mock, LLM_PROVIDER=mock.",
+            )
         yield
         await engine.dispose()
         logger.info("shutdown")
