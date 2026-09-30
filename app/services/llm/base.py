@@ -206,7 +206,8 @@ def schema_json(schema: type[BaseModel]) -> dict[str, Any]:
     after the required header fields, which silently produced minutes without decisions
     or action items. Requiring everything forces an explicit, possibly empty, list.
     """
-    return _require_all(schema.model_json_schema())
+    required: dict[str, Any] = _require_all(schema.model_json_schema())
+    return required
 
 
 def _require_all(node: Any) -> Any:
