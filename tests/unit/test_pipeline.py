@@ -37,6 +37,10 @@ class OptionalStage(RecordingStage):
 
 @pytest.fixture
 async def meeting(uow_factory: UnitOfWorkFactory, store: LocalArtifactStore) -> Meeting:
+    return await create_meeting(uow_factory, store)
+
+
+async def create_meeting(uow_factory: UnitOfWorkFactory, store: LocalArtifactStore) -> Meeting:
     meeting_id = uuid.uuid4()
     key = f"meetings/{meeting_id}/upload/original.wav"
     await store.put(key, b"RIFF")
