@@ -1,33 +1,116 @@
+# API + Postgres + Redis + one worker per resource queue.
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#   docker compose -f docker/docker-compose.yml exec api python scripts/create_api_key.py --label me
+#   docker compose -f docker/docker-compose.yml --profile monitoring up    # + Prometheus, Grafana
+#   docker compose -f docker/docker-compose.yml --profile minio up         # + S3-compatible store
+#
+# Defaults run the mock ML backends so the stack works without GPUs or model downloads;
+# set INSTALL_ML=true and the *_BACKEND variables in .env for real models.
+
+x-app: &app
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+    args:
+      INSTALL_ML: ${INSTALL_ML:-false}
+      INSTALL_INDIC: ${INSTALL_INDIC:-false}
+      TORCH_VARIANT: ${TORCH_VARIANT:-cpu}
+  image: polymom:latest
+  env_file:
+    - path: ../.env
+      required: false
+  environment: &app-env
+    APP_ENV: ${APP_ENV:-production}
+    STORAGE_DIR: /app/storage
+    DATABASE_URL: postgresql+asyncpg://polymom:${POSTGRES_PASSWORD:-polymom}@postgres:5432/polymom
+    REDIS_URL: redis://redis:6379/0
+    PIPELINE_EXECUTION: queue
+    DIARIZATION_BACKEND: ${DIARIZATION_BACKEND:-mock}
+    ASR_BACKEND: ${ASR_BACKEND:-mock}
+    LID_BACKEND: ${LID_BACKEND:-mock}
+    LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+  volumes:
+    - storage:/app/storage
+    - model-cache:/app/.cache
+  restart: unless-stopped
+
 services:
-  api:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        # true installs torch + pyannote.audio for real diarization
-        INSTALL_ML: ${INSTALL_ML:-false}
-        # true adds the Odia ASR runtime (use together with INSTALL_ML=true)
-        INSTALL_INDIC: ${INSTALL_INDIC:-false}
-        TORCH_VARIANT: ${TORCH_VARIANT:-cpu}
-    image: polymom:latest
-    env_file:
-      - path: ../.env
-        required: false
+  postgres:
+    image: postgres:16-alpine
     environment:
-      STORAGE_DIR: /app/storage
+      POSTGRES_USER: polymom
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-polymom}
+      POSTGRES_DB: polymom
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polymom"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      AUTO_MIGRATE: "true"
     ports:
       - "8000:8000"
-    volumes:
-      - storage:/app/storage
-      # Hugging Face / torch model downloads (pyannote, Whisper, IndicConformer),
-      # reused across restarts and rebuilds
-      - model-cache:/app/.cache
-    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/health/ready"]
+      interval: 10s
+      retries: 12
 
-  # Optional S3-compatible artifact store:
-  #   docker compose -f docker/docker-compose.yml --profile minio up
-  # with ARTIFACT_STORE=s3 S3_ENDPOINT_URL=http://minio:9000 S3_BUCKET=polymom
-  #      S3_ACCESS_KEY=polymom S3_SECRET_KEY=polymom-secret in .env
+  worker-cpu:
+    <<: *app
+    command: ["python", "-m", "app.workers.main", "--queue", "cpu"]
+    environment:
+      <<: *app-env
+      AUTO_MIGRATE: "false"
+    stop_grace_period: 150s  # > SHUTDOWN_GRACE_SECONDS: finish the chunk and checkpoint
+    depends_on:
+      api: {condition: service_healthy}  # the API runs the migrations
+
+  worker-gpu:
+    <<: *app
+    command: ["python", "-m", "app.workers.main", "--queue", "gpu"]
+    environment:
+      <<: *app-env
+      AUTO_MIGRATE: "false"
+      QUEUE_CONCURRENCY_GPU: ${QUEUE_CONCURRENCY_GPU:-1}
+    stop_grace_period: 150s
+    depends_on:
+      api: {condition: service_healthy}
+    # For NVIDIA GPUs (with TORCH_VARIANT=cu124):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+
+  worker-llm:
+    <<: *app
+    command: ["python", "-m", "app.workers.main", "--queue", "llm"]
+    environment:
+      <<: *app-env
+      AUTO_MIGRATE: "false"
+    stop_grace_period: 150s
+    depends_on:
+      api: {condition: service_healthy}
+
+  # --- optional: S3-compatible artifact store (ARTIFACT_STORE=s3) ---
   minio:
     image: minio/minio:latest
     profiles: ["minio"]
@@ -35,11 +118,8 @@ services:
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-polymom}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-polymom-secret}
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio-data:/data
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
@@ -49,17 +129,38 @@ services:
     image: minio/mc:latest
     profiles: ["minio"]
     depends_on:
-      minio:
-        condition: service_healthy
+      minio: {condition: service_healthy}
     environment:
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-polymom}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-polymom-secret}
       S3_BUCKET: ${S3_BUCKET:-polymom}
     entrypoint: >
-      sh -c "mc alias set local http://minio:9000 $${S3_ACCESS_KEY:-polymom} $${S3_SECRET_KEY:-polymom-secret}
-      && mc mb --ignore-existing local/$${S3_BUCKET:-polymom}"
+      sh -c "mc alias set local http://minio:9000 $${S3_ACCESS_KEY} $${S3_SECRET_KEY}
+      && mc mb --ignore-existing local/$${S3_BUCKET}"
+
+  # --- optional: monitoring ---
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["monitoring"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["monitoring"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
 
 volumes:
   storage:
   model-cache:
+  postgres-data:
+  redis-data:
   minio-data:

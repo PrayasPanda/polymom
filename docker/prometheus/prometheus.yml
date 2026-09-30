@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: polymom-api
+    metrics_path: /api/v1/metrics
+    static_configs:
+      - targets: ["api:8000"]
+  - job_name: polymom-workers
+    static_configs:
+      - targets: ["worker-cpu:9101", "worker-gpu:9101", "worker-llm:9101"]

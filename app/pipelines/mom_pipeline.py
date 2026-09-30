@@ -482,6 +482,12 @@ async def save_summary(
         SummarizationStage.name, None, duration_ms=duration_ms, fingerprint=writer.fingerprint
     )
     await writer.uow.results.add_summary(writer.meeting_id, writer.run_id, summary)
+    from app.core.metrics import LLM_COST, LLM_TOKENS
+
+    usage = summary.model_info.usage
+    LLM_TOKENS.labels("prompt").inc(usage.prompt_tokens)
+    LLM_TOKENS.labels("completion").inc(usage.completion_tokens)
+    LLM_COST.inc(usage.cost_usd)
     await writer.uow.search.index_summary(writer.meeting_id, writer.run_id, summary)
 
 

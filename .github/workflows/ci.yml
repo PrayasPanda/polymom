@@ -27,3 +27,23 @@ jobs:
         run: make typecheck
       - name: Test
         run: make test
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Export locked dependencies
+        run: uv export --frozen --no-dev --no-hashes --all-extras --no-emit-project > requirements-audit.txt
+      - name: pip-audit
+        run: uvx pip-audit --strict --requirement requirements-audit.txt --no-deps --disable-pip
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
