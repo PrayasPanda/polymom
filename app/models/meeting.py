@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import BigInteger, Enum, Float, Integer, String, Text, Uuid
+from sqlalchemy import BigInteger, Enum, Float, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, JSONDocument, UTCDateTime, utcnow
@@ -27,6 +27,9 @@ class Meeting(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     title: Mapped[str | None] = mapped_column(String(200))
     original_filename: Mapped[str] = mapped_column(String(255))
+    owner_key_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), index=True
+    )
     upload_key: Mapped[str] = mapped_column(String(1024))
     processed_key: Mapped[str | None] = mapped_column(String(1024))
     sha256: Mapped[str | None] = mapped_column(String(64), index=True)
