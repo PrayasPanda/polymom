@@ -7,7 +7,6 @@ maps to one arq worker process with its own concurrency (``QUEUE_CONCURRENCY_*``
 from __future__ import annotations
 
 import uuid
-from collections.abc import Awaitable, Callable
 from typing import Any, Literal, Protocol
 
 from app.core.config import Settings
@@ -25,7 +24,6 @@ class JobQueue(Protocol):
         meeting_id: uuid.UUID,
         *,
         from_stage: str | None = None,
-        idempotency_key: str | None = None,
         request_id: str | None = None,
         callback_url: str | None = None,
     ) -> str: ...
@@ -89,7 +87,6 @@ class InlineQueue:
         meeting_id: uuid.UUID,
         *,
         from_stage: str | None = None,
-        idempotency_key: str | None = None,
         request_id: str | None = None,
         callback_url: str | None = None,
     ) -> str:
@@ -122,15 +119,10 @@ class InlineQueue:
 # --- arq (Redis) ---
 
 CANCEL_KEY_PREFIX = "polymom:cancel:"
-IDEMPOTENCY_KEY_PREFIX = "polymom:idem:"
 
 
 def cancel_key(meeting_id: uuid.UUID) -> str:
     return f"{CANCEL_KEY_PREFIX}{meeting_id}"
-
-
-def idempotency_key(name: str) -> str:
-    return f"{IDEMPOTENCY_KEY_PREFIX}{name}"
 
 
 class ArqJobQueue:
@@ -163,30 +155,21 @@ class ArqJobQueue:
         meeting_id: uuid.UUID,
         *,
         from_stage: str | None = None,
-        idempotency_key: str | None = None,
         request_id: str | None = None,
         callback_url: str | None = None,
     ) -> str:
         pool = await self._get_pool()
-        if idempotency_key is not None:
-            prior = await pool.get(f"{IDEMPOTENCY_KEY_PREFIX}{idempotency_key}")
-            if prior:
-                return prior.decode() if isinstance(prior, bytes) else str(prior)
-        # Clear any earlier cancel flag for this meeting.
-        await pool.delete(cancel_key(meeting_id))
+        await pool.delete(cancel_key(meeting_id))  # a new run clears an old cancel flag
         job = await pool.enqueue_job(
             "run_pipeline",
             str(meeting_id),
             from_stage,
             request_id,
             callback_url,
-            _job_id=f"pipeline:{meeting_id}",
+            None,
             _queue_name="polymom:cpu",
         )
-        job_id = job.job_id if job is not None else f"pipeline:{meeting_id}"
-        if idempotency_key is not None:
-            await pool.set(f"{IDEMPOTENCY_KEY_PREFIX}{idempotency_key}", job_id, ex=24 * 3600)
-        return job_id
+        return str(job.job_id) if job is not None else ""
 
     async def enqueue_regenerate_summary(
         self,
@@ -225,6 +208,3 @@ class ArqJobQueue:
 
 async def is_cancelled(redis: Any, meeting_id: uuid.UUID) -> bool:
     return bool(await redis.get(cancel_key(meeting_id)))
-
-
-CANCELLATION_CHECK: Callable[[Any, uuid.UUID], Awaitable[bool]] = is_cancelled

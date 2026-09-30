@@ -105,13 +105,14 @@ def _backoff(attempt: int) -> float:
 
 async def deliver_webhook(
     settings: Settings,
-    redis: Any,
     meeting_id: uuid.UUID,
     status: str,
     callback_url: str,
     *,
     request_id: str | None = None,
     now_fn: Any = time.time,
+    transport: httpx.AsyncBaseTransport | None = None,
+    sleep: Any = asyncio.sleep,
 ) -> bool:
     """POST the final status; returns True on 2xx, False after exhausting retries."""
     if settings.webhook_secret is None:
@@ -142,7 +143,9 @@ async def deliver_webhook(
         if request_id:
             headers["X-Request-ID"] = request_id
         try:
-            async with httpx.AsyncClient(timeout=settings.webhook_timeout_seconds) as client:
+            async with httpx.AsyncClient(
+                timeout=settings.webhook_timeout_seconds, transport=transport
+            ) as client:
                 response = await client.post(url, content=body, headers=headers)
         except httpx.HTTPError as exc:
             logger.warning("webhook_attempt_failed", url=url, attempt=attempt, error=str(exc))
@@ -163,6 +166,6 @@ async def deliver_webhook(
                 WEBHOOKS.labels("client_error").inc()
                 return False
         if attempt < max_attempts:
-            await asyncio.sleep(_backoff(attempt))
+            await sleep(_backoff(attempt))
     WEBHOOKS.labels("exhausted").inc()
     return False

@@ -90,6 +90,7 @@ class MeetingService:
         expected_speakers: int | None,
         languages: list[str],
         allow_duplicate: bool = False,
+        callback_url: str | None = None,
     ) -> tuple[Meeting, bool]:
         """Validate and store an upload, then record it as ``queued``.
 
@@ -128,6 +129,7 @@ class MeetingService:
                 title=title,
                 original_filename=media.original_filename,
                 owner_key_id=self.owner_key_id,
+                callback_url=callback_url,
                 upload_key=key,
                 sha256=media.sha256,
                 mime_type=media.mime_type,
@@ -376,19 +378,23 @@ class MeetingService:
 
     # --- lifecycle ---
 
-    async def request_processing(self, meeting_id: uuid.UUID, *, force: bool = False) -> Meeting:
+    async def request_processing(
+        self, meeting_id: uuid.UUID, *, force: bool = False, from_stage: str | None = None
+    ) -> Meeting:
         """Mark a meeting as ``processing`` so the pipeline can be scheduled.
 
-        Setting the status here, before the background task starts, makes a
-        second request see ``processing`` and get a 409 instead of double-running.
+        Setting the status here, before the job starts, makes a second request see
+        ``processing`` and get a 409 instead of double-running. ``from_stage`` on a
+        finished meeting is an explicit rerun, so it does not need ``force``.
         """
         meeting = await self.get(meeting_id)
-        busy = (
-            MeetingStatus.PROCESSING,
-            MeetingStatus.COMPLETED,
-            MeetingStatus.COMPLETED_WITH_ERRORS,
-        )
-        if meeting.status in busy and not force:
+        if meeting.status == MeetingStatus.PROCESSING and not force:
+            raise MeetingStateConflictError(
+                "Meeting is already processing. Cancel it first, or use ?force=true.",
+                details=self._details(meeting),
+            )
+        finished = (MeetingStatus.COMPLETED, MeetingStatus.COMPLETED_WITH_ERRORS)
+        if meeting.status in finished and not force and from_stage is None:
             raise MeetingStateConflictError(
                 f"Meeting is already {meeting.status.value}. Use ?force=true to reprocess.",
                 details=self._details(meeting),
