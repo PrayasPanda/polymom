@@ -4,13 +4,25 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    Form,
+    Header,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import PlainTextResponse
 
 from app.api.deps import (
     MeetingServiceDep,
     PipelineDep,
     ResultServiceDep,
+    SettingsDep,
     SummaryRegeneratorDep,
 )
 from app.core.exceptions import TranscriptNotAvailableError, ValidationError
@@ -52,6 +64,8 @@ from app.utils.subtitles import (
     utterances_to_text,
     utterances_to_vtt,
 )
+from app.workers.queue import build_queue
+from app.workers.webhook import validate_callback_url
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
@@ -208,7 +222,7 @@ async def delete_meeting(meeting_id: UUID, service: MeetingServiceDep) -> Respon
     "/{meeting_id}/process",
     response_model=ProcessResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Run the processing pipeline for a meeting",
+    summary="Enqueue the processing pipeline (or resume from a stage)",
     responses={
         **_NOT_FOUND,
         **error_example(
@@ -221,17 +235,67 @@ async def delete_meeting(meeting_id: UUID, service: MeetingServiceDep) -> Respon
 )
 async def process_meeting(
     meeting_id: UUID,
+    request: Request,
     service: MeetingServiceDep,
     pipeline: PipelineDep,
+    settings: SettingsDep,
     background_tasks: BackgroundTasks,
-    force: Annotated[bool, Query(description="Reprocess even if processing or completed.")] = False,
+    force: Annotated[bool, Query(description="Reprocess even if completed.")] = False,
+    from_stage: Annotated[
+        str | None,
+        Query(description="Reuse the latest successful run's stages before this one."),
+    ] = None,
+    callback_url: Annotated[
+        str | None, Query(description="POSTed with the final status (webhook).")
+    ] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> ProcessResponse:
-    """Queue the pipeline in the background. Poll ``GET /meetings/{id}`` for the status.
+    """Enqueues onto the job queue (``PIPELINE_EXECUTION=queue``) or runs inline for tests.
 
-    Runs in-process via ``BackgroundTasks`` for now; a real job queue replaces it later.
+    Progress: ``GET /meetings/{id}/status`` (snapshot) or ``/status/stream`` (SSE).
     """
+    if callback_url:
+        validate_callback_url(callback_url, allow_private=settings.webhook_allow_private_hosts)
     meeting = await service.request_processing(meeting_id, force=force)
-    background_tasks.add_task(pipeline.run, meeting.id)
+    request_id = getattr(request.state, "request_id", None)
+    if settings.pipeline_execution == "inline":
+        background_tasks.add_task(
+            pipeline.run, meeting.id, from_stage=from_stage, cancel_check=None
+        )
+    else:
+        queue = build_queue(settings)
+        await queue.enqueue_meeting(
+            meeting.id,
+            from_stage=from_stage,
+            idempotency_key=idempotency_key,
+            request_id=request_id,
+            callback_url=callback_url,
+        )
+        background_tasks.add_task(queue.close)
+    return ProcessResponse(meeting_id=meeting.id, status=meeting.status)
+
+
+@router.post(
+    "/{meeting_id}/cancel",
+    response_model=ProcessResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ask a running pipeline to stop after the current stage",
+    responses={**_NOT_FOUND},
+)
+async def cancel_meeting(
+    meeting_id: UUID,
+    service: MeetingServiceDep,
+    settings: SettingsDep,
+) -> ProcessResponse:
+    """Sets a cancel flag in Redis. The worker checks it between stages and rolls the
+    run to ``cancelled``. In inline mode (no queue) this is a no-op that returns 202."""
+    meeting = await service.get(meeting_id)
+    if settings.pipeline_execution == "queue" and settings.redis_url:
+        queue = build_queue(settings)
+        try:
+            await queue.cancel(meeting_id)
+        finally:
+            await queue.close()
     return ProcessResponse(meeting_id=meeting.id, status=meeting.status)
 
 

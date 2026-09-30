@@ -94,6 +94,9 @@ def settings(tmp_path: Path) -> Settings:
         storage_dir=tmp_path / "storage",
         diarization_backend="mock",
         llm_provider="mock",
+        pipeline_execution="inline",
+        api_key_required=False,
+        retry_backoff_seconds=0,
         asr_backend="mock",
         lid_backend="mock",
     )

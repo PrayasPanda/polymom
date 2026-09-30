@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app import __version__
@@ -70,6 +70,58 @@ class Settings(BaseSettings):
     keep_raw_audio: bool = Field(
         default=False, description="true keeps uploads and processed audio forever."
     )
+
+    # Job queue and execution
+    redis_url: str | None = Field(
+        default=None, description="Required for PIPELINE_EXECUTION=queue."
+    )
+    pipeline_execution: Literal["queue", "inline"] = Field(
+        default="queue",
+        description="inline runs the pipeline inside the API request (tests, debug).",
+    )
+    queue_concurrency_cpu: int = Field(default=4, ge=1)
+    queue_concurrency_gpu: int = Field(default=1, ge=1, description="Jobs per GPU worker.")
+    queue_concurrency_llm: int = Field(default=4, ge=1)
+    stage_timeouts: Annotated[dict[str, float], NoDecode] = Field(
+        default_factory=lambda: {
+            "preprocess": 1800.0,
+            "diarize": 7200.0,
+            "identify_languages": 3600.0,
+            "transcribe": 10800.0,
+            "align": 600.0,
+            "analytics": 600.0,
+            "summarize": 1800.0,
+        }
+    )
+    max_retries: int = Field(default=3, ge=0, le=10, description="Transient failures only.")
+    retry_backoff_seconds: float = Field(default=10.0, ge=0)
+    stuck_job_seconds: int = Field(default=600, ge=30)
+    heartbeat_seconds: int = Field(default=15, ge=1)
+    shutdown_grace_seconds: int = Field(default=120, ge=0)
+    worker_metrics_port: int = Field(default=9101, ge=0, description="0 disables.")
+
+    # Limits
+    max_audio_duration_minutes: float = Field(default=240.0, gt=0)
+    max_json_body_kb: int = Field(default=1024, gt=0)
+
+    # Webhooks
+    webhook_secret: SecretStr | None = None
+    webhook_timeout_seconds: float = Field(default=10.0, gt=0)
+    webhook_max_attempts: int = Field(default=5, ge=1)
+    webhook_allow_private_hosts: bool = Field(
+        default=False, description="Allow callbacks to private IPs (local testing only)."
+    )
+
+    # Security
+    api_key_required: bool = True
+    rate_limit_default: str = "120/minute"
+    rate_limit_upload: str = "10/minute"
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    # Observability
+    otel_enabled: bool = False
+    otel_service_name: str = "polymom"
+    metrics_enabled: bool = True
 
     max_upload_mb: int = Field(default=200, gt=0)
     upload_chunk_bytes: int = Field(default=1024 * 1024, gt=0)
@@ -171,6 +223,55 @@ class Settings(BaseSettings):
                 mapping[lang.strip().lower()] = backend.strip().lower()
             return mapping
         return value
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, value: object) -> object:
+        """Accept ``"https://a.example,https://b.example"``."""
+        if isinstance(value, str):
+            return [o.strip().rstrip("/") for o in value.split(",") if o.strip()]
+        return value
+
+    @field_validator("stage_timeouts", mode="before")
+    @classmethod
+    def _parse_timeouts(cls, value: object) -> object:
+        """Accept ``"diarize:3600,transcribe:7200"``; unspecified stages keep defaults."""
+        if isinstance(value, str):
+            parsed: dict[str, float] = {}
+            for pair in filter(None, (p.strip() for p in value.split(","))):
+                stage, sep, seconds = pair.partition(":")
+                if not sep:
+                    raise ValueError(f"expected 'stage:seconds', got {pair!r}")
+                parsed[stage.strip()] = float(seconds)
+            return parsed
+        return value
+
+    @model_validator(mode="after")
+    def _fail_fast_in_production(self) -> "Settings":
+        """Refuse to start in production with missing secrets or unsafe settings."""
+        if self.app_env != "production":
+            return self
+        problems = []
+        if self.pipeline_execution == "queue" and not self.redis_url:
+            problems.append("REDIS_URL is required with PIPELINE_EXECUTION=queue")
+        if not self.api_key_required:
+            problems.append("API_KEY_REQUIRED must be true in production")
+        if self.llm_provider in ("openai", "azure", "anthropic") and not self.llm_api_key:
+            problems.append(f"LLM_API_KEY is required for LLM_PROVIDER={self.llm_provider}")
+        if self.diarization_backend == "pyannote" and not self.hf_token:
+            problems.append("HF_TOKEN is required for DIARIZATION_BACKEND=pyannote")
+        if self.artifact_store == "s3" and not (self.s3_access_key and self.s3_secret_key):
+            problems.append("S3_ACCESS_KEY and S3_SECRET_KEY are required for ARTIFACT_STORE=s3")
+        if self.webhook_allow_private_hosts:
+            problems.append("WEBHOOK_ALLOW_PRIVATE_HOSTS must be false in production")
+        if "*" in self.cors_origins:
+            problems.append("CORS_ORIGINS must not contain '*' in production")
+        if problems:
+            raise ValueError("Invalid production configuration: " + "; ".join(problems))
+        return self
+
+    def stage_timeout(self, stage: str) -> float:
+        return self.stage_timeouts.get(stage, 3600.0)
 
     @property
     def max_upload_bytes(self) -> int:

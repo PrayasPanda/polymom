@@ -22,6 +22,12 @@ dependencies = [
     "python-docx>=1.2.0",
     "fpdf2>=2.8",
     "uharfbuzz>=0.56.2",
+    "arq>=0.28.0",
+    "redis>=5",
+    "prometheus-client>=0.26.0",
+    "limits>=5.8.0",
+    "sse-starlette>=3.5.0",
+    "slowapi>=0.1.10",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +58,11 @@ s3 = [
 postgres = [
     "asyncpg>=0.31.0",
 ]
+otel = [
+    "opentelemetry-exporter-otlp-proto-http>=1.45.0",
+    "opentelemetry-instrumentation-fastapi>=0.66b0",
+    "opentelemetry-sdk>=1.45.0",
+]
 
 [dependency-groups]
 dev = [
@@ -70,6 +81,8 @@ dev = [
     "asyncpg>=0.31.0",
     "boto3>=1.43.104",
     "pypdf>=6.19.0",
+    "fakeredis>=2.38.0",
+    "locust>=2.46.6",
 ]
 
 [build-system]

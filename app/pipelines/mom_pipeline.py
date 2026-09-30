@@ -11,21 +11,26 @@ import json
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import structlog
 from pydantic import BaseModel
 
 from app.core.config import Settings
-from app.core.exceptions import PolymomError
+from app.core.exceptions import PolymomError, ValidationError
 from app.core.logging import get_logger
 from app.db.base import utcnow
 from app.repositories.artifacts import ArtifactStore, run_key
 from app.repositories.unit_of_work import UnitOfWork, UnitOfWorkFactory
+
+if TYPE_CHECKING:
+    from app.workers.progress import ProgressReporter
+
+
 from app.schemas.analytics import ConversationAnalytics
 from app.schemas.asr import ASRResult
 from app.schemas.audio import PreprocessResult
@@ -51,6 +56,29 @@ from app.services.stage_outputs import load_stage_output
 from app.services.summarization.summarizer import Summarizer
 
 logger = get_logger(__name__)
+
+_STAGE_OUTPUT_SCHEMAS: dict[str, type[BaseModel]] = dict(
+    {
+        "preprocess": PreprocessResult,
+        "diarize": DiarizationResult,
+        "identify_languages": LanguageSummary,
+        "transcribe": ASRResult,
+        "align": SpeakerTranscript,
+        "analytics": ConversationAnalytics,
+        "summarize": MeetingSummary,
+    }
+)
+
+
+def _reify_stage_output(name: str, output: Any) -> BaseModel | None:
+    """Rebuild the Pydantic output of a reused stage (``None`` if the stage has none)."""
+    schema = _STAGE_OUTPUT_SCHEMAS.get(name)
+    if schema is None or output is None:
+        return None
+    try:
+        return schema.model_validate(output)
+    except Exception:  # pragma: no cover - a corrupt blob just means the stage re-runs
+        return None
 
 
 @dataclass
@@ -424,8 +452,26 @@ class MoMPipeline:
             uow, self._store, meeting_id, run_id, self._settings.stage_output_inline_max_bytes
         )
 
-    async def run(self, meeting_id: uuid.UUID) -> MeetingStatus | None:
-        """Process one meeting. Never raises for stage failures; returns the final status."""
+    async def run(
+        self,
+        meeting_id: uuid.UUID,
+        *,
+        from_stage: str | None = None,
+        cancel_check: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
+        progress: "ProgressReporter | None" = None,
+    ) -> MeetingStatus | None:
+        """Process one meeting. Never raises for stage failures; returns the final status.
+
+        - ``from_stage``: reuse the latest successful run's outputs before this stage
+          (e.g. only rerun summarization). A new run is still recorded, with the
+          reused stages copied in and marked ``skipped``.
+        - ``cancel_check``: awaited between stages; a truthy result cancels the run
+          and marks the meeting ``cancelled``.
+        - ``progress``: pushes stage/chunk updates to Redis (:mod:`app.workers.progress`).
+        """
+        from app.workers.progress import NullProgressReporter
+
+        reporter = progress or NullProgressReporter()
         with structlog.contextvars.bound_contextvars(meeting_id=str(meeting_id)):
             async with self._uow() as uow:
                 meeting = await uow.meetings.get(meeting_id)
@@ -436,6 +482,7 @@ class MoMPipeline:
                 meeting.error = None
                 run = await uow.results.create_run(meeting_id, config_snapshot(self._settings))
                 run_id, upload_key = run.id, meeting.upload_key
+                audio_seconds = meeting.duration_seconds
                 context = PipelineContext(
                     meeting_id=meeting_id,
                     input_path=Path(),
@@ -443,48 +490,137 @@ class MoMPipeline:
                     languages_hint=list(meeting.languages_hint or []),
                     meeting_date=meeting.created_at.date() if meeting.created_at else None,
                 )
+                skipped: set[str] = set()
+                if from_stage is not None:
+                    skipped = await self._seed_from_previous_run(
+                        uow, meeting_id, run_id, from_stage, context
+                    )
                 await uow.commit()
 
+            await reporter.start(run_id, [s.name for s in self.stages], audio_seconds)
+            for name in skipped:
+                await reporter.stage(name, "skipped")
             with structlog.contextvars.bound_contextvars(run_id=str(run_id)):
-                status, error, versions = await self._run_stages(context, upload_key, run_id)
+                status, error, versions = await self._run_stages(
+                    context, upload_key, run_id, skipped, cancel_check, reporter
+                )
                 processed_key = await self._store_processed_audio(context, run_id)
                 await self._finish(context, run_id, status, error, versions, processed_key)
+            await reporter.finish(status, error)
             return status
 
+    async def _seed_from_previous_run(
+        self,
+        uow: UnitOfWork,
+        meeting_id: uuid.UUID,
+        run_id: uuid.UUID,
+        from_stage: str,
+        context: PipelineContext,
+    ) -> set[str]:
+        """Copy every stage before ``from_stage`` from the latest successful run.
+
+        Returns the set of stage names that were skipped. Their outputs are reified
+        into ``context.outputs`` (Pydantic where the stage's own class defines it)
+        so later stages can read them exactly as they would from a fresh run.
+        """
+        stage_names = [s.name for s in self.stages]
+        if from_stage not in stage_names:
+            raise ValidationError(
+                f"Unknown stage {from_stage!r}.",
+                details={"stages": stage_names, "from_stage": from_stage},
+            )
+        prior = await uow.results.latest_run(meeting_id, successful=True)
+        if prior is None:
+            raise ValidationError(
+                "from_stage requires a previous successful run.",
+                details={"meeting_id": str(meeting_id)},
+            )
+        writer = self._writer(uow, meeting_id, run_id)
+        stop = stage_names.index(from_stage)
+        skipped: set[str] = set()
+        for name in stage_names[:stop]:
+            output = await load_stage_output(uow.results, self._store, prior.id, name)
+            if output is None:
+                continue
+            reified = _reify_stage_output(name, output)
+            if reified is not None:
+                context.outputs[name] = reified
+            await writer.save_stage(name, output, status="skipped")
+            skipped.add(name)
+        return skipped
+
     async def _run_stages(
-        self, context: PipelineContext, upload_key: str, run_id: uuid.UUID
+        self,
+        context: PipelineContext,
+        upload_key: str,
+        run_id: uuid.UUID,
+        skipped: set[str],
+        cancel_check: Callable[[uuid.UUID], Awaitable[bool]] | None,
+        reporter: "ProgressReporter",
     ) -> tuple[MeetingStatus, str | None, dict[str, str]]:
-        logger.info("pipeline_started", stages=[s.name for s in self.stages])
+        from app.core.exceptions import JobCancelledError
+        from app.core.metrics import AUDIO_MINUTES, STAGE_DURATION, STAGE_RTF
+
+        logger.info(
+            "pipeline_started",
+            stages=[s.name for s in self.stages],
+            skipped=sorted(skipped) or None,
+        )
         errors: list[str] = []
         versions: dict[str, str] = {}
-        current = self.stages[0].name
+        remaining = [s for s in self.stages if s.name not in skipped]
+        if not remaining:
+            return MeetingStatus.COMPLETED, None, versions
+        current = remaining[0].name
+        audio_seconds = 0.0
         try:
             async with self._store.local_path(upload_key) as input_path:
                 context.input_path = input_path
-                for stage in self.stages:
+                for stage in remaining:
+                    if cancel_check is not None and await cancel_check(context.meeting_id):
+                        raise JobCancelledError(
+                            f"Pipeline cancelled before stage '{stage.name}'.",
+                            details={"cancelled_before": stage.name},
+                        )
                     current = stage.name
+                    await reporter.stage(stage.name, "running")
                     started = time.perf_counter()
                     try:
                         await stage.run(context)
                     except Exception as exc:
                         message = _error_message(exc, stage.name)
                         await self._save_failed_stage(context, run_id, stage.name, message)
+                        await reporter.stage(stage.name, "failed")
+                        STAGE_DURATION.labels(stage.name, "failed").observe(
+                            time.perf_counter() - started
+                        )
                         if not stage.optional:
                             raise
                         errors.append(f"{stage.name}: {message}")
                         logger.warning("optional_stage_failed", stage=stage.name, error=message)
                         continue
-                    context.timings_ms[stage.name] = int((time.perf_counter() - started) * 1000)
+                    elapsed = time.perf_counter() - started
+                    context.timings_ms[stage.name] = int(elapsed * 1000)
+                    STAGE_DURATION.labels(stage.name, "completed").observe(elapsed)
+                    preprocess = context.outputs.get(PreprocessStage.name)
+                    if isinstance(preprocess, PreprocessResult):
+                        audio_seconds = preprocess.duration_seconds
+                        if audio_seconds > 0:
+                            STAGE_RTF.labels(stage.name).observe(elapsed / audio_seconds)
                     async with self._uow() as uow:
                         await stage.persist(context, self._writer(uow, context.meeting_id, run_id))
                         await uow.commit()
                     if version := stage.model_version(context):
                         versions[stage.name] = version
+                    await reporter.stage(stage.name, "completed")
                     logger.info(
                         "stage_completed",
                         stage=stage.name,
                         duration_ms=context.timings_ms[stage.name],
                     )
+        except JobCancelledError as exc:
+            await self._save_failed_stage(context, run_id, current, f"{exc.code}: {exc.message}")
+            return MeetingStatus.CANCELLED, f"{exc.code}: {exc.message}", versions
         except FileNotFoundError:
             logger.warning("upload_missing", key=upload_key)
             return (
@@ -502,6 +638,8 @@ class MoMPipeline:
                 f"internal_error: Unexpected failure in stage '{current}'.",
                 versions,
             )
+        if audio_seconds > 0:
+            AUDIO_MINUTES.inc(audio_seconds / 60)
         status = MeetingStatus.COMPLETED_WITH_ERRORS if errors else MeetingStatus.COMPLETED
         return status, "; ".join(errors) or None, versions
 
