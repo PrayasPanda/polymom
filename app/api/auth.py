@@ -46,14 +46,3 @@ def current_owner_id(key: ApiKey | None, settings: Settings) -> int | None:
     if key is not None:
         return key.id
     return None if not settings.api_key_required else INTERNAL_OWNER_ID
-
-
-async def owner_id_dependency(
-    key: CurrentApiKey,
-    settings: SettingsDep,
-    uow: UowDep,
-) -> int | None:
-    return current_owner_id(key, settings)
-
-
-OwnerIdDep = Annotated[int | None, Depends(owner_id_dependency)]

@@ -57,7 +57,8 @@ def choose_language(hints: Sequence[str]) -> str | None:
     """Exactly one hint forces that language; none or several use auto-detection.
 
     Several hints mean a code-mixed meeting: forcing one language would mangle
-    the others, so Whisper decodes freely until per-segment routing (Prompt 6).
+    the others, so Whisper decodes freely (per-region routing
+    happens in the transcription stage when language ID is enabled).
     """
     return hints[0] if len(hints) == 1 else None
 

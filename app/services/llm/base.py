@@ -11,7 +11,6 @@ where it has one. The base class adds what every provider needs:
 """
 
 import asyncio
-import json
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -201,7 +200,3 @@ def repair_prompt(error: Exception) -> str:
 
 def schema_json(schema: type[BaseModel]) -> dict[str, Any]:
     return schema.model_json_schema()
-
-
-def schema_text(schema: type[BaseModel]) -> str:
-    return json.dumps(schema_json(schema), ensure_ascii=False)

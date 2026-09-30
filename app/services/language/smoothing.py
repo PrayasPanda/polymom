@@ -75,15 +75,6 @@ def _dominant(windows: Sequence[LidWindow]) -> str | None:
     return max(sorted(totals), key=lambda lang: totals[lang]) if totals else None
 
 
-def speaker_profiles(windows: Sequence[LidWindow]) -> dict[str | None, str]:
-    """Dominant language per speaker, from confident windows."""
-    by_speaker: dict[str | None, list[LidWindow]] = defaultdict(list)
-    for w in windows:
-        by_speaker[w.speaker].append(w)
-    profiles = {spk: _dominant(ws) for spk, ws in by_speaker.items()}
-    return {spk: lang for spk, lang in profiles.items() if lang}
-
-
 def inherit_short_windows(windows: Sequence[LidWindow], min_window: float) -> list[LidWindow]:
     """Short (< ``min_window``) low-confidence windows adopt their speaker's dominant language.
 

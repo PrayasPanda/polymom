@@ -106,6 +106,8 @@ def model_availability(settings: Settings) -> dict[str, Any]:
 @router.get("/metrics", summary="Prometheus metrics", include_in_schema=False)
 async def metrics(settings: SettingsDep) -> Response:
     """API metrics, plus queue depth per queue when the job queue is in use."""
+    if not settings.metrics_enabled:
+        return Response(status_code=404)
     if settings.pipeline_execution == "queue" and settings.redis_url:
         queue = build_queue(settings)
         try:
