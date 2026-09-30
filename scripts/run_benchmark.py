@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from app.services.llm import DEFAULT_LLM_MODELS
 from scripts import eval_asr, eval_diarization, eval_summary
 
 DATA = Path("data/eval")
@@ -78,7 +79,8 @@ def model_versions(settings: Any) -> dict[str, str]:
         "asr_or": settings.odia_model_id,
         "lid": settings.lid_model_id if settings.lid_backend == "mms" else settings.lid_backend,
         "diarization": settings.diarization_model,
-        "llm": f"{settings.llm_provider}/{settings.llm_model or 'default'}",
+        "llm": f"{settings.llm_provider}/"
+        f"{settings.llm_model or DEFAULT_LLM_MODELS.get(settings.llm_provider, 'default')}",
     }
 
 
@@ -100,7 +102,8 @@ async def run_asr_and_lid(data: Path, languages: list[str]) -> dict[str, Any]:
         samples = eval_asr.discover(data / "asr" / lang, lang)
         audio_seconds += sum(_duration(s.audio) for s in samples)
         pairs = await eval_asr.transcribe_all(samples, "real")
-        _, scores = eval_asr.score(pairs)
+        files, scores = eval_asr.score(pairs)
+        out["asr_files"] = out.get("asr_files", []) + [_file_row(f) for f in files]
         out["asr"][lang] = {
             "dataset": "FLEURS test",
             "clips": scores[0].files,
@@ -112,6 +115,7 @@ async def run_asr_and_lid(data: Path, languages: list[str]) -> dict[str, Any]:
     routed_samples = [s for lang in languages for s in eval_asr.discover(data / "asr" / lang, lang)]
     for s in routed_samples:
         s.lang_spans = [(0.0, _duration(s.audio), s.language)]
+    audio_seconds += sum(_duration(s.audio) for s in routed_samples)  # second (routed) pass
     await eval_asr.transcribe_all(routed_samples, "real", routed=True, confusion=confusion)
     out["lid"]["fleurs_clips"] = {
         "accuracy": lid_accuracy(confusion),
@@ -125,7 +129,13 @@ async def run_asr_and_lid(data: Path, languages: list[str]) -> dict[str, Any]:
         audio_seconds += sum(_duration(s.audio) for s in mixed)
         mixed_conf: dict[str, dict[str, float]] = {}
         pairs = await eval_asr.transcribe_all(mixed, "real", routed=True, confusion=mixed_conf)
-        _, scores = eval_asr.score([(f, "hi-en", r, h) for f, _, r, h in pairs])
+        files, scores = eval_asr.score([(f, "hi-en", r, h) for f, _, r, h in pairs])
+        out["asr_files"] = out.get("asr_files", []) + [_file_row(f) for f in files]
+        out["lid"]["mucs_code_mixed"] = {
+            "accuracy": lid_accuracy(mixed_conf),
+            "confusion_seconds": mixed_conf,
+            "clips": len(mixed),
+        }
         out["asr"]["hi-en (code-mixed)"] = {
             "dataset": "MUCS 2021 Hindi-English test",
             "clips": scores[0].files,
@@ -135,6 +145,18 @@ async def run_asr_and_lid(data: Path, languages: list[str]) -> dict[str, Any]:
         }
     out["asr_seconds"] = {"audio": audio_seconds, "wall": time.perf_counter() - started}
     return out
+
+
+def _file_row(f: eval_asr.FileScore) -> dict[str, Any]:
+    """Per-clip scores with normalized reference and hypothesis, for error analysis."""
+    return {
+        "file": Path(f.file).name,
+        "language": f.language,
+        "wer": f.wer,
+        "cer": f.cer,
+        "reference": f.reference,
+        "hypothesis": f.hypothesis,
+    }
 
 
 def _duration(path: Path) -> float:
@@ -301,6 +323,16 @@ def aggregate(results: dict[str, Any]) -> list[tuple[str, str, str, str]]:
                 fmt(clips["accuracy"]),
                 f"FLEURS, {clips['clips']} clips",
                 "share of speech seconds",
+            )
+        )
+    mucs = lid.get("mucs_code_mixed")
+    if mucs:
+        rows.append(
+            (
+                "LID accuracy (code-mixed clips)",
+                fmt(mucs["accuracy"]),
+                f"MUCS 2021, {mucs['clips']} clips",
+                "reference: hi (matrix language)",
             )
         )
     meetings = results.get("meetings")
@@ -533,6 +565,17 @@ def main(argv: list[str] | None = None) -> int:
             results["summary"] = asyncio.run(eval_summary.evaluate(fixtures, settings, "auto"))
 
     args.out.mkdir(parents=True, exist_ok=True)
+    previous = args.out / "results.json"
+    if previous.exists() and set(args.only) != set(SECTIONS):
+        # A partial run (--only) keeps the sections it did not re-measure.
+        old = json.loads(previous.read_text("utf-8"))
+        for key, value in old.items():
+            if key not in results:
+                results[key] = value
+        results.setdefault("partial_runs", old.get("partial_runs", []))
+        results["partial_runs"].append(
+            {"sections": args.only, "generated_at": results["generated_at"]}
+        )
     (args.out / "results.json").write_text(
         json.dumps(results, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
     )

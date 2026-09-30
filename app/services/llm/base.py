@@ -199,4 +199,22 @@ def repair_prompt(error: Exception) -> str:
 
 
 def schema_json(schema: type[BaseModel]) -> dict[str, Any]:
-    return schema.model_json_schema()
+    """The model's JSON Schema with **every** property required (nullable ones stay nullable).
+
+    Pydantic leaves fields with defaults (``decisions: list = []``) out of ``required``.
+    Constrained decoders (Ollama ``format``, OpenAI strict mode) then let the model stop
+    after the required header fields, which silently produced minutes without decisions
+    or action items. Requiring everything forces an explicit, possibly empty, list.
+    """
+    return _require_all(schema.model_json_schema())
+
+
+def _require_all(node: Any) -> Any:
+    if isinstance(node, dict):
+        out = {k: _require_all(v) for k, v in node.items()}
+        if isinstance(out.get("properties"), dict):
+            out["required"] = list(out["properties"])
+        return out
+    if isinstance(node, list):
+        return [_require_all(v) for v in node]
+    return node

@@ -158,7 +158,19 @@ async def test_ollama_schema_format() -> None:
     assert str(seen[0].url) == "http://localhost:11434/api/chat"
     assert body["format"]["title"] == "SummaryHeader"
     assert body["stream"] is False
+    assert body["options"]["num_ctx"] > 2048  # Ollama's default would truncate transcripts
     assert client.calls[0].completion_tokens == 4
+
+
+def test_schema_requires_list_fields_with_defaults() -> None:
+    """Regression: optional lists let constrained decoders return no decisions/actions."""
+    from app.schemas.summary import SummaryDraft
+    from app.services.llm.base import schema_json
+
+    schema = schema_json(SummaryDraft)
+    assert {"decisions", "action_items", "key_points", "open_questions"} <= set(schema["required"])
+    action = schema["$defs"]["ActionItem"]
+    assert set(action["required"]) == set(action["properties"])  # nested models too
 
 
 async def test_retries_rate_limit_with_backoff() -> None:

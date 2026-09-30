@@ -17,7 +17,13 @@ class OllamaClient(LLMClient):
             "model": self.model,
             "stream": False,
             "format": schema_json(schema),
-            "options": {"temperature": temperature, "num_predict": s.llm_max_output_tokens},
+            "options": {
+                "temperature": temperature,
+                "num_predict": s.llm_max_output_tokens,
+                # Ollama defaults to a 2048-token context and silently truncates longer
+                # prompts; size it for the largest single-pass transcript plus the output.
+                "num_ctx": s.summary_single_pass_tokens + s.llm_max_output_tokens + 2048,
+            },
             "messages": [{"role": "system", "content": system}]
             + [{"role": m.role, "content": m.content} for m in messages],
         }
