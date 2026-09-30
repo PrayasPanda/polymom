@@ -14,7 +14,11 @@ from typing import Any
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import Settings
-from app.core.exceptions import DiarizationError, DiarizationModelLoadError
+from app.core.exceptions import (
+    DiarizationError,
+    DiarizationModelLoadError,
+    ResourceExhaustedError,
+)
 from app.core.logging import get_logger
 from app.services.diarization.base import DiarizationBackend
 from app.services.diarization.postprocess import RawDiarization, RawSegment
@@ -128,6 +132,23 @@ def to_raw(annotation: Any, embeddings: Any) -> RawDiarization:
     return RawDiarization(segments=segments, embeddings=vectors)
 
 
+def _is_cuda_oom(exc: Exception) -> bool:
+    name = type(exc).__name__
+    return (
+        name in ("OutOfMemoryError", "CudaOutOfMemoryError") or "out of memory" in str(exc).lower()
+    )
+
+
+def _free_cuda_cache() -> None:  # pragma: no cover - only runs with a real GPU
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        logger.warning("cuda_cache_free_failed", exc_info=True)
+
+
 class PyannoteDiarizationBackend(DiarizationBackend):
     @property
     def model_name(self) -> str:  # type: ignore[override]
@@ -155,9 +176,27 @@ class PyannoteDiarizationBackend(DiarizationBackend):
             with _inference_lock:
                 annotation, embeddings = pipeline(audio, return_embeddings=True, **kwargs)
         except Exception as exc:
-            raise DiarizationError(
-                f"Diarization failed: {exc}", details={"reason": "inference_failed"}
-            ) from exc
+            if _is_cuda_oom(exc):
+                logger.warning("diarization_cuda_oom_fallback")
+                _free_cuda_cache()
+                cpu_pipeline = load_pipeline(self.settings.model_copy(update={"device": "cpu"}))
+                try:
+                    with _inference_lock:
+                        annotation, embeddings = cpu_pipeline(
+                            audio, return_embeddings=True, **kwargs
+                        )
+                    from app.core.metrics import OOM_FALLBACKS
+
+                    OOM_FALLBACKS.labels("diarize").inc()
+                except Exception as inner:
+                    raise ResourceExhaustedError(
+                        f"Diarization ran out of memory on GPU and CPU: {inner}",
+                        details={"reason": "cuda_oom_after_fallback"},
+                    ) from inner
+            else:
+                raise DiarizationError(
+                    f"Diarization failed: {exc}", details={"reason": "inference_failed"}
+                ) from exc
         return to_raw(annotation, embeddings)
 
     async def diarize_raw(
