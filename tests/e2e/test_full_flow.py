@@ -11,7 +11,10 @@ from tests.e2e.conftest import upload, wait_for
 
 def _processed_meeting(api: httpx.Client) -> str:
     created = upload(
-        api, make_wav(seconds=20), title="E2E budget review", expected_speakers="2",
+        api,
+        make_wav(seconds=20),
+        title="E2E budget review",
+        expected_speakers="2",
         languages="en,hi,or",
     )
     assert created.status_code == 202, created.text
@@ -78,7 +81,8 @@ def test_result_matches_published_json_schema(api: httpx.Client) -> None:
     schema = api.get("/schema/meeting-result").json()
     result = api.get(f"/meetings/{meeting_id}/result").json()
     jsonschema.validate(result, schema)
-    assert result["transcript"] and result["analytics"] and result["summary"]
+    for section in ("transcript", "analytics", "summary"):
+        assert result[section], section
     api.delete(f"/meetings/{meeting_id}")
 
 
@@ -87,6 +91,4 @@ def test_ui_is_served(api: httpx.Client) -> None:
     page = httpx.get(root + "/", timeout=10)
     assert page.status_code == 200
     assert "Upload a meeting" in page.text
-    assert (
-        httpx.get(root + "/ui/partials/meetings", headers=dict(api.headers)).status_code == 200
-    )
+    assert httpx.get(root + "/ui/partials/meetings", headers=dict(api.headers)).status_code == 200

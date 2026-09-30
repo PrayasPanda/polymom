@@ -47,9 +47,7 @@ def test_unsupported_type_is_rejected(api: httpx.Client) -> None:
 
 
 def test_video_without_audio_is_rejected(api: httpx.Client, tmp_path: Path) -> None:
-    video = _ffmpeg(
-        tmp_path, "silent.mp4", "-f", "lavfi", "-i", "color=c=black:s=32x32:d=1", "-an"
-    )
+    video = _ffmpeg(tmp_path, "silent.mp4", "-f", "lavfi", "-i", "color=c=black:s=32x32:d=1", "-an")
     response = upload(api, video, name="silent.mp4")
     assert response.status_code == 422
     assert _error_code(response) == "corrupted_media"
