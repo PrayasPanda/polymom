@@ -1,12 +1,18 @@
-"""Render docs/samples/sample-minutes.{pdf,md} from the code-mixed fixture meeting (mock LLM).
+"""Render docs/samples/code-mixed-meeting.{result.json,md,pdf,docx} from the code-mixed fixture.
 
-uv run python scripts/make_sample_export.py
+    uv run python scripts/make_sample_export.py                          # LLM_PROVIDER from .env
+    LLM_PROVIDER=mock uv run python scripts/make_sample_export.py        # offline, deterministic
+
+The transcript is the hand-written Hinglish + Odia fixture
+(tests/fixtures/meetings/mixed_standup.json); analytics and exports are computed by the
+real code, and the minutes come from whichever LLM is configured (recorded in
+``summary.model_info``).
 """
 
 import asyncio
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,19 +22,23 @@ from app.schemas.meeting import AudioMetadata, MeetingRead, MeetingStatus
 from app.schemas.result import MeetingResult, SpeakerInfo
 from app.services.analytics.meeting_stats import build_analytics
 from app.services.export import render_export
-from app.services.llm.mock_client import MockLLMClient
+from app.services.llm import build_llm_client
 from app.services.summarization.summarizer import Summarizer
 from scripts.eval_summary import load_transcript
 
 FIXTURE = Path("tests/fixtures/meetings/mixed_standup.json")
 OUT = Path("docs/samples")
+STEM = "code-mixed-meeting"
 NAMES = {"Person 1": "Ravi", "Person 2": "सुनीता", "Person 3": "ପ୍ରିୟା"}
 
 
 async def build(fixture: dict[str, Any]) -> MeetingResult:
     transcript = load_transcript(fixture)
-    settings = Settings(_env_file=None, llm_provider="mock")
-    summary = await Summarizer(MockLLMClient(settings, "mock-llm"), settings).summarize(transcript)
+    settings = Settings()
+    llm = build_llm_client(settings)
+    summary = await Summarizer(llm, settings).summarize(
+        transcript, meeting_date=date.fromisoformat(fixture["date"])
+    )
     turns = [
         SpeakerTurn(
             speaker_label=u.speaker,
@@ -83,9 +93,12 @@ async def build(fixture: dict[str, Any]) -> MeetingResult:
 def main() -> None:
     result = asyncio.run(build(json.loads(FIXTURE.read_text(encoding="utf-8"))))
     OUT.mkdir(parents=True, exist_ok=True)
-    for fmt in ("pdf", "md"):
-        (OUT / f"sample-minutes.{fmt}").write_bytes(render_export(fmt, result))  # type: ignore[arg-type]
-    print(f"wrote {OUT}/sample-minutes.pdf and .md")
+    for fmt in ("pdf", "docx", "md"):
+        (OUT / f"{STEM}.{fmt}").write_bytes(render_export(fmt, result))  # type: ignore[arg-type]
+    (OUT / f"{STEM}.result.json").write_text(
+        result.model_dump_json(indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"wrote {OUT}/{STEM}.result.json, .md, .pdf and .docx")
 
 
 if __name__ == "__main__":
