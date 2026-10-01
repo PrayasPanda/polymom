@@ -99,21 +99,25 @@ A code-mixed standup (Hinglish and Odia) as
 [result JSON](docs/samples/code-mixed-meeting.result.json),
 [Markdown minutes](docs/samples/code-mixed-meeting.md),
 [PDF](docs/samples/code-mixed-meeting.pdf) and [DOCX](docs/samples/code-mixed-meeting.docx).
-An excerpt of `GET /meetings/{id}/result`:
+The transcript is a hand-written fixture. The analytics, minutes and exports were produced
+by the real code with a local LLM (`ollama/qwen2.5:7b-instruct`) and are committed
+unedited, including what the small model missed (see
+[MULTILINGUAL.md](docs/MULTILINGUAL.md#observed-limitations)). An excerpt of the result
+JSON:
 
 ```json
 {
   "transcript": {"utterances": [
-    {"id": 1, "speaker": "Person 2", "speaker_name": "सुनीता", "start": 5.5, "end": 11.0,
-     "text": "Payment API का timeout issue अभी भी है, logs देख रहा हूं।",
-     "primary_language": "hi", "languages_present": ["en", "hi"], "is_code_mixed": true},
-    {"id": 4, "speaker": "Person 3", "speaker_name": "ପ୍ରିୟା", "start": 21.5, "end": 27.0,
-     "text": "ମୁଁ agle hafte load testing କରିବି।", "primary_language": "or", "is_code_mixed": true}
+    {"id": 1, "speaker": "Person 2", "start": 5.5, "end": 11.0,
+     "text": "Payment API का timeout issue अभी भी है, logs देख रहा हूं।", "primary_language": "hi"},
+    {"id": 4, "speaker": "Person 3", "start": 21.5, "end": 27.0,
+     "text": "ମୁଁ agle hafte load testing କରିବି।", "primary_language": "or"}
   ]},
   "summary": {"action_items": [
-    {"task": "Do load testing next week", "owner": "Person 3",
-     "due_date": {"raw": "agle hafte", "iso": "2026-10-05"},
-     "evidence": [{"utterance_ids": [4], "quote": "ମୁଁ agle hafte load testing କରିବି।"}]}
+    {"task": "Fix Payment API timeout issue and update the ticket.", "owner": "Person 2",
+     "due_date": {"raw": "kal", "iso": null}, "priority": "high", "confidence": "high",
+     "evidence": [{"utterance_ids": [3], "speaker": "Person 2", "start": 16.5, "end": 21.0,
+                   "quote": "Main kal tak fix deploy kar dunga, I will update the ticket."}]}
   ]}
 }
 ```
@@ -126,7 +130,36 @@ versions and per-meeting numbers are in
 [docs/evaluation/results.md](docs/evaluation/results.md), and the method is in
 [docs/evaluation/README.md](docs/evaluation/README.md).
 
-<!-- EVAL-SUMMARY -->
+Measured on 2026-10-01 on an RTX 5060 Laptop GPU (8 GB) with faster-whisper large-v3
+(`int8_float16`), MMS-LID-126 and, for summaries, a local `qwen2.5:7b-instruct`:
+
+| Metric | Result | Data |
+| --- | --- | --- |
+| English WER / CER | **5.2% / 2.3%** | FLEURS test, 30 clips |
+| Hindi WER / CER | **31.0% / 14.6%** | FLEURS test, 30 clips |
+| Code-mixed Hindi-English CER (no language hint) | **38.5%** | MUCS 2021 test, 48 clips |
+| Spoken language ID accuracy (English and Hindi clips) | **100%** | FLEURS, 60 clips |
+| Language ID on code-mixed speech | **96.8%** | MUCS 2021, 48 clips |
+| Action items precision / recall | **100% / 57%** | 4 labelled meetings (en, hi, or, mixed) |
+| Decisions precision / recall | **100% / 20%** | 4 labelled meetings |
+| Evidence grounding rate | **74%** | 4 labelled meetings |
+| Real-time factor, ASR + language ID | **0.65** | 24.8 min of short clips, model loading included |
+| Odia WER / CER | *pending* | FLEURS `or_in` is downloaded; the model is gated |
+| DER, speaker-count accuracy, speaker-attributed WER, meeting CER | *pending* | 8 synthetic code-mixed meetings and 2 AMI meetings are prepared |
+
+The pending rows need the gated Hugging Face models (pyannote diarization and
+IndicConformer for Odia), and no `HF_TOKEN` was available when this was run. They are
+reported as pending rather than estimated. With a token, `make benchmark-docker` fills
+them in.
+
+How to read these numbers:
+
+- The Hindi and code-mixed error rates are inflated by script and spelling differences
+  that aren't recognition errors, for example `university` against `यूनिवर्सिटी` or
+  `linux` against `लिनक्स`. [MULTILINGUAL.md](docs/MULTILINGUAL.md#observed-limitations)
+  has the examples.
+- Summary precision is high because unverifiable items are dropped. Recall is limited by
+  the 7B local model; a larger model is one setting away (`LLM_PROVIDER`, `LLM_MODEL`).
 
 ## Documentation
 
