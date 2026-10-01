@@ -1,183 +1,9 @@
-# Polymom
+# Pipeline reference
 
-Voice-based **Minutes of Meeting** pipeline. Upload a meeting recording and get back:
-
-- **Who spoke when** (multi-speaker diarization)
-- **What was said** in English, Hindi, Odia and code-mixed speech (ASR)
-- **Speaker analytics** such as talk time, turns and interruptions
-- **An LLM summary** with key decisions and action items
-
-Everything is exposed through a FastAPI service.
-
-> Status: the pipeline produces a **speaker-attributed, multilingual transcript** (English, Hindi, Odia, code-switched): upload, preprocessing, diarization, language ID, routed ASR and word-to-speaker alignment all work. Speaker statistics and summaries come next. See the [roadmap](#roadmap).
-
-## Architecture
-
-```mermaid
-flowchart LR
-    Client -->|upload audio| API[FastAPI /api/v1]
-    API --> Repo[(Repository<br/>metadata + files)]
-    API -->|enqueue| Worker[Background worker]
-    Worker --> Pipe[MoM pipeline]
-    subgraph Pipe[MoM pipeline]
-        direction LR
-        Pre[Audio preprocess<br/>ffmpeg, 16 kHz mono] --> Dia[Diarization]
-        Pre --> ASR[ASR<br/>en / hi / or / mixed]
-        Dia --> Align[Alignment]
-        ASR --> Align
-        Align --> Stats[Speaker analytics]
-        Align --> Sum[LLM summary<br/>decisions + actions]
-    end
-    Pipe --> Repo
-    Client -->|poll results| API
-```
-
-Requests flow through the layers **routes → services / pipelines → repositories**. Routes get their dependencies (settings, repositories) injected through `app/api/deps.py`, so every layer can be swapped out in tests.
-
-## Folder structure
-
-| Path | Purpose |
-| --- | --- |
-| `app/main.py` | App factory (`create_app`), lifespan hooks, router registration |
-| `app/api/deps.py` | Dependency-injection providers |
-| `app/api/v1/` | Versioned routers: `health` (implemented), `meetings` (stubs) |
-| `app/core/` | Settings (`pydantic-settings`), structured logging (`structlog`), exception hierarchy + handlers |
-| `app/schemas/` | Pydantic request/response models |
-| `app/models/` | SQLAlchemy ORM entities (`Meeting`) |
-| `app/db/` | Async engine/session factory, declarative base, Alembic migrations |
-| `app/repositories/` | Abstract `MeetingRepository` + SQLAlchemy implementation |
-| `app/services/` | One package per pipeline stage: `audio`, `diarization`, `asr`, `alignment`, `analytics`, `summarization` |
-| `app/pipelines/` | `MoMPipeline` orchestrator |
-| `app/workers/` | Background job entry points |
-| `app/utils/` | Framework-free helpers |
-| `tests/` | `unit/` and `integration/` suites, shared fixtures in `conftest.py` |
-| `docker/` | Multi-stage Dockerfile (non-root, ffmpeg) and compose file |
-| `scripts/` | Dev/ops scripts |
-
-## Setup
-
-Prerequisites: Python 3.11+, [uv](https://docs.astral.sh/uv/), `make`, and `ffmpeg`/`ffprobe` on `PATH` (used to validate uploads; tests that need it are skipped when it is missing).
-
-```bash
-git clone https://github.com/PrayasPanda/polymom.git
-cd polymom
-cp .env.example .env       # fill in HF_TOKEN / LLM_API_KEY when needed
-make dev                   # uv sync --all-groups + pre-commit install
-```
-
-### Configuration
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `APP_ENV` | `development` | `development` / `staging` / `production` / `test`; non-development environments log JSON |
-| `LOG_LEVEL` | `INFO` | Root log level |
-| `HF_TOKEN` | – | Hugging Face token (for diarization models) |
-| `LLM_PROVIDER` | `openai` | LLM backend for summaries: `openai`, `azure`, `anthropic`, `ollama`, `mock` |
-| `LLM_API_KEY` | – | API key for the LLM provider |
-| `STORAGE_DIR` | `./storage` | Root of the local artifact store and the SQLite file |
-| `DATABASE_URL` | SQLite at `STORAGE_DIR/polymom.db` | Any SQLAlchemy async URL, e.g. `postgresql+asyncpg://...` (`uv sync --extra postgres`) |
-| `ARTIFACT_STORE` | `local` | `local` or `s3` (see [Storage and retrieval](#storage-and-retrieval)) |
-| `AUTO_MIGRATE` | `true` | Run Alembic migrations on startup |
-| `MAX_UPLOAD_MB` | `200` | Upload size limit, enforced while streaming |
-| `ALLOWED_EXTENSIONS` | `wav,mp3,m4a,flac,ogg,aac,mp4,mkv,mov,webm` | Comma-separated accepted file types |
-| `FFPROBE_PATH` | `ffprobe` | ffprobe binary |
-| `FFPROBE_TIMEOUT_SECONDS` | `30` | Probe timeout per upload |
-
-## Running locally
-
-```bash
-make run
-curl http://localhost:8000/api/v1/health
-# {"status":"ok","app_name":"polymom","version":"0.1.0","env":"development"}
-```
-
-Interactive docs: <http://localhost:8000/docs>.
-
-### Quality gates
-
-```bash
-make lint       # ruff check + format check
-make typecheck  # mypy --strict on app/
-make test       # fast tests with coverage (slow/real-model tests excluded)
-make test-slow  # real-model tests (pyannote, Whisper, Odia); need `make install-ml`, HF_TOKEN
-make format     # auto-fix
-```
-
-## API usage
-
-Interactive docs with schemas and example responses: <http://localhost:8000/docs>.
-
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/api/v1/health` | Liveness, with app name, version and env |
-| `POST` | `/api/v1/meetings` | Upload a recording (multipart). Returns `202` with `meeting_id`, `status: queued`, `created_at` |
-| `GET` | `/api/v1/meetings` | Paginated list, newest first (`limit` 1-100, default 20; `offset`) |
-| `GET` | `/api/v1/meetings/{meeting_id}` | Metadata and status |
-| `DELETE` | `/api/v1/meetings/{meeting_id}` | Delete the record, the upload and the processed audio (`204`) |
-| `GET` | `/api/v1/meetings/{meeting_id}/languages` | Language shares, per-speaker breakdown, switch points; `409` until identified |
-| `GET` | `/api/v1/meetings/{meeting_id}/transcript` | Speaker-attributed transcript; `?format=json` (default), `txt`, `srt`, `vtt`, `md`; raw ASR segments with `?view=raw` (`json`, `txt`, `srt`); `409` until processed |
-| `PATCH` | `/api/v1/meetings/{meeting_id}/speakers` | Display names, e.g. `{"names": {"Person 1": "Ravi"}}` (`null` clears one) |
-| `GET` | `/api/v1/meetings/{meeting_id}/speakers` | Speaker turns (`Person 1..N`), speaker count and overlap regions; `409` until diarized |
-| `POST` | `/api/v1/meetings/{meeting_id}/process` | Run the pipeline in the background (`202`); `409` if already processing/completed unless `?force=true` |
-
-```bash
-# Upload (title, expected_speakers 1-20 and languages en/hi/or are optional)
-curl -F "file=@standup.m4a" -F "title=Weekly sync" -F "expected_speakers=4" \
-     -F "languages=en,hi" http://localhost:8000/api/v1/meetings
-# {"meeting_id":"3f8b6f0e-...","status":"queued","created_at":"2026-09-28T10:15:00Z"}
-
-curl http://localhost:8000/api/v1/meetings/3f8b6f0e-...
-curl "http://localhost:8000/api/v1/meetings?limit=10&offset=0"
-curl -X DELETE http://localhost:8000/api/v1/meetings/3f8b6f0e-...
-
-# Process, then poll until status is completed or failed
-curl -X POST http://localhost:8000/api/v1/meetings/3f8b6f0e-.../process
-# {"meeting_id":"3f8b6f0e-...","status":"processing"}
-curl http://localhost:8000/api/v1/meetings/3f8b6f0e-...   # includes audio_quality
-curl http://localhost:8000/api/v1/meetings/3f8b6f0e-.../speakers
-curl "http://localhost:8000/api/v1/meetings/3f8b6f0e-.../transcript?format=srt" -o meeting.srt
-curl -X PATCH http://localhost:8000/api/v1/meetings/3f8b6f0e-.../speakers \
-     -H 'Content-Type: application/json' -d '{"names": {"Person 1": "Ravi"}}'
-```
-
-### Upload validation
-
-Each upload goes through these checks in order. If any check fails, the partially written file is deleted.
-
-1. **Filename** is sanitized, keeping only the basename; Unicode, including Hindi and Odia, is kept.
-2. **Extension** must be in `ALLOWED_EXTENSIONS`.
-3. **Streamed to disk** in 1 MB chunks. The upload is rejected as soon as it exceeds `MAX_UPLOAD_MB`, and requests whose `Content-Length` is already too large are rejected before the body is read.
-4. **Empty** uploads are rejected.
-5. **Magic bytes** must match the extension, so a text file renamed `.wav` is rejected.
-6. **ffprobe** must find a readable audio stream with a non-zero duration. The duration, codec, sample rate, channels and bit rate are recorded.
-
-### Errors
-
-Every error uses the same envelope:
-
-```json
-{"error": {"code": "unsupported_file_type", "message": "File content does not match its extension.", "details": {"extension": "wav", "detected_mime_type": null}}}
-```
-
-| Status | `code` | When |
-| --- | --- | --- |
-| 404 | `meeting_not_found` | Unknown `meeting_id` |
-| 413 | `file_too_large` | Over `MAX_UPLOAD_MB` |
-| 415 | `unsupported_file_type` | Extension not allowed, or content does not match it |
-| 422 | `empty_file` / `corrupted_media` | Zero bytes; unreadable file; no audio stream |
-| 422 | `validation_error` | Invalid form/query fields |
-| 409 | `language_summary_not_available` | `/languages` before language ID ran (or with routing disabled) |
-| 409 | `transcript_not_available` | `/transcript` before the meeting has been transcribed |
-| 409 | `diarization_not_available` | `/speakers` before the meeting has been diarized |
-| 409 | `meeting_state_conflict` | `/process` on a meeting that is processing or completed, without `force` |
-| 500 | `media_probe_unavailable` | `ffprobe` missing on the server |
-
-### Database migrations
-
-```bash
-uv run alembic upgrade head                           # applied automatically at startup when AUTO_MIGRATE=true
-uv run alembic revision --autogenerate -m "message"   # after changing models
-```
+Stage-by-stage reference: what each stage does, which model it uses, how it is configured
+and its known limitations. Start with the [README](../README.md) and
+[ARCHITECTURE.md](ARCHITECTURE.md); configuration is listed in full in
+[OPERATIONS.md](OPERATIONS.md#configuration-reference) and endpoints in [API.md](API.md).
 
 ## Processing pipeline
 
@@ -233,7 +59,7 @@ The level metrics (`loudness_lufs`, `rms_db`, `peak_db`) describe the **original
 
 ### Chunking long recordings
 
-`app/services/audio/chunker.py` provides `split_wav(path, out_dir, chunk_length_seconds=..., overlap_seconds=...)`. It cuts sample-accurate, overlapping WAV slices without re-encoding, and each `AudioChunk` records its absolute `start_seconds` and `end_seconds` so later stages can map timestamps back to meeting time. It isn't wired into the pipeline yet; the ASR and diarization stages will use it.
+`app/services/audio/chunker.py` provides `split_wav(path, out_dir, chunk_length_seconds=..., overlap_seconds=...)`. It cuts sample-accurate, overlapping WAV slices without re-encoding, and each `AudioChunk` records its absolute `start_seconds` and `end_seconds` so later stages can map timestamps back to meeting time. The diarization and ASR stages use it for recordings above their chunking thresholds.
 
 ### Preprocessing configuration
 
@@ -289,7 +115,7 @@ Recordings longer than `DIARIZATION_CHUNK_THRESHOLD_SECONDS` (1 h) are split int
 
 ### Known limitations
 
-- **Speed:** on a GPU, pyannote 3.1 processes an hour of audio in roughly 1.5 minutes. On CPU it is much slower, often tens of minutes per hour depending on the machine, so use a GPU for long meetings. It currently runs inside the API process; the worker queue in Prompt 11 moves it out.
+- **Speed:** on a GPU, pyannote 3.1 processes an hour of audio in roughly 1.5 minutes. On CPU it is much slower, often tens of minutes per hour depending on the machine, so use a GPU for long meetings. It runs on the gpu worker, never in the API process.
 - **Short or quiet speakers:** someone who only says "yes" once may be missed or merged into another speaker. `expected_speakers` helps.
 - **Similar voices:** speakers with similar voices, or the same person on different microphones, can be merged or split, especially across chunks. Tune `SPEAKER_SIMILARITY_THRESHOLD`.
 - **Non-speech sounds:** music and laughter can occasionally be assigned to a speaker.
@@ -309,7 +135,7 @@ Recordings longer than `DIARIZATION_CHUNK_THRESHOLD_SECONDS` (1 h) are split int
 
 ## Speech recognition (English, Hindi, Odia)
 
-`TranscriptionStage` runs after diarization on the 16 kHz WAV and produces a **timestamped transcript in each language's native script**: segments with word timings, confidence, language and the backend that produced them. It is independent of diarization for now; attributing words to speakers comes in a later prompt. The transcript is served by `GET /meetings/{id}/transcript` as JSON, plain text or SRT subtitles.
+`TranscriptionStage` runs after diarization on the 16 kHz WAV and produces a **timestamped transcript in each language's native script**: segments with word timings, confidence, language and the backend that produced them. The transcript is served by `GET /meetings/{id}/transcript` as JSON, plain text or SRT subtitles.
 
 ### Routing design
 
@@ -328,7 +154,7 @@ flowchart LR
 ```
 
 - `ASRBackend` (`base.py`) defines the interface: `transcribe(audio_path, language, offset) -> ASRResult` and `supported_languages`.
-- `ASRRouter` maps language codes to backends using `ASR_LANGUAGE_BACKENDS=en:whisper,hi:whisper,or:indic`. A misconfigured mapping fails at startup; an unsupported language raises `unsupported_language` with the fix in the message. Routing is a separate object so that Prompt 6 can route **per segment** after language identification.
+- `ASRRouter` maps language codes to backends using `ASR_LANGUAGE_BACKENDS=en:whisper,hi:whisper,or:indic`. A misconfigured mapping fails at startup; an unsupported language raises `unsupported_language` with the fix in the message. Routing is a separate object, so the transcription stage can route **per language region** after language identification (see below).
 - **Current strategy:** if exactly one language hint was given on upload, that language is forced. With no hint, or several (a code-mixed meeting), Whisper decodes without a forced language, because forcing one language on mixed speech mangles the others.
 - **Long recordings** reuse the chunker (30 min chunks, 5 s overlap), and timestamps are shifted to meeting time. In each overlap, a segment belongs to the chunk that owns its midpoint. Near-duplicates that overlap in time with the previous segment (same text, contained text, or ≥ 80 % fuzzy match) are dropped, keeping the more complete version.
 - `ASR_BACKEND=mock` swaps every route for a deterministic fake that emits scripted English, Hindi and Odia lines. The tests use it.
@@ -392,8 +218,8 @@ Before scoring, both texts are NFC-normalized, case-folded and stripped of punct
 ### Known limitations
 
 - **Odia timestamps** are approximate at word level (see above), and Odia segments carry no confidence.
-- **Code-mixed speech:** without a single-language hint, Whisper picks one language per 30 s window. Hindi-English mixing is usually transcribed reasonably, but Odia inside a mixed meeting is sent to Whisper, which cannot transcribe it well. Per-segment language ID and routing is Prompt 6. Whisper also sometimes labels Hindi as Urdu and writes it in Perso-Arabic script; pass `languages=hi` when you know the language.
-- **Compute:** faster-whisper large-v3 needs roughly 5 GB of GPU memory in float16. On CPU (int8) it runs at roughly real time or slower, so use `small` or `medium` on CPU-only hosts. Both models load inside the API process until the worker queue arrives.
+- **Code-mixed speech:** without a single-language hint, Whisper picks one language per 30 s window. Hindi-English mixing is usually transcribed reasonably, but Odia inside a mixed meeting is sent to Whisper, which cannot transcribe it well. Whisper also sometimes labels Hindi as Urdu and writes it in Perso-Arabic script; pass `languages=hi` when you know the language.
+- **Compute:** faster-whisper large-v3 needs roughly 5 GB of GPU memory in float16. On CPU (int8) it runs at roughly real time or slower, so use `small` or `medium` on CPU-only hosts. Both models load in the gpu worker.
 - **Model downloads:** the first transcription of each language downloads the model, so it is slow.
 
 ### ASR configuration
@@ -534,7 +360,7 @@ gantt
 - Fragments shorter than `UTTERANCE_MIN_WORDS` merge into the nearest utterance of the same speaker within `ALIGN_MERGE_GAP_SECONDS`.
 - Utterances longer than `UTTERANCE_MAX_SECONDS` (30 s) are split after sentence punctuation: `. ? !` and the danda `।` / `॥` used by Hindi and Odia. If no punctuation appears within 2× that length, they are cut at a word boundary.
 - Text is rebuilt from the words with correct spacing in every script ("है ।" → "है।").
-- Each utterance carries `primary_language`, `languages_present` and `is_code_mixed` from the per-word language tags (Prompt 6), plus `avg_confidence`.
+- Each utterance carries `primary_language`, `languages_present` and `is_code_mixed` from the per-word language tags, plus `avg_confidence`.
 
 **Labels are never renumbered here.** "Person N" comes straight from diarization. A sanity pass adds `warnings` for speakers who have turns but no words (silent or misdiarized) and for words labelled `Unknown`. `alignment_stats` reports the percentage of words assigned, unknown and segment-level.
 
@@ -550,7 +376,7 @@ gantt
 | `vtt` | `WEBVTT` … `00:01:23.200 --> 00:01:30.400` / `<v Ravi>आज बजट पर बात करेंगे।` |
 | `md` | `**Ravi** · 00:01:23` then the text; consecutive utterances of one speaker share a block |
 
-The Prompt 5 raw ASR output is still available at `?view=raw` (`json`, `txt`, `srt`).
+The raw ASR output (before speaker alignment) is available at `?view=raw` (`json`, `txt`, `srt`).
 
 ### Renaming speakers
 
@@ -602,7 +428,7 @@ curl .../meetings/{id}/analytics/charts/timeline -o timeline.png
 ### Sources of truth
 
 - **Time** comes from diarization turns: speaking time, turns, overlap, interruptions and first/last spoke. Turns are acoustic truth, so a pause inside someone's turn counts the same way for every speaker, whatever the ASR produced.
-- **Words, segments, questions and languages** come from the aligned utterances. The spoken-language shares from Prompt 6 are used when language ID ran; otherwise each utterance's `primary_language` is used.
+- **Words, segments, questions and languages** come from the aligned utterances. The spoken-language shares from language ID are used when language ID ran; otherwise each utterance's `primary_language` is used.
 - Utterances labelled `Unknown` are excluded from per-speaker counts, so segment shares add up to 100.
 
 ### How overlap is counted
@@ -635,7 +461,7 @@ sum(speaking_time_seconds) = total_speech_seconds + overlap_double_counted_secon
 | `overlap_seconds` / `overlap_percent` (meeting) | Time with two or more speakers, and its share of speech time |
 | `gini_coefficient`, `participation_balance` | Gini of speaking time: ≤ `GINI_BALANCED_MAX` (0.2) `balanced`, ≥ `GINI_DOMINATED_MIN` (0.4) `dominated`, otherwise `moderately dominated`; `not applicable` below two speakers. For two speakers, 0.2 is about a 60/40 split and 0.4 about 70/30 |
 | `dominant_speaker`, `least_active_speaker` | Most and least speaking time |
-| `language_distribution`, `num_language_switches` | From the Prompt 6 `LanguageSummary`, or from utterances when LID did not run |
+| `language_distribution`, `num_language_switches` | From the `LanguageSummary`, or from utterances when LID did not run |
 | `longest_monologue` | Longest run of speech by one speaker without a floor switch |
 | `timeline` | Speaking seconds per speaker in `BUCKET_SECONDS` windows, for charting |
 
@@ -997,7 +823,7 @@ The JSON Schema is published at **`GET /api/v1/schema/meeting-result`** (`$id` a
   - fpdf2 instead of WeasyPrint or ReportLab: WeasyPrint needs the Pango system libraries, and open-source ReportLab has no dependable Indic shaping.
 - **DOCX** (python-docx): runs set Noto as the complex-script font.
 
-Samples: [docs/samples/sample-minutes.pdf](docs/samples/sample-minutes.pdf) and [.md](docs/samples/sample-minutes.md), generated from the code-mixed fixture by `uv run python scripts/make_sample_export.py`.
+Samples: [PDF](samples/code-mixed-meeting.pdf), [DOCX](samples/code-mixed-meeting.docx), [Markdown](samples/code-mixed-meeting.md) and [result JSON](samples/code-mixed-meeting.result.json), generated from the code-mixed fixture by `uv run python scripts/make_sample_export.py`.
 
 ### Retrieval and search
 
@@ -1027,195 +853,3 @@ Search indexes each meeting's latest utterances and summary:
 | `STAGE_OUTPUT_INLINE_MAX_BYTES` | `524288` | Larger stage outputs are stored as artifacts |
 | `RETENTION_DAYS` | `90` | Age after which raw audio is purged (`0` = never) |
 | `KEEP_RAW_AUDIO` | `false` | `true` keeps raw audio regardless of age |
-
-## Workers, reliability and security
-
-Processing runs on a Redis job queue ([arq](https://arq-docs.helpmanual.io/), async-native like FastAPI). The API only validates, stores and enqueues; it never loads a model.
-
-### Architecture
-
-```mermaid
-flowchart LR
-    C[Client] -->|X-API-Key| API[FastAPI API<br/>auth, rate limits,<br/>idempotency]
-    API -->|enqueue| R[(Redis<br/>queues, progress,<br/>cancel flags, heartbeats)]
-    API --> DB[(Postgres<br/>meetings, runs,<br/>stage results)]
-    API --> S[(Artifact store<br/>local / S3)]
-    R -->|polymom:cpu| W1[cpu worker<br/>preprocess, align,<br/>analytics]
-    R -->|polymom:gpu| W2[gpu worker<br/>diarize, language ID,<br/>ASR]
-    R -->|polymom:llm| W3[llm worker<br/>summarize]
-    W1 -. hand-off .-> R
-    W2 -. hand-off .-> R
-    W1 & W2 & W3 --> DB
-    W1 & W2 & W3 --> S
-    W1 & W2 & W3 -->|progress pub/sub| R
-    R -->|SSE| API
-    W3 -->|signed webhook| CB[callback_url]
-```
-
-Every stage belongs to a queue. A worker runs only its own queue's stages. At the first stage of another queue, it enqueues a **continuation job** for the same run and returns, so a run moves cpu → gpu → cpu → llm. Each queue has its own concurrency (`QUEUE_CONCURRENCY_CPU/GPU/LLM`); keep `QUEUE_CONCURRENCY_GPU=1` per GPU so a GPU is never oversubscribed.
-
-### Running workers
-
-```bash
-# local: API + one worker per queue (needs Redis: docker run -p 6379:6379 redis:7-alpine)
-export REDIS_URL=redis://localhost:6379/0
-make run
-uv run python -m app.workers.main --queue cpu
-uv run python -m app.workers.main --queue gpu
-uv run python -m app.workers.main --queue llm
-
-# or everything, with Postgres and Redis:
-docker compose -f docker/docker-compose.yml up --build
-docker compose -f docker/docker-compose.yml exec api python -m scripts.create_api_key --label me
-```
-
-`PIPELINE_EXECUTION=inline` runs the pipeline inside the API process instead. It exists for tests and local debugging, and production settings refuse it.
-
-### Resumable pipeline
-
-- **Stage checkpoints:** every stage's result is committed to `stage_results` before the next stage starts, together with a **fingerprint**. The fingerprint is the SHA-256 of the input file, the stage's settings (including model names) and the upstream fingerprints. When a run is continued (after a hand-off, a retry, a crash or a restart), completed stages whose fingerprint still matches are skipped. A changed setting reruns that stage and every stage after it.
-- **Chunk checkpoints:** long diarization and ASR write each chunk's result to the artifact store (`meetings/{id}/{run}/checkpoints/{stage}/{fingerprint}/chunk-NNNN.json`). A crash at chunk 7 of 10 resumes at chunk 7.
-- **Partial reruns:** `POST /meetings/{id}/process?from_stage=summarize` starts a new run that reuses the earlier stages' outputs, for example to try a new LLM without redoing ASR.
-- **Cancel:** `POST /meetings/{id}/cancel` sets a flag that is checked between stages and between chunks. The meeting becomes `cancelled`, and completed work is kept.
-- **Idempotency:** a repeated `Idempotency-Key` on upload or process replays the first response (`Idempotent-Replayed: true`). Reusing a key for a different request returns 409.
-
-### Progress and webhooks
-
-- `GET /meetings/{id}/status` returns a snapshot: status, `percent`, `current_stage`, per-stage status and chunk, `elapsed_seconds` and `eta_seconds`. ETA is measured from the run's start and the weighted progress so far.
-- `GET /meetings/{id}/status/stream` is a Server-Sent Events stream of the same snapshots, pushed from Redis pub/sub. It closes when the run finishes.
-- `callback_url` (on upload, or overridden on process) receives `POST {"meeting_id", "status"}` when the run finishes:
-  - it's signed with `X-Polymom-Signature: sha256=HMAC(WEBHOOK_SECRET, "{X-Polymom-Timestamp}.{body}")`;
-  - it's retried with exponential backoff on network errors, 429 and 5xx.
-- **Webhook SSRF protection:** only `http`/`https` URLs are accepted. The host is resolved at validation and again at delivery, and loopback, private, link-local (cloud metadata), reserved and multicast addresses are refused.
-
-```python
-import hashlib, hmac
-
-expected = "sha256=" + hmac.new(secret, f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
-assert hmac.compare_digest(expected, request.headers["X-Polymom-Signature"])
-```
-
-### Failure handling
-
-| Failure | What happens |
-| --- | --- |
-| Transient error (LLM 429/5xx, network, stage or ffmpeg timeout) | Retried with exponential backoff (`RETRY_BACKOFF_SECONDS` × 2^n, capped at 10 min) up to `MAX_RETRIES`; the retry resumes at the failed stage |
-| Permanent error (corrupted media, validation, missing credentials, unsupported language) | Not retried; run and meeting `failed` with code, message and remediation |
-| Optional stage fails (summarization) | Meeting `completed_with_errors`; transcript and analytics stay available |
-| Stage exceeds `STAGE_TIMEOUTS` | `stage_timeout` (retryable) |
-| GPU out of memory | CUDA cache freed, stage retried once on CPU (`polymom_gpu_oom_fallbacks_total`); `resource_exhausted` if the CPU fails too |
-| Worker killed / crashes | Heartbeat stops; the reaper (cpu worker, every minute) re-queues runs silent for `STUCK_JOB_SECONDS`; they resume from checkpoints |
-| SIGTERM (deploy, scale-down) | Worker stops at the next chunk or stage boundary, checkpoints, and enqueues a continuation; `stop_grace_period` > `SHUTDOWN_GRACE_SECONDS` |
-| Hand-off loop (bug or config drift between workers) | Stopped after 20 hand-offs with `handoff_loop` |
-| Webhook endpoint down | Retried up to `WEBHOOK_MAX_ATTEMPTS`; never affects the meeting's status |
-| Unhandled exception in the API | Generic `internal_error` 500 with `request_id`; the traceback is only in the logs |
-
-Every error response has the same shape: `{"error": {"code", "message", "remediation", "details", "request_id"}}`. The `X-Request-ID` header is accepted or generated, returned on the response, bound to every log line and passed on to the jobs.
-
-### Security model
-
-- **API keys:** keys are sent in `X-API-Key` and stored as SHA-256 hashes.
-  - Create them with `python -m scripts.create_api_key --label ci`; `--list` and `--revoke <prefix>` are also available.
-  - The plaintext key is printed once.
-- **Tenant isolation (OWASP API1, BOLA):** every meeting records its owning key. Reads, writes, lists, search and duplicate detection are scoped to that key. Another tenant's meeting returns 404, not 403, so its existence isn't revealed.
-- **Rate limits:** per key (or per IP when auth is off), with a moving window stored in Redis and shared by API replicas.
-  - `RATE_LIMIT_DEFAULT` applies everywhere; the stricter `RATE_LIMIT_UPLOAD` applies to upload, process and regenerate.
-  - A 429 carries `Retry-After`.
-  - This uses `limits`, the engine behind slowapi. slowapi's module-level decorators don't fit the app factory, where each app has its own settings.
-- **Uploads:**
-  - size and duration limits (`MAX_UPLOAD_MB`, `MAX_AUDIO_DURATION_MINUTES`, returning 422 `audio_too_long`);
-  - magic-byte checks and sanitized filenames;
-  - ffmpeg and ffprobe run with `-protocol_whitelist file,pipe,fd`, so crafted playlists and containers can't fetch URLs or read other files;
-  - files are stored under keys, outside any served path.
-- **HTTP:** a CORS allowlist (`CORS_ORIGINS`), security headers (`nosniff`, `DENY`, a strict CSP, `no-store`, and HSTS in production), and body-size limits.
-- **Secrets and CI:** secrets come only from the environment. `APP_ENV=production` refuses to start when auth is off, `REDIS_URL` or needed credentials are missing, or CORS is `*`. CI runs `pip-audit` on the locked dependencies and `gitleaks` on the history.
-
-### Observability
-
-- **Prometheus:** metrics at `/api/v1/metrics`, and on `:9101` for each worker:
-  - request count and latency by route template, jobs by status, queue depth;
-  - stage duration and real-time factor histograms, audio minutes processed;
-  - LLM tokens and cost, retries, OOM fallbacks, webhook results.
-- **Health:** `/api/v1/health/live` checks that the process is up. `/api/v1/health/ready` checks the database, Redis and the artifact store, and reports model availability for information only (the API doesn't load models).
-- **Tracing:** with `OTEL_ENABLED=true` and `uv sync --extra otel`, there are OpenTelemetry spans for API requests, jobs and stages, exported over OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`.
-- **Dashboards:** `docker compose --profile monitoring up` adds Prometheus (:9090) and Grafana (:3000) with the provisioned *Polymom* dashboard (`docker/grafana/dashboards/polymom.json`).
-
-### Scaling guidance
-
-- **API:** stateless. Run several replicas behind a load balancer; rate limits and idempotency live in Redis and Postgres.
-- **gpu workers:** one per GPU with `QUEUE_CONCURRENCY_GPU=1`. Add GPUs to add throughput. Watch `polymom_queue_depth{queue="gpu"}` and `polymom_stage_real_time_factor`.
-- **cpu workers:** cheap; scale on `queue_depth{queue="cpu"}`.
-- **llm workers:** limited by provider rate limits, not local resources. Raise `QUEUE_CONCURRENCY_LLM` until you see 429 retries.
-- **Storage:** use Postgres and `ARTIFACT_STORE=s3` for more than one host, since checkpoints and processed audio must be visible to every worker.
-
-**Load test** (`scripts/load_test.py`, Locust, mock backends): 50 users for 90 s against one API container on a laptop (Docker Desktop, Windows):
-
-| Endpoint | Requests | Failures | Median | p95 | req/s |
-| --- | --- | --- | --- | --- | --- |
-| `POST /meetings` (upload) | 202 | 0 | 810 ms | 1.2 s | 2.4 |
-| `POST /meetings/{id}/process` | 199 | 0 | 560 ms | 930 ms | 2.4 |
-| `GET /meetings/{id}/status` | 1176 | 0 | 450 ms | 880 ms | 14.2 |
-| `GET /meetings` | 453 | 0 | 970 ms | 1.4 s | 5.5 |
-| **All** | 2030 | **0** | 520 ms | 1.3 s | 24.6 |
-
-All 202 meetings uploaded during the test were processed by the workers. Raw numbers are in `docs/load/results_stats.csv`. The rate limits were raised for this run; with the defaults, the extra uploads get 429.
-
-### Configuration
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `REDIS_URL` | – | Queue, progress, cancel flags, rate limits |
-| `PIPELINE_EXECUTION` | `queue` | `inline` for tests and local debugging only |
-| `QUEUE_CONCURRENCY_CPU` / `_GPU` / `_LLM` | `4` / `1` / `4` | Jobs per worker process |
-| `STAGE_TIMEOUTS` | per stage | e.g. `diarize:7200,transcribe:10800` |
-| `MAX_RETRIES`, `RETRY_BACKOFF_SECONDS` | `3`, `10` | Transient failures only |
-| `STUCK_JOB_SECONDS`, `HEARTBEAT_SECONDS` | `600`, `15` | Stuck-job reaper |
-| `SHUTDOWN_GRACE_SECONDS` | `120` | Time to reach a checkpoint on SIGTERM |
-| `MAX_AUDIO_DURATION_MINUTES` | `240` | Longer recordings get 422 |
-| `WEBHOOK_SECRET`, `WEBHOOK_MAX_ATTEMPTS` | –, `5` | Webhooks are skipped without a secret |
-| `API_KEY_REQUIRED` | `true` | Required in production |
-| `RATE_LIMIT_DEFAULT`, `RATE_LIMIT_UPLOAD` | `120/minute`, `10/minute` | Per API key |
-| `CORS_ORIGINS` | none | Comma-separated allowlist |
-| `OTEL_ENABLED` | `false` | Needs the `otel` extra |
-| `WORKER_METRICS_PORT` | `9101` | `0` disables |
-
-## Running with Docker
-
-```bash
-make docker-build   # build polymom:latest
-make docker-up      # API, cpu/gpu/llm workers, Postgres and Redis on port 8000 (reads .env)
-```
-
-Compose runs the mock ML backends by default, so the whole stack works without a GPU; set the `*_BACKEND` variables and `INSTALL_ML=true` for real models.
-
-```bash
-make docker-build-ml                                   # torch (CPU), pyannote, faster-whisper, Odia ASR
-docker build -f docker/Dockerfile --build-arg INSTALL_ML=true \
-    --build-arg TORCH_VARIANT=cu124 -t polymom:cuda .   # CUDA torch; run with --gpus all
-INSTALL_ML=true docker compose -f docker/docker-compose.yml up --build
-```
-
-By default the image stays light, without ML. `INSTALL_ML=true` adds torch, pyannote and faster-whisper, and `INSTALL_INDIC=true` adds the Odia ASR runtime; `TORCH_VARIANT` swaps in CUDA wheels of the same torch version. Downloaded models are cached in the `model-cache` volume (`HF_HOME=/app/.cache/huggingface`), so they survive restarts.
-
-The image uses a multi-stage build, runs as a non-root `app` user, installs `ffmpeg` and `libmagic`, and defines a `HEALTHCHECK` against `/api/v1/health`. Postgres, Redis, artifacts and model downloads each have their own volume.
-
-## Roadmap
-
-| # | Prompt | Scope |
-| --- | --- | --- |
-| 1 | Project scaffold ✅ | Layout, tooling, CI, Docker, health endpoint |
-| 2 | Upload API ✅ | Multipart upload, size/extension validation, storage, meeting records |
-| 3 | Audio preprocessing ✅ | ffmpeg extract, resample, loudness-normalize, silence/quality analysis, chunking, stage-based pipeline |
-| 4 | Speaker diarization ✅ | pyannote 3.1 stage, consistent Person N labels, overlaps, chunk re-linking |
-| 5 | Multilingual ASR ✅ | Routed ASR: faster-whisper (en/hi) + AI4Bharat IndicConformer (or), NFC native script, hallucination guards, SRT, WER/CER eval |
-| 6 | Language ID + code-switching ✅ | Turn-based spoken LID (MMS), smoothing, per-region ASR routing, code-mix tagging, `/languages` |
-| 7 | Speaker + transcript alignment ✅ | Word-level speaker attribution, utterances, txt/srt/vtt/md, speaker renaming, DER/WDER eval |
-| 8 | Speaker statistics ✅ | Talk time, turns, interruptions, WPM, languages, questions per speaker; balance, timeline, CSV, charts |
-| 9 | **LLM summarization** ✅ | Grounded summary, decisions, action items; OpenAI/Azure/Anthropic/Ollama; map-reduce, verifier, injection flags, eval |
-| 10 | **Storage & retrieval** ✅ | Run history, normalized results, artifact store (local/S3), consolidated result + JSON Schema, docx/pdf/md/json exports, search, retention |
-| 11 | **Workers & hardening** ✅ | arq queues per resource, resumable/checkpointed runs, cancel, SSE progress, signed webhooks, API keys + tenant isolation, rate limits, metrics, tracing |
-| 12 | Tests, Docker & final docs | Test hardening, production images, deployment guide, release |
-
-## License
-
-[MIT](LICENSE)
