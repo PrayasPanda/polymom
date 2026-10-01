@@ -56,6 +56,8 @@ jobs:
         # pyannote.audio 3.x (diarization) still passes it. The fix is the pyannote 4 +
         # transformers 5 migration, tracked as a follow-up; transformers is only in the
         # optional `indic` extra (Odia ASR, MMS language ID) and loads trusted models.
+        # CVE-2026-80047 (4.57.0-5.16.1): load_custom_generate() caches remote code before the
+        # consent check. Polymom never calls it and only loads two fixed model ids.
         run: >-
           uvx pip-audit --strict --requirement requirements-audit.txt --no-deps --disable-pip
           --ignore-vuln PYSEC-2025-217
@@ -63,6 +65,7 @@ jobs:
           --ignore-vuln PYSEC-2026-2289
           --ignore-vuln PYSEC-2026-2290
           --ignore-vuln PYSEC-2026-3929
+          --ignore-vuln CVE-2026-80047
 
   secret-scan:
     runs-on: ubuntu-latest

@@ -36,7 +36,8 @@ server-side request forgery through webhooks, and leaked secrets.
 
 ## Known accepted risks
 
-- **transformers 4.x advisories** (PYSEC-2025-217, PYSEC-2026-2288/2289/2290/3929) are
+- **transformers 4.x advisories** (PYSEC-2025-217, PYSEC-2026-2288/2289/2290/3929 and
+  CVE-2026-80047, which affects `load_custom_generate()`, a function Polymom never calls) are
   ignored in `pip-audit`. The fixes need transformers ≥ 5.10, which requires
   huggingface-hub ≥ 1.5, and that release removed an argument pyannote.audio 3.x still
   passes. transformers is used only by the optional `indic` extra, to load pinned, trusted
