@@ -1,0 +1,29 @@
+# Overlay for the end-to-end suite (tests/e2e): mock ML backends, auth on, tight limits.
+#
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.e2e.yml up -d --build --wait
+#   uv run pytest -m e2e --no-cov
+#
+# The failure-flow tests restart single services with different environment variables
+# (for example worker-llm pointed at an unreachable LLM), so every knob they touch is
+# interpolated here.
+x-e2e-env: &e2e-env
+  API_KEY_REQUIRED: "true"
+  MAX_AUDIO_DURATION_MINUTES: "1"
+  RATE_LIMIT_DEFAULT: "100000/minute"
+  RATE_LIMIT_UPLOAD: "100000/minute"
+  LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+  LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+  MAX_RETRIES: ${MAX_RETRIES:-3}
+  RETRY_BACKOFF_SECONDS: "1"
+
+services:
+  api:
+    environment: *e2e-env
+  worker-cpu:
+    environment: *e2e-env
+  worker-gpu:
+    environment: *e2e-env
+  worker-llm:
+    environment: *e2e-env

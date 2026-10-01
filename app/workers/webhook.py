@@ -30,7 +30,6 @@ logger = get_logger(__name__)
 MAX_ATTEMPTS = 5
 BACKOFF_BASE_SECONDS = 2.0
 BACKOFF_MAX_SECONDS = 60.0
-DELIVERY_TTL_SECONDS = 7 * 24 * 3600
 PRIVATE_HOST_NAMES = frozenset(
     {
         "localhost",

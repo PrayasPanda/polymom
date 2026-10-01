@@ -2,8 +2,13 @@
 #
 #   docker compose -f docker/docker-compose.yml up --build
 #   docker compose -f docker/docker-compose.yml exec api python -m scripts.create_api_key --label me
-#   docker compose -f docker/docker-compose.yml --profile monitoring up    # + Prometheus, Grafana
-#   docker compose -f docker/docker-compose.yml --profile minio up         # + S3-compatible store
+#
+# Profiles (combine freely):
+#   --profile monitoring   Prometheus + Grafana (http://localhost:3000)
+#   --profile s3           SeaweedFS S3; set ARTIFACT_STORE=s3 S3_ENDPOINT_URL=http://seaweedfs:8333
+#   --profile local-llm    Ollama; set LLM_PROVIDER=ollama OLLAMA_BASE_URL=http://ollama:11434
+#   --profile gpu          CUDA worker for the gpu queue (real models, NVIDIA runtime);
+#                          add `--scale worker-gpu=0` so the CPU copy does not compete
 #
 # Defaults run the mock ML backends so the stack works without GPUs or model downloads;
 # set INSTALL_ML=true and the *_BACKEND variables in .env for real models.
@@ -39,7 +44,7 @@ x-app: &app
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
       POSTGRES_USER: polymom
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-polymom}
@@ -52,7 +57,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
@@ -79,6 +84,10 @@ services:
   worker-cpu:
     <<: *app
     command: ["python", "-m", "app.workers.main", "--queue", "cpu"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9101/metrics"]
+      interval: 15s
+      retries: 5
     environment:
       <<: *app-env
       AUTO_MIGRATE: "false"
@@ -89,6 +98,10 @@ services:
   worker-gpu:
     <<: *app
     command: ["python", "-m", "app.workers.main", "--queue", "gpu"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9101/metrics"]
+      interval: 15s
+      retries: 5
     environment:
       <<: *app-env
       AUTO_MIGRATE: "false"
@@ -96,15 +109,46 @@ services:
     stop_grace_period: 150s
     depends_on:
       api: {condition: service_healthy}
-    # For NVIDIA GPUs (with TORCH_VARIANT=cu124):
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+
+  # --- optional: CUDA worker with the real models (profile gpu) ---
+  worker-gpu-cuda:
+    <<: *app
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        INSTALL_ML: "true"
+        INSTALL_INDIC: "true"
+        TORCH_VARIANT: ${TORCH_VARIANT_GPU:-cu128}
+    image: polymom:cuda
+    command: ["python", "-m", "app.workers.main", "--queue", "gpu"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9101/metrics"]
+      interval: 15s
+      retries: 5
+    environment:
+      <<: *app-env
+      AUTO_MIGRATE: "false"
+      DEVICE: cuda
+      DIARIZATION_BACKEND: ${DIARIZATION_BACKEND_GPU:-pyannote}
+      ASR_BACKEND: ${ASR_BACKEND_GPU:-real}
+      LID_BACKEND: ${LID_BACKEND_GPU:-mms}
+    stop_grace_period: 150s
+    depends_on:
+      api: {condition: service_healthy}
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
 
   worker-llm:
     <<: *app
     command: ["python", "-m", "app.workers.main", "--queue", "llm"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9101/metrics"]
+      interval: 15s
+      retries: 5
     environment:
       <<: *app-env
       AUTO_MIGRATE: "false"
@@ -112,44 +156,44 @@ services:
     depends_on:
       api: {condition: service_healthy}
 
-  # --- optional: S3-compatible artifact store (ARTIFACT_STORE=s3) ---
-  minio:
-    image: minio/minio:latest
-    profiles: ["minio"]
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-polymom}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-polymom-secret}
-    ports: ["9000:9000", "9001:9001"]
-    volumes: [minio-data:/data]
+  # --- optional: S3-compatible artifact store (profile s3, ARTIFACT_STORE=s3) ---
+  # SeaweedFS (Apache-2.0): MinIO stopped publishing community images in 2025.
+  # Dev setup without S3 auth; use real credentials (or AWS S3) in production.
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    profiles: ["s3"]
+    command: ["server", "-dir=/data", "-s3", "-s3.port=8333"]
+    ports: ["8333:8333"]
+    volumes: [s3-data:/data]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 10s
-      retries: 5
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9333/cluster/status >/dev/null"]
+      interval: 5s
+      retries: 20
 
-  minio-init:
-    image: minio/mc:latest
-    profiles: ["minio"]
+  s3-init:
+    image: chrislusf/seaweedfs:latest@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    profiles: ["s3"]
     depends_on:
-      minio: {condition: service_healthy}
-    environment:
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-polymom}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-polymom-secret}
-      S3_BUCKET: ${S3_BUCKET:-polymom}
-    entrypoint: >
-      sh -c "mc alias set local http://minio:9000 $${S3_ACCESS_KEY} $${S3_SECRET_KEY}
-      && mc mb --ignore-existing local/$${S3_BUCKET}"
+      seaweedfs: {condition: service_healthy}
+    entrypoint: ["sh", "-c", "echo 's3.bucket.create -name ${S3_BUCKET:-polymom}' | weed shell -master=seaweedfs:9333"]
+
+  # --- optional: local LLM (profile local-llm) ---
+  ollama:
+    image: ollama/ollama:0.11.10
+    profiles: ["local-llm"]
+    volumes: [ollama-data:/root/.ollama]
+    ports: ["11434:11434"]
 
   # --- optional: monitoring ---
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.5.0
     profiles: ["monitoring"]
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports: ["9090:9090"]
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:12.1.1
     profiles: ["monitoring"]
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
@@ -165,4 +209,5 @@ volumes:
   model-cache:
   postgres-data:
   redis-data:
-  minio-data:
+  s3-data:
+  ollama-data:

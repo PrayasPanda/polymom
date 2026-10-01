@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Meetings{% endblock %}
+{% block content %}
+<section class="card" aria-labelledby="upload-h">
+  <h1 id="upload-h">Upload a meeting</h1>
+  <form id="upload-form" class="upload">
+    <label id="dropzone" class="dropzone" for="file">
+      <span>Drop an audio or video file here, or <u>browse</u></span>
+      <span class="muted small">{{ settings.allowed_extensions | sort | join(", ") }} · up to {{ settings.max_upload_mb }} MB</span>
+      <span id="file-name" class="small"></span>
+    </label>
+    <input id="file" name="file" type="file" class="visually-hidden" required
+           accept="{% for e in settings.allowed_extensions | sort %}.{{ e }}{% if not loop.last %},{% endif %}{% endfor %}">
+    <div class="grid3">
+      <div>
+        <label for="title">Title <span class="muted">(optional)</span></label>
+        <input id="title" name="title" maxlength="200">
+      </div>
+      <div>
+        <label for="expected_speakers">Expected speakers</label>
+        <input id="expected_speakers" name="expected_speakers" type="number" min="1" max="20">
+      </div>
+      <fieldset>
+        <legend>Language hints</legend>
+        <label class="inline"><input type="checkbox" name="languages" value="en"> English</label>
+        <label class="inline"><input type="checkbox" name="languages" value="hi"> हिन्दी</label>
+        <label class="inline"><input type="checkbox" name="languages" value="or"> ଓଡ଼ିଆ</label>
+      </fieldset>
+    </div>
+    <button type="submit" id="upload-btn" class="primary">Upload and process</button>
+    <progress id="upload-progress" max="100" value="0" hidden aria-label="Upload progress"></progress>
+  </form>
+</section>
+
+<section class="card" aria-labelledby="list-h">
+  <h2 id="list-h">Meetings</h2>
+  <div id="meetings" hx-get="/ui/partials/meetings" hx-trigger="load, keychange from:body">
+    <p class="muted">Loading…</p>
+  </div>
+</section>
+{% endblock %}

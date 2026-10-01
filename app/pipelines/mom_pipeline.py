@@ -283,8 +283,9 @@ class TranscriptionStage(PipelineStage):
     """Timestamped transcript of the preprocessed audio.
 
     With language regions from :class:`LanguageIdentificationStage` each region
-    is routed to its language's backend; otherwise the single-pass Prompt 5
-    strategy (hint or auto-detect) is used. Word-to-speaker alignment comes later.
+    is routed to its language's backend; otherwise a single pass
+    (forced hint or auto-detect) is used. Words are attributed to speakers by the
+    alignment stage.
     """
 
     name = "transcribe"

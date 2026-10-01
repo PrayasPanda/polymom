@@ -278,10 +278,6 @@ class Settings(BaseSettings):
         return self.max_upload_mb * 1024 * 1024
 
     @property
-    def uploads_dir(self) -> Path:
-        return self.storage_dir / "uploads"
-
-    @property
     def processed_dir(self) -> Path:
         return self.storage_dir / "processed"
 

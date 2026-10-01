@@ -6,8 +6,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
+from app.api.v1.routes.health import model_availability
 from app.core.config import Settings, get_settings
 from app.core.exceptions import error_body, register_exception_handlers
 from app.core.logging import configure_logging, get_logger
@@ -16,6 +18,7 @@ from app.core.rate_limit import RateLimiter
 from app.core.tracing import setup_tracing
 from app.db.migrate import upgrade_to_head
 from app.db.session import create_engine, create_sessionmaker
+from app.ui import routes as ui
 
 # Allowance for multipart boundaries and form fields on top of the file itself.
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -42,6 +45,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             env=settings.app_env,
             pipeline_execution=settings.pipeline_execution,
         )
+        missing = [k for k, ok in model_availability(settings).items() if k != "ok" and not ok]
+        if missing:
+            # The API never loads models, so it runs; jobs that need these backends fail.
+            logger.warning(
+                "ml_backends_unavailable",
+                backends=missing,
+                hint="Install the ml/indic extras and set HF_TOKEN / LLM_API_KEY, "
+                "or use DIARIZATION_BACKEND/ASR_BACKEND/LID_BACKEND=mock, LLM_PROVIDER=mock.",
+            )
         yield
         await engine.dispose()
         logger.info("shutdown")
@@ -80,9 +92,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ),
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             )
+        json_limit = settings.max_json_body_kb * 1024
+        is_json = request.headers.get("content-type", "").startswith("application/json")
+        if is_json and length.isdigit() and int(length) > json_limit:
+            return JSONResponse(
+                error_body(
+                    "payload_too_large",
+                    f"JSON body exceeds the {settings.max_json_body_kb} KB limit.",
+                    {"max_json_body_kb": settings.max_json_body_kb},
+                ),
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            )
         return await call_next(request)
 
     app.include_router(api_router, prefix="/api/v1")
+    app.include_router(ui.router)
+    app.include_router(ui.partials)
+    app.mount("/static/fonts", StaticFiles(directory=ui.FONTS_DIR), name="fonts")
+    app.mount("/static", StaticFiles(directory=ui.STATIC_DIR), name="static")
     setup_tracing(settings, app)
     return app
 

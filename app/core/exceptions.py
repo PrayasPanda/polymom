@@ -210,6 +210,13 @@ class TranscriptionError(PipelineError):
     code = "transcription_failed"
 
 
+class AudioNotAvailableError(ConflictError):
+    """Playback audio was requested after the retention policy purged it."""
+
+    code = "audio_not_available"
+    remediation = "Raw audio is purged after RETENTION_DAYS; results stay available."
+
+
 class TranscriptNotAvailableError(ConflictError):
     """The transcript was requested before transcription finished."""
 
@@ -315,14 +322,6 @@ def error_body(
             "request_id": current_request_id(),
         }
     }
-
-
-def describe(exc: BaseException, stage: str | None = None) -> tuple[str, str, str | None]:
-    """``(code, message, remediation)`` for any exception, safe to store and show."""
-    if isinstance(exc, PolymomError):
-        return exc.code, exc.message, exc.remediation
-    where = f" in stage '{stage}'" if stage else ""
-    return "internal_error", f"Unexpected failure{where}.", PolymomError.remediation
 
 
 async def _polymom_error_handler(request: Request, exc: Exception) -> JSONResponse:

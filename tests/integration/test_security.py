@@ -71,6 +71,8 @@ async def test_api_keys_and_tenant_isolation(
             ("GET", f"{URL}/{meeting_id}/status"),
             ("GET", f"{URL}/{meeting_id}/result"),
             ("GET", f"{URL}/{meeting_id}/export"),
+            ("GET", f"{URL}/{meeting_id}/audio"),
+            ("GET", f"/ui/partials/meetings/{meeting_id}"),
             ("POST", f"{URL}/{meeting_id}/process"),
             ("POST", f"{URL}/{meeting_id}/cancel"),
             ("DELETE", f"{URL}/{meeting_id}"),
@@ -276,3 +278,14 @@ async def test_sse_requires_the_queue(client: AsyncClient) -> None:
     meeting_id = "3f8b6f0e-2c1d-4d6a-9d3e-6c2b1a0f9e7d"
     response = await client.get(f"{URL}/{meeting_id}/status/stream")
     assert response.status_code == 404  # unknown meeting is checked first
+
+
+async def test_oversized_json_body_is_rejected(client: AsyncClient) -> None:
+    body = b'{"names": {"Person 1": "' + b"x" * 2_000_000 + b'"}}'
+    response = await client.patch(
+        "/api/v1/meetings/00000000-0000-0000-0000-000000000000/speakers",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "payload_too_large"

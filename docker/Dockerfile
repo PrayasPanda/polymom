@@ -3,7 +3,9 @@
 # Build args:
 #   INSTALL_ML=false|true     install the `ml` extra (torch, pyannote.audio, faster-whisper)
 #   INSTALL_INDIC=false|true  also install the `indic` extra (Odia ASR: transformers, onnxruntime)
-#   TORCH_VARIANT=cpu         PyTorch wheel variant; e.g. cu121 / cu124 for NVIDIA GPUs
+#   TORCH_VARIANT=cpu         PyTorch wheel variant: cpu (small image) or cu124 / cu128 (CUDA;
+#                             cu128 is required for RTX 50xx / Blackwell GPUs). The CUDA
+#                             runtime ships inside the torch wheels, so the base stays slim.
 #                             (run the GPU image with `--gpus all` on a host with the NVIDIA runtime)
 #
 #   docker build -f docker/Dockerfile -t polymom .                                   # light, no ML
@@ -11,15 +13,17 @@
 #   docker build -f docker/Dockerfile --build-arg INSTALL_ML=true \
 #       --build-arg INSTALL_INDIC=true -t polymom:ml-indic .                         # + Odia ASR
 #   docker build -f docker/Dockerfile --build-arg INSTALL_ML=true \
-#       --build-arg TORCH_VARIANT=cu124 -t polymom:cuda .                            # CUDA torch
+#       --build-arg TORCH_VARIANT=cu128 -t polymom:cuda .                            # CUDA torch
+#
+# Base images are pinned by digest; Dependabot (docker ecosystem) proposes updates.
 
 # ---------- builder ----------
-FROM python:3.11-slim AS builder
+FROM python:3.11.16-slim-trixie@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e AS builder
 ARG INSTALL_ML=false
 ARG INSTALL_INDIC=false
 ARG TORCH_VARIANT=cpu
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv
+COPY --from=ghcr.io/astral-sh/uv:0.9.30@sha256:538e0b39736e7feae937a65983e49d2ab75e1559d35041f9878b7b7e51de91e4 /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv UV_HTTP_TIMEOUT=300
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -48,9 +52,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev $FLAGS
 
 # ---------- runtime ----------
-FROM python:3.11-slim AS runtime
+FROM python:3.11.16-slim-trixie@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e AS runtime
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="polymom" \
+      org.opencontainers.image.description="Multilingual minutes-of-meeting pipeline" \
+      org.opencontainers.image.source="https://github.com/PrayasPanda/polymom" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libmagic1 curl \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends ffmpeg curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system app && useradd --system --gid app --home /app app
 # HF_HOME holds downloaded models (pyannote, Whisper, IndicConformer); mount a volume there.
@@ -68,5 +79,5 @@ RUN mkdir -p /app/storage /app/.cache/huggingface /app/.cache/torch \
 USER app
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-    CMD curl -fsS http://localhost:8000/api/v1/health || exit 1
+    CMD curl -fsS http://localhost:8000/api/v1/health/live || exit 1
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -219,6 +219,9 @@ class FakeTensor:
     def tolist(self) -> list[float]:
         return self.values
 
+    def float(self) -> "FakeTensor":
+        return self
+
     def to(self, device: str) -> "FakeTensor":
         return self
 
@@ -256,6 +259,10 @@ def fake_mms(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     class Model:
         config = types.SimpleNamespace(id2label={0: "eng", 1: "hin", 2: "ory", 3: "ben"})
+        dtype = None
+
+        def half(self) -> None:
+            state["half"] = True
 
         def to(self, device: str) -> None:
             state["device"] = device

@@ -71,6 +71,10 @@ def load_model(settings: Settings) -> tuple[Any, Any, Any, str]:
                     "Hugging Face and LID_MODEL_ID.",
                     details={"reason": "load_failed", "model": settings.lid_model_id},
                 ) from exc
+            if device == "cuda":
+                # fp16 halves the 1B-parameter model (~2 GB), so it fits next to Whisper
+                # large-v3 on an 8 GB GPU; LID scores are not sensitive to the precision.
+                model.half()
             model.to(device)
             model.eval()
             _models[key] = (extractor, model)
@@ -93,10 +97,14 @@ class MMSLanguageIdentifier(LanguageIdentifier):
         extractor, model, torch, device = load_model(self.settings)
         samples, rate = read_samples(audio_path, start, end)
         try:
-            inputs = extractor(samples, sampling_rate=rate, return_tensors="pt").to(device)
+            features = extractor(samples, sampling_rate=rate, return_tensors="pt")
+            inputs = {
+                k: v.to(device, dtype=model.dtype) if v.is_floating_point() else v.to(device)
+                for k, v in features.items()
+            }
             with _inference_lock, torch.no_grad():
                 logits = model(**inputs).logits[0]
-            probs = torch.softmax(logits, dim=-1).tolist()
+            probs = torch.softmax(logits.float(), dim=-1).tolist()
         except Exception as exc:
             raise LanguageIdError(
                 f"MMS language ID failed: {exc}", details={"reason": "inference_failed"}

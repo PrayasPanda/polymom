@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Meeting{% endblock %}
+{% block content %}
+<p><a href="/">← All meetings</a></p>
+<div id="detail" data-meeting-id="{{ meeting_id }}"
+     hx-get="/ui/partials/meetings/{{ meeting_id }}" hx-trigger="load, keychange from:body, refresh">
+  <p class="muted">Loading…</p>
+</div>
+{% endblock %}

@@ -1,6 +1,6 @@
 [project]
 name = "polymom"
-version = "0.1.0"
+version = "1.0.0"
 description = "Voice-based Minutes of Meeting pipeline: diarization, multilingual ASR (en/hi/or/code-mixed), speaker analytics and LLM summaries."
 readme = "README.md"
 license = { text = "MIT" }
@@ -72,7 +72,6 @@ dev = [
     "pytest-cov>=5.0",
     "httpx>=0.27",
     "pre-commit>=3.8",
-    "jiwer>=3.0",
     "hypothesis>=6.100",
     "matplotlib>=3.8",
     "moto[s3]>=5.2.3",
@@ -82,6 +81,7 @@ dev = [
     "pypdf>=6.19.0",
     "fakeredis>=2.38.0",
     "locust>=2.46.6",
+    "jsonschema>=4.26.0",
 ]
 
 [build-system]
@@ -122,16 +122,17 @@ files = ["app"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow'"
+addopts = "-ra --cov=app --cov-report=term-missing -m 'not slow and not e2e'"
 markers = [
     "slow: needs real models / HF_TOKEN; run with `make test-slow`",
     "llm: calls a real LLM provider; skipped without LLM_API_KEY",
     "postgres: runs against Postgres in Docker (testcontainers); skipped without Docker",
+    "e2e: needs the docker compose stack (make e2e-up); run with `make e2e`",
     "redis: runs arq workers against Redis in Docker (testcontainers); skipped without Docker",
 ]
 
 [[tool.mypy.overrides]]
-module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "jiwer", "jiwer.*", "matplotlib", "matplotlib.*", "langfuse", "langfuse.*", "boto3", "boto3.*", "botocore.*", "moto", "moto.*", "testcontainers.*", "docx", "docx.*", "fpdf", "fpdf.*", "pypdf", "opentelemetry", "opentelemetry.*"]
+module = ["filetype", "filetype.*", "torch", "torch.*", "pyannote.*", "numpy", "numpy.*", "faster_whisper", "faster_whisper.*", "speechbrain", "speechbrain.*", "transformers", "transformers.*", "matplotlib", "matplotlib.*", "langfuse", "langfuse.*", "boto3", "boto3.*", "botocore.*", "moto", "moto.*", "testcontainers.*", "docx", "docx.*", "fpdf", "fpdf.*", "pypdf", "opentelemetry", "opentelemetry.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]
