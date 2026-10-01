@@ -103,7 +103,7 @@ progress { width: 100%; height: 12px; }
 
 @media (max-width: 720px) {
   .grid3 { grid-template-columns: 1fr; }
-  .keyform { width: 100%; } .keyform input { width: auto; flex: 1; }
+  .keyform { width: 100%; } .keyform input { width: auto; flex: 1; min-width: 0; }
   .line { grid-template-columns: 3.6rem 1fr; } .line .lang { display: none; } .line .text { grid-column: 1 / -1; }
   .list { display: block; overflow-x: auto; }
 }
