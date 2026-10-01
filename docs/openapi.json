@@ -3320,7 +3320,8 @@
               }
             ],
             "title": "Start",
-            "description": "Filled from the transcript."
+            "description": "Filled from the transcript.",
+            "system_filled": true
           },
           "end": {
             "anyOf": [
@@ -3331,7 +3332,8 @@
                 "type": "null"
               }
             ],
-            "title": "End"
+            "title": "End",
+            "system_filled": true
           }
         },
         "type": "object",

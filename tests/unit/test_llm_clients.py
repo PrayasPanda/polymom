@@ -171,6 +171,8 @@ def test_schema_requires_list_fields_with_defaults() -> None:
     assert {"decisions", "action_items", "key_points", "open_questions"} <= set(schema["required"])
     action = schema["$defs"]["ActionItem"]
     assert set(action["required"]) == set(action["properties"])  # nested models too
+    # Timestamps are filled by the verifier, never requested from the model.
+    assert set(schema["$defs"]["Evidence"]["properties"]) == {"utterance_ids", "speaker", "quote"}
 
 
 async def test_retries_rate_limit_with_backoff() -> None:

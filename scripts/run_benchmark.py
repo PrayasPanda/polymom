@@ -562,7 +562,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             fixtures = eval_summary.load_fixtures(eval_summary.DEFAULT_FIXTURES)
-            results["summary"] = asyncio.run(eval_summary.evaluate(fixtures, settings, "auto"))
+            try:
+                results["summary"] = asyncio.run(eval_summary.evaluate(fixtures, settings, "auto"))
+            except Exception as exc:  # keep the speech results, report the gap
+                results["summary"] = pending(
+                    f"The LLM call failed ({type(exc).__name__}: {exc}).",
+                    "free the GPU, then: make benchmark-docker ARGS='--only summary'",
+                )
 
     args.out.mkdir(parents=True, exist_ok=True)
     previous = args.out / "results.json"

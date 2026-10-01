@@ -24,8 +24,14 @@ class Evidence(BaseModel):
     utterance_ids: list[int] = Field(min_length=1, description="Ids from the [uN] line prefixes.")
     speaker: str = Field(description='Label of the speaker quoted, e.g. "Person 2".')
     quote: str = Field(description="Short verbatim quote in the original script and language.")
-    start: float | None = Field(default=None, description="Filled from the transcript.")
-    end: float | None = None
+    # Filled by the verifier from the cited utterances; never requested from the model
+    # (schema_json drops "system_filled" properties), which would only invent them.
+    start: float | None = Field(
+        default=None,
+        description="Filled from the transcript.",
+        json_schema_extra={"system_filled": True},
+    )
+    end: float | None = Field(default=None, json_schema_extra={"system_filled": True})
 
 
 class KeyPoint(BaseModel):

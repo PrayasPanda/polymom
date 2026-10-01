@@ -101,7 +101,8 @@ First public release. It consolidates the twelve development milestones (PRs #1â
   qwen2.5:7b-instruct during the benchmark) came back without decisions, action items or
   key points. List fields with defaults were optional in the JSON Schema sent to the
   model, so the decoder could stop after the header fields. Every property is now
-  required.
+  required, and the evidence timestamps the verifier fills in are no longer requested
+  from the model.
 - Ollama requests set `num_ctx`. The 2048-token default silently truncated longer
   transcripts.
 - MMS-LID loads in float16 on CUDA, so it fits next to Whisper large-v3 on 8 GB GPUs

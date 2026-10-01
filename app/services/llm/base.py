@@ -201,6 +201,9 @@ def repair_prompt(error: Exception) -> str:
 def schema_json(schema: type[BaseModel]) -> dict[str, Any]:
     """The model's JSON Schema with **every** property required (nullable ones stay nullable).
 
+    Properties marked ``system_filled`` (evidence timestamps) are removed: the pipeline
+    fills them, and a model forced to produce them invents values the verifier rejects.
+
     Pydantic leaves fields with defaults (``decisions: list = []``) out of ``required``.
     Constrained decoders (Ollama ``format``, OpenAI strict mode) then let the model stop
     after the required header fields, which silently produced minutes without decisions
@@ -214,6 +217,11 @@ def _require_all(node: Any) -> Any:
     if isinstance(node, dict):
         out = {k: _require_all(v) for k, v in node.items()}
         if isinstance(out.get("properties"), dict):
+            out["properties"] = {
+                name: prop
+                for name, prop in out["properties"].items()
+                if not (isinstance(prop, dict) and prop.get("system_filled"))
+            }
             out["required"] = list(out["properties"])
         return out
     if isinstance(node, list):
