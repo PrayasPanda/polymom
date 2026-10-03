@@ -50,7 +50,7 @@ indic = [
 # Analytics charts (PNG): `uv sync --extra viz`. Without it the chart endpoint returns 503.
 viz = ["matplotlib>=3.8"]
 # Langfuse tracing of LLM calls (LANGFUSE_ENABLED=true): `uv sync --extra tracing`.
-tracing = ["langfuse>=2,<3"]
+tracing = ["langfuse>=2,<5"]
 s3 = [
     "boto3>=1.43.104",
 ]
