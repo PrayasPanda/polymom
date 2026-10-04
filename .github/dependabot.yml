@@ -20,9 +20,19 @@ updates:
   - package-ecosystem: docker
     directory: /docker
     schedule: {interval: weekly}
+    ignore:
+      # The base image tracks the Python the project pins (3.11); torch 2.8 has no
+      # 3.14 wheels. Bump deliberately, together with the torch/pyannote migration.
+      - dependency-name: python
+        update-types: [version-update:semver-major, version-update:semver-minor]
   - package-ecosystem: docker-compose
     directory: /docker
     schedule: {interval: weekly}
+    ignore:
+      # Postgres 18 changed the image's data directory layout; upgrading needs a
+      # pg_upgrade/volume migration, not an image bump. Hold at 16 until then.
+      - dependency-name: postgres
+        update-types: [version-update:semver-major]
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
