@@ -41,7 +41,7 @@ an NVIDIA GPU, accept the terms of the three gated models listed in
 
 Without Docker: `make dev && make run`, then `PIPELINE_EXECUTION=inline` for a single
 process (see [CONTRIBUTING.md](CONTRIBUTING.md)). `pip install .` installs the API alone;
-without the `ml` extra it starts with a warning and can use only mock or remote backends.
+without the `ml` extra, it starts with a warning and can use only mock or remote backends.
 
 ## Assignment requirements
 
