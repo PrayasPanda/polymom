@@ -179,7 +179,7 @@ services:
 
   # --- optional: local LLM (profile local-llm) ---
   ollama:
-    image: ollama/ollama:0.34.4
+    image: ollama/ollama:0.35.0
     profiles: ["local-llm"]
     volumes: [ollama-data:/root/.ollama]
     ports: ["11434:11434"]
