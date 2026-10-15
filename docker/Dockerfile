@@ -18,7 +18,7 @@
 # Base images are pinned by digest; Dependabot (docker ecosystem) proposes updates.
 
 # ---------- builder ----------
-FROM python:3.11.16-slim-trixie@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e AS builder
+FROM python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS builder
 ARG INSTALL_ML=false
 ARG INSTALL_INDIC=false
 ARG TORCH_VARIANT=cpu
@@ -52,7 +52,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev $FLAGS
 
 # ---------- runtime ----------
-FROM python:3.11.16-slim-trixie@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e AS runtime
+FROM python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS runtime
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="polymom" \
       org.opencontainers.image.description="Multilingual minutes-of-meeting pipeline" \
