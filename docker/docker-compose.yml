@@ -160,7 +160,7 @@ services:
   # SeaweedFS (Apache-2.0): MinIO stopped publishing community images in 2025.
   # Dev setup without S3 auth; use real credentials (or AWS S3) in production.
   seaweedfs:
-    image: chrislusf/seaweedfs:latest@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    image: chrislusf/seaweedfs:latest@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860
     profiles: ["s3"]
     command: ["server", "-dir=/data", "-s3", "-s3.port=8333"]
     ports: ["8333:8333"]
@@ -171,7 +171,7 @@ services:
       retries: 20
 
   s3-init:
-    image: chrislusf/seaweedfs:latest@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    image: chrislusf/seaweedfs:latest@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860
     profiles: ["s3"]
     depends_on:
       seaweedfs: {condition: service_healthy}
